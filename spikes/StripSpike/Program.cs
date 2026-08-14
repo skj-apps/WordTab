@@ -112,28 +112,48 @@ namespace StripSpike
 
             Log("OpusApp windows found: " + candidates.Count);
 
+            IntPtr fg = Native.GetForegroundWindow();
+            var usable = new List<IntPtr>();
+
             foreach (var h in candidates)
             {
                 bool visible = Native.IsWindowVisible(h);
                 bool cloaked = Native.IsCloaked(h);
+                bool iconic = Native.IsIconic(h);
                 IntPtr wwf = FindChild(h, "_WwF");
                 RECT r; Native.GetWindowRect(h, out r);
 
-                Log(string.Format(
-                    "  hwnd=0x{0:X} visible={1} cloaked={2} _WwF={3} rect=({4},{5} {6}x{7}) title=\"{8}\"",
-                    h.ToInt64(), visible, cloaked, wwf == IntPtr.Zero ? "no" : "yes",
-                    r.left, r.top, r.right - r.left, r.bottom - r.top, Native.TitleOf(h)));
+                // Word keeps a permanent hidden background OpusApp with a full _Ww* tree,
+                // and minimized windows park off-screen near -32000 (scaled by DPI, so
+                // -21333 at 150%) at a stub size. Neither is something we can lay out into.
+                bool ok = visible && !cloaked && !iconic && wwf != IntPtr.Zero
+                          && (r.right - r.left) >= 200 && (r.bottom - r.top) >= 200;
 
-                // Word keeps a permanent hidden background OpusApp with a full _Ww* tree.
-                // Visibility plus a non-cloaked frame is what separates it from a real one.
-                if (_opus == IntPtr.Zero && visible && !cloaked && wwf != IntPtr.Zero)
+                Log(string.Format(
+                    "  hwnd=0x{0:X} visible={1} cloaked={2} minimized={3} _WwF={4} " +
+                    "rect=({5},{6} {7}x{8}) usable={9} title=\"{10}\"",
+                    h.ToInt64(), visible, cloaked, iconic, wwf == IntPtr.Zero ? "no" : "yes",
+                    r.left, r.top, r.right - r.left, r.bottom - r.top, ok, Native.TitleOf(h)));
+
+                if (!ok) continue;
+                usable.Add(h);
+
+                // Prefer whatever the user is actually looking at.
+                if (h == fg || _opus == IntPtr.Zero)
                 {
                     _opus = h;
                     _wwf = wwf;
                 }
             }
 
-            if (_opus == IntPtr.Zero) return false;
+            if (_opus == IntPtr.Zero)
+            {
+                Log("no usable OpusApp: every Word window is hidden, cloaked or minimized.");
+                return false;
+            }
+
+            if (usable.Count > 1)
+                Log("note: " + usable.Count + " usable Word windows; this spike drives one only.");
 
             Native.GetWindowThreadProcessId(_opus, out _wordPid);
             Log(string.Format("target: OpusApp=0x{0:X} _WwF=0x{1:X} pid={2}",
