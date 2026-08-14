@@ -1,0 +1,7 @@
+bin/
+obj/
+*.user
+*.log
+
+# per-machine Claude Code settings
+.claude/settings.local.json
