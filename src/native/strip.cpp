@@ -34,6 +34,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <stdio.h>
+#include <math.h>       // sqrtf, for the one anti-aliased stroke in DrawGlyph
 
 // Height of the strip in logical pixels, scaled per-window by DPI. 32 is what spike 1 used and what
 // Office Tab's own strip measures at 100%.
@@ -58,6 +59,25 @@
 // monitor sold, so a layout array larger than this could only describe tabs nobody can see - and an
 // unbounded one on the stack of a WM_MOUSEMOVE handler is a different kind of problem.
 #define MAX_TABS         128
+
+// The look. Also logical pixels, also scaled per window.
+//
+// Not one of these appears in ComputeLayout. That is deliberate and it is the thing that made this
+// slice safe to do: the restyle changes what is drawn *inside* the rectangles and never the
+// rectangles themselves, so tools\WordLayout.cs - the second, hand-maintained copy of ComputeLayout
+// that the check scripts click through - needed no edit at all, and the 224 checks that were passing
+// before this slice are still measuring the same things afterwards.
+#define TAB_LOGICAL_RADIUS    6   // the rounded top corners of a tab card
+#define TAB_LOGICAL_INSET     1   // a card is drawn narrower than its rect, so cards do not touch
+#define CHIP_LOGICAL_RADIUS   4   // the close and new-document buttons' hover chip
+#define LIFT_LOGICAL_SPREAD   4   // how far the carried tab's shadow reaches past it
+#define LIFT_ALPHA           64   // and how dark it is where it is darkest
+
+// The x and the + are drawn as strokes rather than typed as characters, for the reason at
+// DrawGlyphLines. A stroke of exactly one physical pixel is what made them read as placeholder
+// scratches at 150%: everything around them scales and they did not. Tenths of a logical pixel,
+// because 1 is too thin and 2 is a felt tip, and this number is ours alone - nothing mirrors it.
+#define GLYPH_LOGICAL_STROKE_TENTHS 12
 
 // What the pointer is over, or what a button press is claiming. Used for both, which is why HIT_TAB
 // appears as a press kind: it means a *middle* press, since a left press on a tab acts immediately
@@ -103,6 +123,18 @@ struct StripState
     int   stripH;        // STRIP_LOGICAL_H scaled to this window's DPI
     int   dpi;
     HFONT font;
+
+    // The back buffer, and it is a 32-bit DIB rather than a compatible bitmap because the strip now
+    // composites: anti-aliased corners and the carried tab's shadow are coverage arithmetic against
+    // whatever is already underneath them, and a screen-compatible bitmap has no channel to do that
+    // in. Kept for the life of the strip rather than made per paint - DragMove repaints every strip
+    // in the stack on every mouse movement, and a CreateDIBSection per movement is a cost paid
+    // inside Word's own input loop. Rebuilt when the strip changes size or DPI.
+    HDC     memDc;
+    HBITMAP dib;
+    HBITMAP dibOld;      // what the memory DC came with, put back before the DC is destroyed
+    BYTE*   bits;        // BGRA, top-down, owned by the DIB section
+    int     dibW, dibH;
 
     BOOL  enabled;       // cleared while restoring, so the handler stops rewriting
     BOOL  hasApplied;
@@ -171,6 +203,8 @@ static BOOL g_stripEnabled = TRUE;
 static BOOL g_buttonsEnabled = TRUE;     // HKCU\Software\WordTab\TabButtons
 static BOOL g_menuEnabled = TRUE;        // HKCU\Software\WordTab\TabMenu
 static BOOL g_dragEnabled = TRUE;        // HKCU\Software\WordTab\TabDrag
+static BOOL g_lookEnabled = TRUE;        // HKCU\Software\WordTab\TabStyle
+static BOOL g_sampleEnabled = TRUE;      // HKCU\Software\WordTab\TabThemeSample
 
 // ---------------------------------------------------------------------------------------------
 // A tab being dragged.
@@ -200,19 +234,47 @@ static BOOL g_dragging   = FALSE;   // past the slop: this is a drag, not a clic
 static ATOM g_stripClass = 0;
 static UINT_PTR g_janitor = 0;
 
-static HBRUSH   g_backBrush    = NULL;   // strip background
-static HBRUSH   g_tabBrush     = NULL;   // the selected tab
-static HBRUSH   g_tabIdleBrush = NULL;   // the others
-static HBRUSH   g_tabHotBrush  = NULL;   // an unselected tab under the pointer
-static HBRUSH   g_chipHotBrush = NULL;   // a close or new button under the pointer
-static HBRUSH   g_chipDownBrush = NULL;  // ...and while it is held down
-static HPEN     g_edgePen      = NULL;
-static COLORREF g_edgeColor    = RGB(200, 198, 196);
-static COLORREF g_textColor    = RGB(50, 49, 48);
-static COLORREF g_idleTextColor = RGB(96, 94, 92);
-static COLORREF g_glyphColor    = RGB(96, 94, 92);
-static COLORREF g_glyphHotColor = RGB(32, 31, 30);
-static BOOL     g_darkTheme    = FALSE;
+// ---------------------------------------------------------------------------------------------
+// The palette.
+//
+// One structure derived from one colour: the one Word is painting immediately above us. Every value
+// below is a fixed step from it, and the steps are measurements rather than taste - see
+// DerivePalette. That is what replaced the two hand-picked triples this file used to carry, and it
+// is why Colorful, White, Dark Grey, Black and whatever Office ships next all come out right
+// without a table listing them.
+// ---------------------------------------------------------------------------------------------
+
+struct Palette
+{
+    COLORREF chrome;      // what it was all derived from: Word's ribbon
+    BOOL     dark;
+
+    COLORREF back;        // the well the tabs sit in
+    COLORREF selected;    // the active tab's card
+    COLORREF lifted;      // ...and the same card while it is being carried
+    COLORREF hover;       // an inactive tab under the pointer
+    COLORREF edge;        // the card's border, and the hairline along the bottom
+    COLORREF separator;   // between two inactive tabs
+    COLORREF text;        // the active tab's name
+    COLORREF textIdle;    // the others, and the empty row's message
+    COLORREF glyph;       // the x and the +
+    COLORREF glyphHot;
+    COLORREF chip;        // a button's hover chip
+    COLORREF chipDown;
+
+    COLORREF menuBack;    // the context menu, which is ours to draw now
+    COLORREF menuText;
+    COLORREF menuTextDim;
+    COLORREF menuHot;
+    COLORREF menuLine;
+};
+
+static Palette g_palette;
+static BOOL    g_paletteReady = FALSE;
+
+// The two GDI objects the palette still needs as handles: everything else is composited by hand.
+static HBRUSH g_backBrush     = NULL;   // the flat fallback renderer's ground
+static HBRUSH g_menuBackBrush = NULL;   // SetMenuInfo's MIM_BACKGROUND, which is not ours to paint
 
 static StripState* FindByFrame(HWND frame)
 {
@@ -267,11 +329,22 @@ static int Scaled(int logical, int dpi)
 // ---------------------------------------------------------------------------------------------
 // Theme.
 //
-// Not a design decision - the real look of the tabs is a product question for later. This is the
-// minimum needed for the strip not to read as broken: a band of light grey across a black Word
-// window looks like a failure even when the geometry underneath it is perfect.
+// The strip used to carry two hand-picked palettes, light and dark, chosen by eye and selected
+// between by reading Office's `UI Theme` registry value. Two things measured for this slice retired
+// that arrangement.
 //
-// Office keeps its own theme setting; "use system setting" defers to Windows.
+// **The registry value is not a reliable oracle.** It is legitimately 6 - "use system setting" - on
+// a default install, so the answer is somewhere else anyway; and Word *rewrites it at startup* from
+// the roaming account setting. Writing 5 (White) and launching Word produced a Word that read back
+// 6. A value we read once while the add-in is loading may be the previous session's answer.
+//
+// **The colour itself is readable, and exactly.** Word paints a flat band along the bottom of the
+// ribbon, immediately above our strip. Sampled from the ribbon window's own device context it comes
+// back at 98-99% of a 150-pixel scan: RGB(41,41,41) with Windows dark, RGB(255,255,255) with
+// Windows light. So the palette is derived from what Word is actually painting, and every Office
+// theme - including ones that do not exist yet - comes out right without a table listing them.
+//
+// The registry read stays as the fallback for when the sample cannot be taken.
 // ---------------------------------------------------------------------------------------------
 
 static DWORD ReadDword(HKEY root, const wchar_t* key, const wchar_t* name, DWORD fallback)
@@ -300,6 +373,349 @@ static BOOL DarkThemeInUse(void)
                      L"AppsUseLightTheme", 1) == 0;
 }
 
+// Rec. 709 luma, which is the one that matches how bright a colour looks rather than how much ink
+// it is. It decides one thing - whether this is a light Word or a dark one - and that decision
+// flips the direction of every step below.
+static int Luma(COLORREF c)
+{
+    return (GetRValue(c) * 54 + GetGValue(c) * 183 + GetBValue(c) * 19) >> 8;
+}
+
+// A fixed number of levels toward white (positive) or black (negative), per channel, clamped. Steps
+// rather than percentages: Word's own steps are absolute, and a percentage of 41 is not a step at
+// all.
+static int Clamp255(int v)
+{
+    if (v < 0)   return 0;
+    if (v > 255) return 255;
+    return v;
+}
+
+static COLORREF Step(COLORREF c, int delta)
+{
+    return RGB(Clamp255(GetRValue(c) + delta),
+               Clamp255(GetGValue(c) + delta),
+               Clamp255(GetBValue(c) + delta));
+}
+
+static COLORREF Mix(COLORREF a, COLORREF b, int percentB)
+{
+    int r = (GetRValue(a) * (100 - percentB) + GetRValue(b) * percentB) / 100;
+    int g = (GetGValue(a) * (100 - percentB) + GetGValue(b) * percentB) / 100;
+    int bl = (GetBValue(a) * (100 - percentB) + GetBValue(b) * percentB) / 100;
+    return RGB(r, g, bl);
+}
+
+// Everything from one colour.
+//
+// The one number that is not arbitrary is 26, and it is the measurement this whole scheme rests on:
+// the step Word itself takes from the ribbon to the workspace below it. Light, that is 255 -> 228.
+// Dark, 41 -> 9. Twenty-six and thirty-two - call it 26 in both directions, and the well our tabs
+// sit in lands on Word's own workspace grey without being told what it is.
+//
+// The active tab is then the chrome colour exactly: it is a piece of the ribbon, brought down.
+static void DerivePalette(COLORREF chrome, Palette* out)
+{
+    BOOL dark = (Luma(chrome) < 128);
+
+    out->chrome   = chrome;
+    out->dark     = dark;
+
+    out->selected = chrome;
+    out->back     = Step(chrome, -26);
+    out->hover    = Step(chrome, -13);
+
+    // A picked-up tab is lifted by a shadow, and a shadow is black - which is worth nothing at all
+    // on a dark Word, where the well behind it is already RGB(15,15,15). Photographed: the lift was
+    // invisible. So in a dark theme the card is *raised* as well, and in a light one it is not,
+    // because the card there is already white and there is nowhere to raise it to. The shadow is
+    // drawn in both; it only earns its keep in one.
+    out->lifted = dark ? Step(chrome, +14) : chrome;
+
+    // A border has to go the other way in a dark theme or it is not a border. Light Word gets a
+    // definite edge because a white card on a near-white ground needs one; dark Word needs less,
+    // because the card is already lighter than everything around it.
+    out->edge      = dark ? Step(chrome, +26) : Step(chrome, -45);
+    out->separator = dark ? Step(out->back, +22) : Step(out->back, -22);
+
+    out->text      = dark ? RGB(255, 255, 255) : RGB(32, 31, 30);
+    out->textIdle  = Mix(out->text, out->back, 38);
+    out->glyph     = out->textIdle;
+    out->glyphHot  = out->text;
+    out->chip      = dark ? Step(chrome, +40) : Step(chrome, -50);
+    out->chipDown  = dark ? Step(chrome, +62) : Step(chrome, -67);
+
+    // The menu is a floating surface, not part of the band, so it sits a step *above* the chrome
+    // rather than below it - which is what every menu in Windows does against its own window.
+    out->menuBack    = dark ? Step(chrome, +2) : RGB(255, 255, 255);
+    out->menuText    = out->text;
+    out->menuTextDim = Mix(out->text, out->menuBack, 45);
+    out->menuHot     = dark ? Step(out->menuBack, +22) : Step(out->menuBack, -18);
+    out->menuLine    = dark ? Step(out->menuBack, +34) : Step(out->menuBack, -30);
+}
+
+// The colour Word is painting immediately above the strip, read from the ribbon's own device
+// context.
+//
+// Three ways of taking this sample were measured and only one of them tells the truth:
+//
+//   - the *frame's* client DC answers CLR_INVALID at every pixel. The frame is WS_CLIPCHILDREN and
+//     everything up there belongs to a child, so there is nothing of the frame's own to read.
+//   - the *screen* DC works while Word is in front and lies when it is not. With Notepad maximised
+//     over Word it returned RGB(39,39,39) - Notepad's background - against Word's real
+//     RGB(41,41,41). A wrong answer two levels away from the right one is worse than no answer.
+//   - the *ribbon's own* window DC returned RGB(41,41,41) at 98% of the scan, unchanged, with
+//     Notepad maximised on top of it. That is the one.
+//
+// A scan and a mode rather than a single pixel: one GetPixel lands on a separator or the edge of a
+// button often enough to matter, and a band that is genuinely flat says so by agreeing with itself.
+static BOOL ChildRect(HWND parent, HWND child, RECT* out);   // defined with the geometry helpers
+
+// Finding the ribbon among the frame's descendants: the widest visible NetUIHWND whose bottom edge
+// is the strip's top edge. By position rather than by order, because a Word frame has three of them
+// - the ribbon, the vertical scrollbar and the status bar - and their order is not ours to rely on.
+struct RibbonHunt
+{
+    HWND frame;
+    int  clientW;
+    LONG stripTop;
+    HWND found;
+};
+
+static BOOL CALLBACK RibbonHuntProc(HWND child, LPARAM param)
+{
+    RibbonHunt* hunt = (RibbonHunt*)param;
+
+    wchar_t cls[32];
+    if (!GetClassNameW(child, cls, 32) || wcscmp(cls, L"NetUIHWND") != 0)
+        return TRUE;
+    if (!IsWindowVisible(child))
+        return TRUE;
+
+    RECT at;
+    if (!ChildRect(hunt->frame, child, &at))
+        return TRUE;
+
+    if ((at.right - at.left) * 10 < hunt->clientW * 6)
+        return TRUE;                                    // too narrow to be the ribbon
+    LONG gap = at.bottom - hunt->stripTop;
+    if (gap < -4 || gap > 4)
+        return TRUE;                                    // not the thing directly above us
+
+    hunt->found = child;
+    return FALSE;
+}
+
+//
+// It reports why it could not answer as well as whether it could. That is not decoration: the first
+// version of this returned a bare FALSE, the palette silently stayed on its fallback, and because the
+// fallback and the sample agree on this rig the only symptom was a theme change that did not take -
+// three steps away from the cause.
+static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
+{
+    *why = L"ok";
+
+    if (!state->frame || !IsWindow(state->frame) || !state->strip)
+    {
+        *why = L"no frame or no strip";
+        return FALSE;
+    }
+
+    RECT client;
+    if (!GetClientRect(state->frame, &client))
+    {
+        *why = L"the frame has no client rect";
+        return FALSE;
+    }
+    int clientW = client.right - client.left;
+    if (clientW < 200)
+    {
+        *why = L"the frame is too narrow";
+        return FALSE;
+    }
+
+    RECT stripAt;
+    if (!ChildRect(state->frame, state->strip, &stripAt))
+    {
+        *why = L"the strip has no rect";
+        return FALSE;
+    }
+
+    // The ribbon: a direct NetUIHWND child of the frame, as wide as the window, whose bottom edge is
+    // where our top edge is. The frame has three NetUIHWNDs - the ribbon, the vertical scrollbar and
+    // the status bar - and this picks the ribbon out of them by position rather than by order.
+    RibbonHunt hunt;
+    hunt.frame    = state->frame;
+    hunt.clientW  = clientW;
+    hunt.stripTop = stripAt.top;
+    hunt.found    = NULL;
+
+    // EnumChildWindows, not a walk of GetWindow(GW_CHILD)/GW_HWNDNEXT, and that distinction cost a
+    // build to find. **The ribbon is not a child of the frame.** It is the innermost of a chain -
+    // MsoCommandBarDock, MsoCommandBar, MsoWorkPane, NUIPane, NetUIHWND - five windows deep, all
+    // reporting the *same* rectangle, which is what made the mistake so plausible: the enumeration
+    // the check scripts use is recursive, so the ribbon looked like a direct child in every listing
+    // taken while this was being designed. A sibling walk found nothing at all and said so, in a
+    // failure that looked exactly like a sampler that simply agreed with the fallback.
+    //
+    // Only the innermost of that chain is worth sampling anyway: the outer four are WS_CLIPCHILDREN
+    // and their device contexts exclude every pixel that belongs to a child, which up there is all
+    // of them. That is the same reason the frame's own DC answered CLR_INVALID.
+    EnumChildWindows(state->frame, RibbonHuntProc, (LPARAM)&hunt);
+
+    HWND ribbon = hunt.found;
+    if (!ribbon)
+    {
+        *why = L"no NetUIHWND of the right width sits directly above the strip";
+        return FALSE;
+    }
+
+    RECT ribbonRect;
+    if (!GetWindowRect(ribbon, &ribbonRect))
+    {
+        *why = L"the ribbon has no rect";
+        return FALSE;
+    }
+    int rw = ribbonRect.right - ribbonRect.left;
+    int rh = ribbonRect.bottom - ribbonRect.top;
+    if (rw < 200 || rh < 12)
+    {
+        *why = L"the ribbon is too small to sample";
+        return FALSE;
+    }
+
+    // The screen, and it has to be the screen. This was written the other way first - GetDC on the
+    // ribbon itself, so that an occluded Word could still be read - and measured, that DC is a lie:
+    //
+    //     before the flip        window DC: RGB( 41, 41, 41)    screen: RGB(41,41,41)
+    //     3s after the flip      window DC: RGB( 41, 41, 41)    screen: RGB(255,255,255)
+    //     12s after the flip     window DC: RGB( 41, 41, 41)    screen: RGB(255,255,255)
+    //     after putting it back  window DC: RGB( 41, 41, 41)    screen: RGB(41,41,41)
+    //
+    // **Word re-renders its ribbon somewhere GDI cannot follow.** The redirection surface behind that
+    // HWND keeps whatever was last drawn into it by GDI and never changes again, so the window DC
+    // answers correctly exactly once - at startup - and then goes stale for the life of the process.
+    // Which is the one case that mattered, because a palette that is only right at startup is the
+    // registry read this was meant to replace.
+    //
+    // The screen DC tells the truth, and its hazard is the opposite one: it reads whatever is on
+    // top, and with Notepad maximised over Word it returned RGB(39,39,39) against Word's real
+    // RGB(41,41,41) - a wrong answer two levels from the right one. So every sample point is asked
+    // *who owns this pixel* before it is read, and points that belong to anything but the ribbon are
+    // not read at all. That is not a heuristic about how likely occlusion is; it is the question the
+    // hazard actually poses, answered per pixel.
+    HDC screen = GetDC(NULL);
+    if (!screen)
+    {
+        *why = L"no screen DC";
+        return FALSE;
+    }
+
+    COLORREF seen[32];
+    int      count[32];
+    int      kinds = 0, total = 0, foreign = 0;
+    int      y = ribbonRect.bottom - 3;
+    int      step = (rw / 2) / 24;
+    if (step < 1) step = 1;
+
+    for (int i = 0; i < 24; i++)
+    {
+        POINT pt;
+        pt.x = ribbonRect.left + 20 + i * step;
+        pt.y = y;
+
+        HWND owner = WindowFromPoint(pt);
+        if (owner != ribbon && !IsChild(ribbon, owner))
+        {
+            foreign++;
+            continue;
+        }
+
+        COLORREF c = GetPixel(screen, pt.x, pt.y);
+        if (c == CLR_INVALID)
+            continue;
+
+        total++;
+        int found = -1;
+        for (int k = 0; k < kinds; k++)
+            if (seen[k] == c) { found = k; break; }
+        if (found >= 0)
+            count[found]++;
+        else if (kinds < 32)
+        {
+            seen[kinds]  = c;
+            count[kinds] = 1;
+            kinds++;
+        }
+    }
+    ReleaseDC(NULL, screen);
+
+    if (total < 12)
+    {
+        *why = (foreign > 0) ? L"something is covering Word's ribbon"
+                             : L"too few readable pixels";
+        return FALSE;
+    }
+
+    int best = 0;
+    for (int k = 1; k < kinds; k++)
+        if (count[k] > count[best])
+            best = k;
+
+    // Three quarters of a flat band is flat. Anything less and we are looking at something that is
+    // not the ribbon's background - a contextual tab, a mid-repaint, a theme we do not understand -
+    // and the honest answer is to keep the palette we already have.
+    if (count[best] * 4 < total * 3)
+    {
+        *why = L"the band under the ribbon is not flat";
+        return FALSE;
+    }
+
+    *out = seen[best];
+    return TRUE;
+}
+
+// Adopt a chrome colour, rebuild everything derived from it, and repaint.
+//
+// Written to be called again, which the old code could not be: every brush there was created behind
+// an `if (!brush)` guard, so a second call changed the COLORREFs and kept the first theme's handles.
+// That produced a palette half in one theme and half in the other - and specifically a bottom
+// hairline that followed the change (it built its brush per paint) above a tab border that did not.
+// Nothing here is guarded, everything is deleted before it is remade, and the whole thing is
+// compare-before-act so a redundant call costs one comparison.
+static BOOL ApplyPalette(COLORREF chrome, const wchar_t* why)
+{
+    if (g_paletteReady && g_palette.chrome == chrome)
+        return FALSE;
+
+    DerivePalette(chrome, &g_palette);
+    g_paletteReady = TRUE;
+
+    if (g_backBrush)     { DeleteObject(g_backBrush);     g_backBrush = NULL; }
+    if (g_menuBackBrush) { DeleteObject(g_menuBackBrush); g_menuBackBrush = NULL; }
+    g_backBrush     = CreateSolidBrush(g_palette.back);
+    g_menuBackBrush = CreateSolidBrush(g_palette.menuBack);
+
+    LogWrite(L"strip  palette %s: chrome=RGB(%d,%d,%d) %s  well=RGB(%d,%d,%d) "
+             L"card=RGB(%d,%d,%d) edge=RGB(%d,%d,%d)",
+             why,
+             GetRValue(chrome), GetGValue(chrome), GetBValue(chrome),
+             g_palette.dark ? L"dark" : L"light",
+             GetRValue(g_palette.back), GetGValue(g_palette.back), GetBValue(g_palette.back),
+             GetRValue(g_palette.selected), GetGValue(g_palette.selected), GetBValue(g_palette.selected),
+             GetRValue(g_palette.edge), GetGValue(g_palette.edge), GetBValue(g_palette.edge));
+
+    StripRefreshTabs();
+    return TRUE;
+}
+
+// The palette when no sample can be taken: Word's two measured ribbon colours, chosen between by the
+// registry read this file has always done.
+static void ApplyFallbackPalette(const wchar_t* why)
+{
+    ApplyPalette(DarkThemeInUse() ? RGB(41, 41, 41) : RGB(255, 255, 255), why);
+}
+
 static void MakeFont(StripState* state)
 {
     if (state->font)
@@ -317,6 +733,40 @@ static void MakeFont(StripState* state)
     wcscpy(lf.lfFaceName, L"Segoe UI");
 
     state->font = CreateFontIndirectW(&lf);
+}
+
+// The back buffer. Freed here and rebuilt on demand rather than resized, because a strip changes
+// size rarely and a DIB section cannot be resized anyway.
+static void ReleaseSurface(StripState* state)
+{
+    // The bitmap goes back before the DC does. A bitmap still selected into a device context is not
+    // deleted by DeleteObject, it is only marked - and the leak is per strip, inside Word, for the
+    // rest of the session.
+    if (state->memDc && state->dibOld)
+        SelectObject(state->memDc, state->dibOld);
+    if (state->dib)   { DeleteObject(state->dib); state->dib = NULL; }
+    if (state->memDc) { DeleteDC(state->memDc);   state->memDc = NULL; }
+
+    state->dibOld = NULL;
+    state->bits = NULL;
+    state->dibW = 0;
+    state->dibH = 0;
+}
+
+// Everything about this strip that is a function of its DPI, in one place.
+//
+// It used to be three: StripAttachFrame, TryBind and StripOnFrameDpiChanged each set `dpi` and
+// `stripH`, and only two of them remade the font - TryBind guarded it with `if (!state->font)`, so a
+// DPI change between attach and bind left the strip at the new height with the old font. That was
+// latent while the font was the only thing derived from DPI. This slice derives the corner radius,
+// the glyph stroke, the chip radius, the shadow spread and the size of the back buffer from it too,
+// so three copies of "what depends on DPI" was three chances to forget one.
+static void ApplyMetrics(StripState* state)
+{
+    state->dpi    = DpiOf(state->frame);
+    state->stripH = Scaled(STRIP_LOGICAL_H, state->dpi);
+    MakeFont(state);
+    ReleaseSurface(state);        // its size is in physical pixels, so it is DPI-dependent too
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -814,67 +1264,286 @@ static void ArmLeaveTracking(StripState* state, HWND hwnd)
         state->tracking = TRUE;
 }
 
-// The two glyphs, drawn as lines rather than as characters. A font is not guaranteed to have a
-// multiplication sign or a heavy plus at any particular weight, and one that substitutes silently
-// gives a close button that looks like a lowercase x. Two lines cannot be substituted.
-static void DrawGlyphLines(HDC dc, const RECT* box, COLORREF color, int dpi, BOOL cross)
+// ---------------------------------------------------------------------------------------------
+// Compositing.
+//
+// GDI has no anti-aliasing. A rounded tab drawn with RoundRect is a staircase, and at 150% the
+// staircase is three physical pixels tall - which is exactly the sort of thing that makes a piece of
+// UI read as somebody's first draft. So the strip composites its own pixels: a 32-bit DIB, coverage
+// worked out per pixel, blended by hand.
+//
+// Not GDI+ and not AlphaBlend. GDI+ has a process-wide startup and shutdown that we would be sharing
+// with Word's own use of it, and AlphaBlend lives in msimg32, which is a new import into someone
+// else's process. Neither is worth it for a few hundred pixels of arithmetic that fits on one
+// screen, and hand-rolled coverage is in the same spirit as DrawGlyph below refusing to trust a font
+// to have a multiplication sign.
+//
+// The surface carries its own DC as well as its own bytes, because the tab names are still drawn by
+// GDI - laying out and hinting text is not something to reimplement. That mixing is the one hazard
+// here: GDI batches, so anything that reads the pixels back has to GdiFlush first. DrawOneTab does
+// that at its start, which is the only ordering rule in this file.
+// ---------------------------------------------------------------------------------------------
+
+struct Surface
 {
-    HPEN pen = CreatePen(PS_SOLID, Scaled(1, dpi), color);
-    if (!pen)
+    BYTE* bits;      // BGRA, top-down
+    int   w, h;
+    HDC   dc;        // the same pixels, for the text
+};
+
+static inline void Blend(Surface* s, int x, int y, COLORREF color, int alpha)
+{
+    if (alpha <= 0 || x < 0 || y < 0 || x >= s->w || y >= s->h)
         return;
 
-    HGDIOBJ oldPen = SelectObject(dc, pen);
+    BYTE* p = s->bits + ((size_t)y * (size_t)s->w + (size_t)x) * 4;
+    int r = GetRValue(color), g = GetGValue(color), b = GetBValue(color);
+
+    if (alpha >= 255)
+    {
+        p[0] = (BYTE)b; p[1] = (BYTE)g; p[2] = (BYTE)r; p[3] = 255;
+        return;
+    }
+    p[0] = (BYTE)((p[0] * (255 - alpha) + b * alpha) / 255);
+    p[1] = (BYTE)((p[1] * (255 - alpha) + g * alpha) / 255);
+    p[2] = (BYTE)((p[2] * (255 - alpha) + r * alpha) / 255);
+    p[3] = 255;
+}
+
+static void SurfFill(Surface* s, const RECT* box, COLORREF color)
+{
+    int x0 = box->left   < 0 ? 0 : box->left;
+    int y0 = box->top    < 0 ? 0 : box->top;
+    int x1 = box->right  > s->w ? s->w : box->right;
+    int y1 = box->bottom > s->h ? s->h : box->bottom;
+
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++)
+            Blend(s, x, y, color, 255);
+}
+
+// How much of one pixel falls inside a circle, by sixteen samples on an even grid. Analytic coverage
+// of a circle against a square is a page of algebra for an arc nine pixels long; sixteen samples are
+// indistinguishable from it at this size and the whole thing stays in integers.
+static int CircleCoverage(int x, int y, int cx, int cy, int radius)
+{
+    long long rr = (long long)(radius * 8) * (long long)(radius * 8);
+    int hits = 0;
+
+    for (int j = 0; j < 4; j++)
+    {
+        long long dy = (long long)(y * 8 + 2 * j + 1) - (long long)cy * 8;
+        for (int i = 0; i < 4; i++)
+        {
+            long long dx = (long long)(x * 8 + 2 * i + 1) - (long long)cx * 8;
+            if (dx * dx + dy * dy <= rr)
+                hits++;
+        }
+    }
+    return hits * 255 / 16;
+}
+
+// A filled rectangle with independently rounded top and bottom corners. A tab card is round on top
+// and square on the bottom, because it meets the document there and a tab that is round at the
+// bottom is a lozenge.
+static void SurfRoundRect(Surface* s, const RECT* box, int rTop, int rBottom,
+                          COLORREF color, int alpha)
+{
+    int x0 = box->left, x1 = box->right, y0 = box->top, y1 = box->bottom;
+    if (x1 <= x0 || y1 <= y0 || alpha <= 0)
+        return;
+
+    int w = x1 - x0, h = y1 - y0;
+    if (rTop    > w / 2) rTop    = w / 2;
+    if (rBottom > w / 2) rBottom = w / 2;
+    if (rTop    > h)     rTop    = h;
+    if (rBottom > h)     rBottom = h;
+    if (rTop < 0) rTop = 0;
+    if (rBottom < 0) rBottom = 0;
+
+    int clipY0 = y0 < 0 ? 0 : y0, clipY1 = y1 > s->h ? s->h : y1;
+    int clipX0 = x0 < 0 ? 0 : x0, clipX1 = x1 > s->w ? s->w : x1;
+
+    for (int y = clipY0; y < clipY1; y++)
+    {
+        BOOL inTop    = (y < y0 + rTop);
+        BOOL inBottom = (y >= y1 - rBottom);
+
+        for (int x = clipX0; x < clipX1; x++)
+        {
+            int cov = 255;
+
+            if (inTop && x < x0 + rTop)
+                cov = CircleCoverage(x, y, x0 + rTop, y0 + rTop, rTop);
+            else if (inTop && x >= x1 - rTop)
+                cov = CircleCoverage(x, y, x1 - rTop, y0 + rTop, rTop);
+            else if (inBottom && x < x0 + rBottom)
+                cov = CircleCoverage(x, y, x0 + rBottom, y1 - rBottom, rBottom);
+            else if (inBottom && x >= x1 - rBottom)
+                cov = CircleCoverage(x, y, x1 - rBottom, y1 - rBottom, rBottom);
+
+            if (cov > 0)
+                Blend(s, x, y, color, alpha * cov / 255);
+        }
+    }
+}
+
+// The lift under a carried tab: the same shape, drawn a few times, each one larger and offset a
+// little further down, each one faint. The overlap is what makes the falloff - there is no blur
+// kernel here and none is needed at four pixels.
+//
+// It reaches past the tab it belongs to, which is the only thing in the strip that does. That is
+// bounded on purpose: LIFT_LOGICAL_SPREAD is 4 logical pixels, and the nearest thing any check
+// asserts must not change is a whole tab away.
+static void SurfLift(Surface* s, const RECT* box, int radius, int spread)
+{
+    if (spread <= 0)
+        return;
+
+    for (int i = spread; i >= 1; i--)
+    {
+        RECT ring = *box;
+        InflateRect(&ring, i, i);
+        OffsetRect(&ring, 0, (i + 1) / 2);
+        SurfRoundRect(s, &ring, radius + i, radius + i, RGB(0, 0, 0), LIFT_ALPHA / spread);
+    }
+}
+
+// An anti-aliased stroke, by distance to the segment. Used for the two glyphs and nothing else, so
+// it is written for short lines and does not try to be a rasteriser.
+static void SurfStroke(Surface* s, float ax, float ay, float bx, float by,
+                       float thickness, COLORREF color)
+{
+    float half = thickness * 0.5f;
+    float dx = bx - ax, dy = by - ay;
+    float len2 = dx * dx + dy * dy;
+    if (len2 <= 0.0f)
+        return;
+
+    int x0 = (int)((ax < bx ? ax : bx) - half - 1.0f);
+    int x1 = (int)((ax > bx ? ax : bx) + half + 2.0f);
+    int y0 = (int)((ay < by ? ay : by) - half - 1.0f);
+    int y1 = (int)((ay > by ? ay : by) + half + 2.0f);
+
+    for (int y = y0; y < y1; y++)
+    {
+        for (int x = x0; x < x1; x++)
+        {
+            float px = (float)x + 0.5f, py = (float)y + 0.5f;
+            float t = ((px - ax) * dx + (py - ay) * dy) / len2;
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            float qx = ax + t * dx - px, qy = ay + t * dy - py;
+            float dist = sqrtf(qx * qx + qy * qy);
+
+            float cover = half + 0.5f - dist;
+            if (cover <= 0.0f) continue;
+            if (cover > 1.0f) cover = 1.0f;
+            Blend(s, x, y, color, (int)(cover * 255.0f));
+        }
+    }
+}
+
+// The two glyphs, drawn as strokes rather than as characters. A font is not guaranteed to have a
+// multiplication sign or a heavy plus at any particular weight, and one that substitutes silently
+// gives a close button that looks like a lowercase x. Two strokes cannot be substituted.
+//
+// The stroke used to be exactly one physical pixel at every DPI, which is how a 150% rig ended up
+// with a hairline x on a full-size button. It scales now, and it is anti-aliased, which for a
+// diagonal is most of the difference.
+static void DrawGlyph(Surface* s, const RECT* box, COLORREF color, int dpi, BOOL cross)
+{
+    float thickness = (float)(GLYPH_LOGICAL_STROKE_TENTHS * dpi) / 960.0f;
+    if (thickness < 1.0f) thickness = 1.0f;
+
+    float cx = (float)(box->left + box->right) * 0.5f;
+    float cy = (float)(box->top + box->bottom) * 0.5f;
+    float arm = (float)Scaled(4, dpi);
 
     if (cross)
     {
-        int inset = Scaled(5, dpi);
-        MoveToEx(dc, box->left + inset, box->top + inset, NULL);
-        LineTo(dc, box->right - inset, box->bottom - inset);
-        MoveToEx(dc, box->right - inset - 1, box->top + inset, NULL);
-        LineTo(dc, box->left + inset - 1, box->bottom - inset);
+        SurfStroke(s, cx - arm, cy - arm, cx + arm, cy + arm, thickness, color);
+        SurfStroke(s, cx + arm, cy - arm, cx - arm, cy + arm, thickness, color);
     }
     else
     {
-        int cx  = (box->left + box->right) / 2;
-        int cy  = (box->top + box->bottom) / 2;
-        int arm = Scaled(5, dpi);
-        MoveToEx(dc, cx - arm, cy, NULL);
-        LineTo(dc, cx + arm + 1, cy);
-        MoveToEx(dc, cx, cy - arm, NULL);
-        LineTo(dc, cx, cy + arm + 1);
+        SurfStroke(s, cx - arm, cy, cx + arm, cy, thickness, color);
+        SurfStroke(s, cx, cy - arm, cx, cy + arm, thickness, color);
     }
-
-    SelectObject(dc, oldPen);
-    DeleteObject(pen);
 }
 
-// A close or new button's background: nothing at rest, a chip under the pointer, a darker one while
-// it is held. Slightly larger than the hit rectangle so the glyph is not touching its own edge.
-static void DrawChip(HDC dc, const RECT* box, BOOL hot, BOOL down, int dpi)
+// A close or new button's background: nothing at rest, a rounded chip under the pointer, a darker
+// one while it is held. Slightly larger than the hit rectangle so the glyph is not touching its own
+// edge.
+static void DrawChip(Surface* s, const RECT* box, BOOL hot, BOOL down, int dpi)
 {
     if (!hot && !down)
         return;
+
     RECT chip = *box;
     InflateRect(&chip, Scaled(2, dpi), Scaled(2, dpi));
-    FillRect(dc, &chip, down ? g_chipDownBrush : g_chipHotBrush);
+    int radius = Scaled(CHIP_LOGICAL_RADIUS, dpi);
+    SurfRoundRect(s, &chip, radius, radius, down ? g_palette.chipDown : g_palette.chip, 255);
 }
 
-// One tab: its background, its border, its name and its close button.
+// One tab: its card, its name and its close button.
 //
-// Its rectangle is a parameter rather than an index into the layout, and that is the whole point: a
-// tab being carried is drawn by this same function at wherever the pointer has taken it, so a
-// dragged tab cannot end up looking like a different kind of object from a tab sitting still.
-static void DrawOneTab(StripState* state, HDC dc, HWND frame,
-                       RECT tab, RECT close, BOOL selected, BOOL hot)
+// Its rectangle is a parameter rather than an index into the layout, and that is still the whole
+// point: a tab being carried is drawn by this same function at wherever the pointer has taken it, so
+// a dragged tab cannot end up looking like a different kind of object from a tab sitting still. The
+// lift is a parameter for the same reason - it is an argument to this function, not a second
+// drawing path for dragged tabs.
+static void DrawOneTab(StripState* state, Surface* s, HWND frame,
+                       RECT tab, RECT close, BOOL selected, BOOL hot, BOOL lifted, BOOL first)
 {
-    HBRUSH fill = selected ? g_tabBrush : (hot ? g_tabHotBrush : g_tabIdleBrush);
-    FillRect(dc, &tab, fill);
+    // The one ordering rule in this file. Tab names are drawn by GDI and GDI batches; everything
+    // below reads the pixels back to blend against them, and a batch still in flight would be
+    // composited over after it lands rather than before.
+    GdiFlush();
 
-    HGDIOBJ oldPen   = SelectObject(dc, g_edgePen);
-    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    Rectangle(dc, tab.left, tab.top, tab.right, tab.bottom + 1);
-    SelectObject(dc, oldBrush);
-    SelectObject(dc, oldPen);
+    int dpi    = state->dpi;
+    int radius = Scaled(TAB_LOGICAL_RADIUS, dpi);
+    int inset  = Scaled(TAB_LOGICAL_INSET, dpi);
+
+    RECT card = tab;
+    card.left  += inset;
+    card.right -= inset;
+    if (card.right <= card.left)
+        card = tab;
+
+    if (lifted)
+        SurfLift(s, &card, radius, Scaled(LIFT_LOGICAL_SPREAD, dpi));
+
+    if (selected || lifted)
+    {
+        // The active card is Word's own chrome colour, brought down out of the ribbon. Its border is
+        // a single step away from that, and it exists because in a light theme the card is white on
+        // near-white and without an edge it is a smudge rather than a shape.
+        COLORREF fill = lifted ? g_palette.lifted : g_palette.selected;
+
+        SurfRoundRect(s, &card, radius, 0, g_palette.edge, 255);
+
+        RECT inner = card;
+        InflateRect(&inner, -1, 0);
+        inner.top += 1;
+        SurfRoundRect(s, &inner, radius - 1, 0, fill, 255);
+    }
+    else if (hot)
+    {
+        SurfRoundRect(s, &card, radius, 0, g_palette.hover, 255);
+    }
+    else if (!first)
+    {
+        // At rest an inactive tab is not a shape at all - it is a name on the well, the way a
+        // browser draws them. What separates two of them is a rule, and it lives inside the right
+        // tab's own rectangle so that hovering one tab can never change a pixel of another.
+        RECT rule;
+        rule.left   = card.left;
+        rule.right  = card.left + 1;
+        rule.top    = card.top + Scaled(7, dpi);
+        rule.bottom = card.bottom - Scaled(6, dpi);
+        SurfFill(s, &rule, g_palette.separator);
+    }
 
     BOOL hasClose = !IsRectEmpty(&close) && close.right <= tab.right;
 
@@ -882,35 +1551,37 @@ static void DrawOneTab(StripState* state, HDC dc, HWND frame,
     WordTabFrameTitle(frame, title, 256);
 
     RECT text = tab;
-    text.left += Scaled(10, state->dpi);
+    text.left += Scaled(12, dpi);
     // The name stops before the button rather than running under it. A title clipped by an
     // ellipsis reads as a long name; one running under a close button reads as a bug.
-    text.right = hasClose ? (close.left - Scaled(4, state->dpi))
-                          : (tab.right - Scaled(8, state->dpi));
-    if (text.right > text.left)
+    text.right = hasClose ? (close.left - Scaled(4, dpi))
+                          : (tab.right - Scaled(10, dpi));
+    if (text.right > text.left && s->dc)
     {
-        SetTextColor(dc, selected ? g_textColor : g_idleTextColor);
-        DrawTextW(dc, title, -1, &text,
+        SetTextColor(s->dc, (selected || lifted) ? g_palette.text : g_palette.textIdle);
+        DrawTextW(s->dc, title, -1, &text,
                   DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
 
     if (hasClose)
     {
+        GdiFlush();
         BOOL hotClose  = (state->hotKind == HIT_CLOSE && state->hotFrame == frame);
         BOOL downClose = (state->pressKind == HIT_CLOSE && state->pressFrame == frame);
-        DrawChip(dc, &close, hotClose, downClose, state->dpi);
-        DrawGlyphLines(dc, &close, hotClose || downClose ? g_glyphHotColor : g_glyphColor,
-                       state->dpi, TRUE);
+        DrawChip(s, &close, hotClose, downClose, dpi);
+        DrawGlyph(s, &close, hotClose || downClose ? g_palette.glyphHot : g_palette.glyph,
+                  dpi, TRUE);
     }
 }
 
-// Everything in the strip, onto whatever device context is handed in.
+// Everything in the strip, composited into the surface.
 //
-// Separate from PaintStrip so the same drawing serves WM_PAINT, the off-screen bitmap it paints
-// through, and WM_PRINTCLIENT - which is how the check scripts photograph a strip without a camera.
-static void DrawStrip(StripState* state, HDC dc, const RECT* client)
+// Separate from PaintStrip so the same drawing serves WM_PAINT and WM_PRINTCLIENT - which is how the
+// check scripts photograph a strip without a camera. Anything that only happened on the WM_PAINT
+// path would be a thing the photographs could not see.
+static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
 {
-    FillRect(dc, client, g_backBrush);
+    SurfFill(s, client, g_palette.back);
 
     // The tabs are the stack's, not this window's. Every window in the stack draws the same row
     // with the same one selected, which is what makes switching look like a strip standing still
@@ -922,9 +1593,13 @@ static void DrawStrip(StripState* state, HDC dc, const RECT* client)
     StripLayout layout;
     ComputeLayout(state, client, count, &layout);
 
-    HGDIOBJ oldFont = SelectObject(dc, state->font ? (HGDIOBJ)state->font
-                                                   : GetStockObject(DEFAULT_GUI_FONT));
-    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ oldFont = SelectObject(s->dc, state->font ? (HGDIOBJ)state->font
+                                                      : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(s->dc, TRANSPARENT);
+
+    // Where the active card ends up, so the hairline below can be drawn around it rather than
+    // through it. Left at nothing when no card is active, which is the empty row.
+    int skipLeft = 0, skipRight = 0;
 
     // The tab being carried, if it is one of ours. Held out of the loop and drawn afterwards, so it
     // is on top of the tabs it is passing over rather than half under them.
@@ -953,7 +1628,15 @@ static void DrawStrip(StripState* state, HDC dc, const RECT* client)
                        (state->hotKind == HIT_TAB || state->hotKind == HIT_CLOSE)) ||
                       (state->menuFrame && state->menuFrame == frames[i]);
 
-        DrawOneTab(state, dc, frames[i], tab, layout.close[i], (i == activeIndex), hotTab);
+        DrawOneTab(state, s, frames[i], tab, layout.close[i],
+                   (i == activeIndex), hotTab, FALSE, (i == 0));
+
+        if (i == activeIndex)
+        {
+            int inset = Scaled(TAB_LOGICAL_INSET, state->dpi);
+            skipLeft  = tab.left + inset;
+            skipRight = tab.right - inset;
+        }
     }
 
     if (carried >= 0)
@@ -975,7 +1658,15 @@ static void DrawStrip(StripState* state, HDC dc, const RECT* client)
         {
             if (tab.right > client->right)
                 tab.right = client->right;
-            DrawOneTab(state, dc, g_dragFrame, tab, close, (carried == activeIndex), TRUE);
+            DrawOneTab(state, s, g_dragFrame, tab, close,
+                       (carried == activeIndex), TRUE, TRUE, FALSE);
+
+            if (carried == activeIndex)
+            {
+                int inset = Scaled(TAB_LOGICAL_INSET, state->dpi);
+                skipLeft  = tab.left + inset;
+                skipRight = tab.right - inset;
+            }
         }
     }
 
@@ -995,23 +1686,246 @@ static void DrawStrip(StripState* state, HDC dc, const RECT* client)
                 hotPlus = PtInRect(&layout.plus, cursor) ? TRUE : FALSE;
         }
         BOOL downPlus = (state->pressKind == HIT_PLUS);
-        DrawChip(dc, &layout.plus, hotPlus, downPlus, state->dpi);
-        DrawGlyphLines(dc, &layout.plus, hotPlus || downPlus ? g_glyphHotColor : g_glyphColor,
-                       state->dpi, FALSE);
+        GdiFlush();
+        DrawChip(s, &layout.plus, hotPlus, downPlus, state->dpi);
+        DrawGlyph(s, &layout.plus, hotPlus || downPlus ? g_palette.glyphHot : g_palette.glyph,
+                  state->dpi, FALSE);
+    }
+
+    // The empty row, which since the last slice is a state rather than an accident: this window has
+    // no document open, it is not in the stack, and the row has nothing to list. It used to be a
+    // bare band with a + in the corner, which reads as a row that has failed to draw.
+    //
+    // The message is painted and nothing more. It is deliberately not part of the +'s hit rectangle,
+    // because that rectangle is the one thing tools\check-startscreen.ps1 uses to prove the row is
+    // empty without looking at a single pixel, and widening it would put the + under the point that
+    // suite clicks to prove nothing is there.
+    if (count == 0 && s->dc)
+    {
+        RECT text = *client;
+        text.left = (layout.hasPlus ? layout.plus.right : client->left)
+                    + Scaled(TAB_LOGICAL_PAD * 2, state->dpi);
+        text.right -= Scaled(TAB_LOGICAL_PAD, state->dpi);
+        if (text.right > text.left)
+        {
+            SetTextColor(s->dc, g_palette.textIdle);
+            DrawTextW(s->dc, L"No document open", -1, &text,
+                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+    }
+
+    SelectObject(s->dc, oldFont);
+    GdiFlush();
+
+    // A hairline along the bottom, so the strip reads as part of Word's chrome rather than as a
+    // rectangle dropped on top of it - except under the active card, which runs down to meet the
+    // document instead. That gap is the whole difference between a row of buttons and a row of tabs:
+    // one of them belongs to what is underneath it.
+    RECT line = *client;
+    line.top = line.bottom - 1;
+
+    if (skipRight > skipLeft)
+    {
+        RECT left = line;
+        left.right = skipLeft;
+        if (left.right > left.left)
+            SurfFill(s, &left, g_palette.edge);
+
+        RECT right = line;
+        right.left = skipRight;
+        if (right.right > right.left)
+            SurfFill(s, &right, g_palette.edge);
+    }
+    else
+    {
+        SurfFill(s, &line, g_palette.edge);
+    }
+}
+
+// The flat renderer, which is what the strip looked like before this slice.
+//
+// Two jobs: it is what `HKCU\Software\WordTab\TabStyle=0` gives back, so a visual regression can be
+// bisected the way every other piece of this add-in can; and it is what happens if the surface
+// cannot be made at all, because a band that fails to draw inside Word is worse than a plain one.
+static void DrawStripFlat(StripState* state, HDC dc, const RECT* client)
+{
+    HBRUSH back = CreateSolidBrush(g_palette.back);
+    HBRUSH card = CreateSolidBrush(g_palette.selected);
+    HBRUSH hover = CreateSolidBrush(g_palette.hover);
+    HBRUSH edge = CreateSolidBrush(g_palette.edge);
+    HPEN   pen  = CreatePen(PS_SOLID, 1, g_palette.edge);
+
+    if (back)
+        FillRect(dc, client, back);
+
+    HWND frames[MAX_STRIPS];
+    int  activeIndex = 0;
+    int  count = StackTabs(state->frame, frames, MAX_STRIPS, &activeIndex);
+
+    StripLayout layout;
+    ComputeLayout(state, client, count, &layout);
+
+    HGDIOBJ oldFont = SelectObject(dc, state->font ? (HGDIOBJ)state->font
+                                                   : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(dc, TRANSPARENT);
+
+    for (int i = 0; i < layout.count; i++)
+    {
+        RECT tab = layout.tab[i];
+        if (tab.right <= tab.left || tab.left >= client->right)
+            break;
+        if (tab.right > client->right)
+            tab.right = client->right;
+
+        BOOL selected = (i == activeIndex);
+        BOOL hotTab = ((state->hotFrame == frames[i]) &&
+                       (state->hotKind == HIT_TAB || state->hotKind == HIT_CLOSE)) ||
+                      (state->menuFrame && state->menuFrame == frames[i]);
+
+        if (selected && card)     FillRect(dc, &tab, card);
+        else if (hotTab && hover) FillRect(dc, &tab, hover);
+
+        if (pen)
+        {
+            HGDIOBJ oldPen   = SelectObject(dc, pen);
+            HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, tab.left, tab.top, tab.right, tab.bottom + 1);
+            SelectObject(dc, oldBrush);
+            SelectObject(dc, oldPen);
+        }
+
+        wchar_t title[256];
+        WordTabFrameTitle(frames[i], title, 256);
+
+        BOOL hasClose = !IsRectEmpty(&layout.close[i]);
+        RECT text = tab;
+        text.left += Scaled(10, state->dpi);
+        text.right = hasClose ? (layout.close[i].left - Scaled(4, state->dpi))
+                              : (tab.right - Scaled(8, state->dpi));
+        if (text.right > text.left)
+        {
+            SetTextColor(dc, selected ? g_palette.text : g_palette.textIdle);
+            DrawTextW(dc, title, -1, &text,
+                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+
+        if (hasClose)
+        {
+            HPEN glyph = CreatePen(PS_SOLID, Scaled(1, state->dpi), g_palette.glyph);
+            if (glyph)
+            {
+                RECT box = layout.close[i];
+                int inset = Scaled(5, state->dpi);
+                HGDIOBJ oldPen = SelectObject(dc, glyph);
+                MoveToEx(dc, box.left + inset, box.top + inset, NULL);
+                LineTo(dc, box.right - inset, box.bottom - inset);
+                MoveToEx(dc, box.right - inset - 1, box.top + inset, NULL);
+                LineTo(dc, box.left + inset - 1, box.bottom - inset);
+                SelectObject(dc, oldPen);
+                DeleteObject(glyph);
+            }
+        }
+    }
+
+    if (layout.hasPlus)
+    {
+        HPEN glyph = CreatePen(PS_SOLID, Scaled(1, state->dpi), g_palette.glyph);
+        if (glyph)
+        {
+            int cx  = (layout.plus.left + layout.plus.right) / 2;
+            int cy  = (layout.plus.top + layout.plus.bottom) / 2;
+            int arm = Scaled(5, state->dpi);
+            HGDIOBJ oldPen = SelectObject(dc, glyph);
+            MoveToEx(dc, cx - arm, cy, NULL);
+            LineTo(dc, cx + arm + 1, cy);
+            MoveToEx(dc, cx, cy - arm, NULL);
+            LineTo(dc, cx, cy + arm + 1);
+            SelectObject(dc, oldPen);
+            DeleteObject(glyph);
+        }
     }
 
     SelectObject(dc, oldFont);
 
-    // A hairline along the bottom, so the strip reads as part of Word's chrome rather than as a
-    // rectangle dropped on top of it.
     RECT line = *client;
     line.top = line.bottom - 1;
-    HBRUSH edge = CreateSolidBrush(g_edgeColor);
     if (edge)
-    {
         FillRect(dc, &line, edge);
-        DeleteObject(edge);
+
+    if (back)  DeleteObject(back);
+    if (card)  DeleteObject(card);
+    if (hover) DeleteObject(hover);
+    if (edge)  DeleteObject(edge);
+    if (pen)   DeleteObject(pen);
+}
+
+// The back buffer, made on demand and kept. `reference` is only used for its colour format, so it is
+// as valid to build one against the foreign DC WM_PRINTCLIENT arrives with as against our own.
+static BOOL EnsureSurface(StripState* state, HDC reference, int w, int h)
+{
+    if (state->dib && state->bits && state->memDc && state->dibW == w && state->dibH == h)
+        return TRUE;
+
+    ReleaseSurface(state);
+    if (w <= 0 || h <= 0 || w > 32768 || h > 4096)
+        return FALSE;
+
+    BITMAPINFO info;
+    memset(&info, 0, sizeof(info));
+    info.bmiHeader.biSize        = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth       = w;
+    info.bmiHeader.biHeight      = -h;              // top-down, so row 0 is the top one
+    info.bmiHeader.biPlanes      = 1;
+    info.bmiHeader.biBitCount    = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    HDC dc = CreateCompatibleDC(reference);
+    if (!dc)
+        return FALSE;
+
+    void* bits = NULL;
+    HBITMAP dib = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!dib || !bits)
+    {
+        if (dib) DeleteObject(dib);
+        DeleteDC(dc);
+        return FALSE;
     }
+
+    state->dibOld = (HBITMAP)SelectObject(dc, dib);
+    state->memDc  = dc;
+    state->dib    = dib;
+    state->bits   = (BYTE*)bits;
+    state->dibW   = w;
+    state->dibH   = h;
+    return TRUE;
+}
+
+static void DrawStrip(StripState* state, HDC dc, const RECT* client)
+{
+    // A paint can be the first thing that happens to a strip, before any janitor tick has had a
+    // chance to look at the ribbon. Something has to be on the palette by the time anything is
+    // drawn with it.
+    if (!g_paletteReady)
+        ApplyFallbackPalette(L"first paint");
+
+    int w = client->right - client->left;
+    int h = client->bottom - client->top;
+
+    if (g_lookEnabled && EnsureSurface(state, dc, w, h))
+    {
+        Surface surface;
+        surface.bits = state->bits;
+        surface.w    = w;
+        surface.h    = h;
+        surface.dc   = state->memDc;
+
+        DrawStripSoft(state, &surface, client);
+        BitBlt(dc, client->left, client->top, w, h, state->memDc, 0, 0, SRCCOPY);
+        return;
+    }
+
+    DrawStripFlat(state, dc, client);
 }
 
 static void PaintStrip(StripState* state, HWND hwnd)
@@ -1024,29 +1938,297 @@ static void PaintStrip(StripState* state, HWND hwnd)
     RECT client;
     GetClientRect(hwnd, &client);
 
-    // Drawn into an off-screen bitmap and blitted once. Hover means the strip now repaints whenever
-    // the pointer crosses a tab boundary, and painting straight to the screen shows the background
-    // fill before the tabs land on it - which at 60 crossings a second is a flicker under the
-    // pointer, exactly where the user is looking.
-    HDC     mem = CreateCompatibleDC(dc);
-    HBITMAP bmp = mem ? CreateCompatibleBitmap(dc, client.right, client.bottom) : NULL;
-
-    if (mem && bmp)
-    {
-        HGDIOBJ oldBitmap = SelectObject(mem, bmp);
-        DrawStrip(state, mem, &client);
-        BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, oldBitmap);
-    }
-    else
-    {
-        DrawStrip(state, dc, &client);
-    }
-
-    if (bmp) DeleteObject(bmp);
-    if (mem) DeleteDC(mem);
+    // The double buffer used to live here: a compatible bitmap made and thrown away every paint,
+    // because hover repaints the strip whenever the pointer crosses a tab boundary and painting
+    // straight to the screen shows the background fill before the tabs land on it - a flicker under
+    // the pointer, exactly where the user is looking.
+    //
+    // It has moved into DrawStrip, and is now a 32-bit DIB kept for the life of the strip. Two
+    // reasons. Compositing needs a buffer it can read back, which a screen-compatible bitmap is not;
+    // and WM_PRINTCLIENT went through DrawStrip *without* the buffer, so the photographs the check
+    // scripts take were of a different code path from the one on screen. Now there is one path.
+    DrawStrip(state, dc, &client);
 
     EndPaint(hwnd, &ps);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The context menu, owner-drawn.
+//
+// A Win32 popup menu is a system menu. It takes its colours from the system, and on Windows 11 the
+// system's menu colours are light whatever the app around them looks like - so on a dark Word the
+// tab menu was a white rectangle. That was recorded as a gap when the menu shipped
+// (RESULT-menu.md), with the two possible routes named: owner-draw it, or use the undocumented
+// uxtheme ordinals that would restyle menus for the whole of Word. This is the first route. The
+// second was never a candidate: it changes a host application's rendering globally, from an add-in.
+//
+// Owner-drawing a menu draws its *items*. The window behind them, its margins, its border and its
+// Windows 11 rounded corners stay the system's; SetMenuInfo with MIM_BACKGROUND is the only handle
+// on the first of those and it is enough - photographed, the result is dark edge to edge.
+//
+// Four things were measured before any of this was written, because between them they decide whether
+// the 32 checks in tools\check-menu.ps1 survive - and that suite is the only one that deliberately
+// provokes Word's save prompt, so it is not one to break casually:
+//
+//   1. **An owner-drawn item keeps its string.** The documentation says GetMenuString has nothing to
+//      return for an MFT_OWNERDRAW item. Measured, with the string supplied through MIIM_STRING in
+//      the same call, it returns it: `GetMenuString=5 '&Save'`. check-menu reads every label that
+//      way from outside the process and asserts all seven; nothing there had to change.
+//   2. **Mnemonics still work.** Typing `n` over the owner-drawn menu returned CMD_NEW exactly as it
+//      does over a system one, and WM_MENUCHAR was never sent - because the string is still there to
+//      match against. No third case in the frame subclass.
+//   3. **`MFT_SEPARATOR | MFT_OWNERDRAW` is a real combination**, undocumented though it is. The item
+//      still reports MF_SEPARATOR to GetMenuState - which is what check-menu reads to expect a `-` -
+//      *and* it is sent to us to draw. A plain MF_SEPARATOR is drawn by Windows as a bright rule
+//      running the full width of the menu, which on a dark background is exactly wrong.
+//   4. **WM_MEASUREITEM and WM_DRAWITEM arrive with CtlType == ODT_MENU and dwItemData intact**,
+//      TPM_NONOTIFY notwithstanding - those are requests, not notifications.
+//
+// They arrive at the menu's *owner*, which is Word's frame and not the strip (see below for why it
+// has to be), so they land in frames.cpp's subclass and are forwarded back here.
+// ---------------------------------------------------------------------------------------------
+
+#define MENU_MAGIC 0x57544144u   // 'WTAD', after 'WTAB' and 'WTAC' elsewhere in this add-in
+
+struct MenuItemTag
+{
+    DWORD   magic;
+    wchar_t label[40];      // empty for a separator
+};
+
+static MenuItemTag g_menuItems[8];
+static int         g_menuItemCount = 0;
+static HMENU       g_openMenu      = NULL;
+static int         g_menuDpi       = 96;
+static HWND        g_menuOwner     = NULL;
+
+// Is this item one of ours?
+//
+// The range check is the point, and it is not paranoia. `itemData` is a value chosen by whoever
+// built the menu, and menus owned by this frame are not all ours: Word's own Alt+Space menu is a
+// real HMENU, shell extensions inject items, and Office Tab is installed on these machines and could
+// be doing exactly what we are doing on the same window. Dereferencing a pointer another program
+// chose, to read a magic number out of it, is a wild read inside Word's process - which is the whole
+// class of thing the "nothing escapes" rule exists to prevent. So: prove it points into our own
+// array, on an element boundary, and only then read it.
+static MenuItemTag* MenuTagOf(ULONG_PTR itemData)
+{
+    if (!itemData)
+        return NULL;
+
+    const char* base = (const char*)&g_menuItems[0];
+    const char* p    = (const char*)itemData;
+    if (p < base || p >= base + sizeof(g_menuItems))
+        return NULL;
+    if ((size_t)(p - base) % sizeof(MenuItemTag) != 0)
+        return NULL;
+
+    MenuItemTag* tag = (MenuItemTag*)itemData;
+    return (tag->magic == MENU_MAGIC) ? tag : NULL;
+}
+
+static void MenuBuildBegin(StripState* state)
+{
+    g_menuItemCount = 0;
+    g_menuDpi       = state->dpi > 0 ? state->dpi : 96;
+    g_menuOwner     = state->frame;
+    memset(g_menuItems, 0, sizeof(g_menuItems));
+}
+
+static void MenuAddItem(HMENU menu, UINT id, const wchar_t* label, BOOL enabled)
+{
+    MENUITEMINFOW info;
+    memset(&info, 0, sizeof(info));
+    info.cbSize     = sizeof(info);
+    info.fMask      = MIIM_ID | MIIM_STATE | MIIM_STRING;
+    info.wID        = id;
+    info.fState     = enabled ? MFS_ENABLED : MFS_GRAYED;
+    info.dwTypeData = (LPWSTR)label;
+
+    // MF_GRAYED has to stay on the item itself and not merely be drawn: it is the state
+    // check-menu.ps1 reads through GetMenuState to assert that Close Others is unavailable with one
+    // document open, and an owner-drawn item Windows does no graying for.
+    if (g_lookEnabled && g_menuItemCount < (int)(sizeof(g_menuItems) / sizeof(g_menuItems[0])))
+    {
+        MenuItemTag* tag = &g_menuItems[g_menuItemCount++];
+        tag->magic = MENU_MAGIC;
+        wcsncpy(tag->label, label, 39);
+        tag->label[39] = 0;
+
+        info.fMask     |= MIIM_FTYPE | MIIM_DATA;
+        info.fType      = MFT_OWNERDRAW;
+        info.dwItemData = (ULONG_PTR)tag;
+    }
+
+    InsertMenuItemW(menu, GetMenuItemCount(menu), TRUE, &info);
+}
+
+static void MenuAddSeparator(HMENU menu)
+{
+    if (!g_lookEnabled || g_menuItemCount >= (int)(sizeof(g_menuItems) / sizeof(g_menuItems[0])))
+    {
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        return;
+    }
+
+    MenuItemTag* tag = &g_menuItems[g_menuItemCount++];
+    tag->magic    = MENU_MAGIC;
+    tag->label[0] = 0;
+
+    MENUITEMINFOW info;
+    memset(&info, 0, sizeof(info));
+    info.cbSize     = sizeof(info);
+    info.fMask      = MIIM_FTYPE | MIIM_DATA;
+    info.fType      = MFT_SEPARATOR | MFT_OWNERDRAW;
+    info.dwItemData = (ULONG_PTR)tag;
+    InsertMenuItemW(menu, GetMenuItemCount(menu), TRUE, &info);
+}
+
+static void MenuBuildEnd(HMENU menu)
+{
+    if (!g_lookEnabled || !g_menuBackBrush)
+        return;
+
+    // Everything outside the item rectangles - the gutter down the left, the margin at top and
+    // bottom - belongs to the menu window, not to us. This is the whole of our say in it.
+    MENUINFO mi;
+    memset(&mi, 0, sizeof(mi));
+    mi.cbSize  = sizeof(mi);
+    mi.fMask   = MIM_BACKGROUND | MIM_APPLYTOSUBMENUS;
+    mi.hbrBack = g_menuBackBrush;
+    SetMenuInfo(menu, &mi);
+}
+
+// The two halves, called from frames.cpp with the frame the message arrived on. Both answer FALSE
+// for anything that is not one of ours, and the caller must chain those on untouched.
+//
+// They run inside TrackPopupMenu's modal loop, on Word's UI thread. The rules there are the ones
+// ShowTabMenu already lives by: look nothing up by a pointer captured earlier, allocate nothing per
+// item, and never log - WM_DRAWITEM fires per item and again per item on every hover change, and a
+// log line is a file write.
+BOOL StripOnMenuMeasure(HWND frame, MEASUREITEMSTRUCT* item)
+{
+    if (!item || item->CtlType != ODT_MENU)
+        return FALSE;
+
+    MenuItemTag* tag = MenuTagOf(item->itemData);
+    if (!tag)
+        return FALSE;
+
+    int dpi = g_menuDpi;
+    if (tag->label[0] == 0)
+    {
+        item->itemWidth  = 0;
+        item->itemHeight = (UINT)Scaled(7, dpi);
+        return TRUE;
+    }
+
+    // Measured against the real font, because a menu sized from a guess is a menu with its longest
+    // item clipped at some DPI and not at others.
+    HDC dc = GetDC(frame);
+    SIZE size;
+    size.cx = Scaled(120, dpi);
+    size.cy = Scaled(16, dpi);
+    if (dc)
+    {
+        StripState* state = FindByFrame(frame);
+        HGDIOBJ old = SelectObject(dc, (state && state->font) ? (HGDIOBJ)state->font
+                                                              : GetStockObject(DEFAULT_GUI_FONT));
+        GetTextExtentPoint32W(dc, tag->label, (int)wcslen(tag->label), &size);
+        SelectObject(dc, old);
+        ReleaseDC(frame, dc);
+    }
+
+    // The empty column on the left is where Windows would put a check mark or an icon. Leaving room
+    // for it is most of what makes an owner-drawn menu still read as a menu.
+    item->itemWidth  = (UINT)(size.cx + Scaled(28 + 28, dpi));
+    item->itemHeight = (UINT)(size.cy + Scaled(9, dpi));
+    if (item->itemHeight < (UINT)Scaled(24, dpi))
+        item->itemHeight = (UINT)Scaled(24, dpi);
+    return TRUE;
+}
+
+BOOL StripOnMenuDraw(HWND frame, DRAWITEMSTRUCT* item)
+{
+    if (!item || item->CtlType != ODT_MENU || !item->hDC)
+        return FALSE;
+
+    MenuItemTag* tag = MenuTagOf(item->itemData);
+    if (!tag)
+        return FALSE;
+
+    // For a menu, hwndItem is the HMENU. Comparing it against the one we put up makes this exact
+    // rather than merely well-guarded, and costs one comparison.
+    if (g_openMenu && (HMENU)item->hwndItem != g_openMenu)
+        return FALSE;
+
+    HDC  dc  = item->hDC;
+    RECT box = item->rcItem;
+    int  dpi = g_menuDpi;
+
+    HBRUSH back = CreateSolidBrush(g_palette.menuBack);
+    if (back)
+    {
+        FillRect(dc, &box, back);
+        DeleteObject(back);
+    }
+
+    if (tag->label[0] == 0)
+    {
+        RECT rule = box;
+        rule.top    = (box.top + box.bottom) / 2;
+        rule.bottom = rule.top + 1;
+        rule.left  += Scaled(10, dpi);
+        rule.right -= Scaled(10, dpi);
+        HBRUSH line = CreateSolidBrush(g_palette.menuLine);
+        if (line)
+        {
+            FillRect(dc, &rule, line);
+            DeleteObject(line);
+        }
+        return TRUE;
+    }
+
+    BOOL grayed   = (item->itemState & (ODS_GRAYED | ODS_DISABLED)) != 0;
+    BOOL selected = (item->itemState & ODS_SELECTED) != 0;
+
+    // A disabled item does not highlight. Windows would not have highlighted it either, and an
+    // unavailable command that lights up under the pointer is an invitation to click it.
+    if (selected && !grayed)
+    {
+        RECT hot = box;
+        hot.left   += Scaled(3, dpi);
+        hot.right  -= Scaled(3, dpi);
+        hot.top    += Scaled(1, dpi);
+        hot.bottom -= Scaled(1, dpi);
+        HBRUSH brush = CreateSolidBrush(g_palette.menuHot);
+        if (brush)
+        {
+            FillRect(dc, &hot, brush);
+            DeleteObject(brush);
+        }
+    }
+
+    StripState* state = FindByFrame(frame);
+    HGDIOBJ oldFont = SelectObject(dc, (state && state->font) ? (HGDIOBJ)state->font
+                                                             : GetStockObject(DEFAULT_GUI_FONT));
+    int oldMode = SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, grayed ? g_palette.menuTextDim : g_palette.menuText);
+
+    RECT text = box;
+    text.left += Scaled(28, dpi);
+
+    // ODS_NOACCEL means the user has not pressed Alt, so the mnemonic underlines are not being
+    // shown anywhere else either. Honouring it is the difference between a menu that matches the
+    // rest of Windows and one that always looks like Alt is held down.
+    UINT format = DT_SINGLELINE | DT_VCENTER | DT_LEFT;
+    if (item->itemState & ODS_NOACCEL)
+        format |= DT_HIDEPREFIX;
+    DrawTextW(dc, tag->label, -1, &text, format);
+
+    SetBkMode(dc, oldMode);
+    SelectObject(dc, oldFont);
+    return TRUE;
 }
 
 // The context menu.
@@ -1075,21 +2257,24 @@ static void ShowTabMenu(HWND hwnd, POINT client, HWND target)
 
     int count = StackTabs(state->frame, NULL, MAX_TABS, NULL);
 
+    MenuBuildBegin(state);
+
     if (target)
     {
-        AppendMenuW(menu, MF_STRING, CMD_SAVE, L"&Save");
-        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(menu, MF_STRING, CMD_CLOSE, L"&Close");
-        AppendMenuW(menu, MF_STRING | (count > 1 ? MF_ENABLED : MF_GRAYED),
-                    CMD_CLOSE_OTHERS, L"Close &Others");
-        AppendMenuW(menu, MF_STRING, CMD_CLOSE_ALL, L"Close &All");
-        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        MenuAddItem(menu, CMD_SAVE, L"&Save", TRUE);
+        MenuAddSeparator(menu);
+        MenuAddItem(menu, CMD_CLOSE, L"&Close", TRUE);
+        MenuAddItem(menu, CMD_CLOSE_OTHERS, L"Close &Others", count > 1);
+        MenuAddItem(menu, CMD_CLOSE_ALL, L"Close &All", TRUE);
+        MenuAddSeparator(menu);
     }
 
     // On the empty part of the strip this is the whole menu. A right-click that produces nothing at
     // all reads as a dead area rather than as a deliberate one, and this is the command that has
     // nothing to do with any particular tab.
-    AppendMenuW(menu, MF_STRING, CMD_NEW, L"&New Document");
+    MenuAddItem(menu, CMD_NEW, L"&New Document", TRUE);
+
+    MenuBuildEnd(menu);
 
     // The tab stays lit for as long as the menu is up. A tab can be narrow enough that its name is
     // an ellipsis, and "Close All" arriving from a menu the user is no longer sure they aimed
@@ -1106,10 +2291,16 @@ static void ShowTabMenu(HWND hwnd, POINT client, HWND target)
     // user clicks away from it. The WM_NULL afterwards is the other half of that rule.
     SetForegroundWindow(state->frame);
 
+    // Set before the modal loop and cleared after it, so a WM_DRAWITEM arriving at the frame can be
+    // matched against the menu it belongs to rather than merely believed.
+    g_openMenu = menu;
+
     int chosen = (int)TrackPopupMenu(menu,
                                      TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN |
                                      TPM_RIGHTBUTTON,
                                      screen.x, screen.y, 0, state->frame, NULL);
+    g_openMenu = NULL;
+    g_menuItemCount = 0;
     DestroyMenu(menu);
 
     // Everything from before the modal loop is re-derived: the strip may have been detached and
@@ -1870,10 +3061,7 @@ static void TryBind(StripState* state)
     // window that has been visible all along as having just appeared, and re-derives a layout that
     // did not need re-deriving.
     state->wasVisible = (IsWindowVisible(state->frame) && !IsIconic(state->frame)) ? TRUE : FALSE;
-    state->dpi    = DpiOf(state->frame);
-    state->stripH = Scaled(STRIP_LOGICAL_H, state->dpi);
-    if (!state->font)
-        MakeFont(state);
+    ApplyMetrics(state);
 
     // refData carries the state pointer, so the procedure never has to search for it. The entries
     // live in a static array and are never moved, which is what makes that safe.
@@ -1944,6 +3132,7 @@ static void Restore(StripState* state)
         DeleteObject(state->font);
         state->font = NULL;
     }
+    ReleaseSurface(state);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2010,6 +3199,59 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
     // re-decided on the same cadence rather than tracked through events that Word does not always
     // send.
     StackJanitor();
+
+    // Has Word changed colour underneath us?
+    //
+    // This is a poll, and this project's standing rule is that transient state must be heard rather
+    // than sampled - got wrong twice over Word's save prompt, at some cost. The rule does not apply
+    // here and it is worth being precise about why: it is about state that can appear and disappear
+    // *inside* one tick, which a sampler cannot see at any cadence. A theme is not that. Somebody
+    // changes it in File > Account, it stays changed, and a sampler that is one tick late is one
+    // tick late rather than wrong.
+    //
+    // Sampling is the honest mechanism here for a second reason too: there is no event to hear. The
+    // strip is a WS_CHILD, and WM_SETTINGCHANGE is broadcast to top-level windows only.
+    //
+    // Every fourth tick, once, off the first strip that can answer - not once per window. Cost is a
+    // GetDC and twenty-four GetPixels every two seconds, and it stops at the first strip that gives
+    // a usable answer.
+    if (g_sampleEnabled)
+    {
+        static int countdown = 0;
+        if (--countdown <= 0)
+        {
+            countdown = 4;
+
+            // The outcome is logged when it *changes*, never per tick. A sampler that cannot read
+            // the ribbon looks exactly like a sampler that agrees with the fallback, because on this
+            // rig the two answers are the same number - so silence here costs a whole diagnosis.
+            static wchar_t lastWhy[192] = L"";
+            const wchar_t* why = L"no strip was ready to be asked";
+
+            for (int i = 0; i < g_stripCount; i++)
+            {
+                StripState* state = &g_strips[i];
+                if (!state->enabled || !state->strip || !IsWindow(state->frame))
+                    continue;
+                if (!IsWindowVisible(state->frame) || IsIconic(state->frame))
+                    continue;
+
+                COLORREF chrome;
+                if (SampleChrome(state, &chrome, &why))
+                {
+                    ApplyPalette(chrome, L"sampled from Word's ribbon");
+                    break;
+                }
+            }
+
+            if (wcscmp(why, lastWhy) != 0)
+            {
+                wcsncpy(lastWhy, why, 191);
+                lastWhy[191] = 0;
+                LogWrite(L"strip  chrome sample: %s", why);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2040,6 +3282,18 @@ void StripStart(void)
     // is out of the way rather than merely inert.
     g_dragEnabled = WordTabReadFlag(L"TabDrag", TRUE);
 
+    // The look. Off, the strip is what it was before this slice: flat rectangles with a full border,
+    // an aliased one-pixel x and +, a bare empty row, and a context menu drawn by the system in the
+    // system's colours. The palette is still derived rather than hand-picked, because that is a
+    // correction rather than a style - but nothing is composited and nothing is owner-drawn.
+    g_lookEnabled = WordTabReadFlag(L"TabStyle", TRUE);
+
+    // And the sampler on its own switch, because it is the one part of this that reads pixels out of
+    // a window belonging to Word. Off, the palette comes from the Office theme registry value the
+    // way it always did - which is the setting to try first if the strip is ever the wrong colour on
+    // a machine this has not been run on.
+    g_sampleEnabled = g_lookEnabled ? WordTabReadFlag(L"TabThemeSample", TRUE) : FALSE;
+
     if (!g_stripClass)
     {
         WNDCLASSEXW wc;
@@ -2053,36 +3307,11 @@ void StripStart(void)
         g_stripClass = RegisterClassExW(&wc);
     }
 
-    g_darkTheme = DarkThemeInUse();
-    if (g_darkTheme)
-    {
-        g_edgeColor     = RGB(77, 77, 77);
-        g_textColor     = RGB(255, 255, 255);
-        g_idleTextColor = RGB(186, 186, 186);
-        g_glyphColor    = RGB(186, 186, 186);
-        g_glyphHotColor = RGB(255, 255, 255);
-        if (!g_backBrush)     g_backBrush     = CreateSolidBrush(RGB(38, 38, 38));
-        if (!g_tabBrush)      g_tabBrush      = CreateSolidBrush(RGB(66, 66, 66));
-        if (!g_tabIdleBrush)  g_tabIdleBrush  = CreateSolidBrush(RGB(45, 45, 45));
-        if (!g_tabHotBrush)   g_tabHotBrush   = CreateSolidBrush(RGB(55, 55, 55));
-        if (!g_chipHotBrush)  g_chipHotBrush  = CreateSolidBrush(RGB(90, 90, 90));
-        if (!g_chipDownBrush) g_chipDownBrush = CreateSolidBrush(RGB(112, 112, 112));
-    }
-    else
-    {
-        g_edgeColor     = RGB(200, 198, 196);
-        g_textColor     = RGB(50, 49, 48);
-        g_idleTextColor = RGB(96, 94, 92);
-        g_glyphColor    = RGB(96, 94, 92);
-        g_glyphHotColor = RGB(32, 31, 30);
-        if (!g_backBrush)     g_backBrush     = CreateSolidBrush(RGB(237, 235, 233));
-        if (!g_tabBrush)      g_tabBrush      = CreateSolidBrush(RGB(255, 255, 255));
-        if (!g_tabIdleBrush)  g_tabIdleBrush  = CreateSolidBrush(RGB(225, 223, 221));
-        if (!g_tabHotBrush)   g_tabHotBrush   = CreateSolidBrush(RGB(240, 238, 236));
-        if (!g_chipHotBrush)  g_chipHotBrush  = CreateSolidBrush(RGB(205, 203, 201));
-        if (!g_chipDownBrush) g_chipDownBrush = CreateSolidBrush(RGB(188, 186, 184));
-    }
-    if (!g_edgePen) g_edgePen = CreatePen(PS_SOLID, 1, g_edgeColor);
+    // Something has to be on the palette before the first paint. The registry answer, which is the
+    // one available this early: no window of Word's exists yet to take a colour off. The janitor
+    // replaces it with the sampled one within two seconds, and ApplyPalette does nothing at all if
+    // the two agree - which on this rig they do.
+    ApplyFallbackPalette(L"from the Office theme setting");
 
     // A thread timer rather than a window timer: it needs no window of its own, and Word's message
     // loop dispatches it to the callback like any other.
@@ -2090,13 +3319,15 @@ void StripStart(void)
         g_janitor = SetTimer(NULL, 0, 500, JanitorProc);
 
     LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s  "
-             L"tab menu=%s  tab drag=%s",
+             L"tab menu=%s  tab drag=%s  tab style=%s  theme sample=%s",
              g_stripClass ? L"registered" : L"FAILED",
              g_janitor ? L"running" : L"FAILED", STRIP_LOGICAL_H,
-             g_darkTheme ? L"dark" : L"light",
+             g_palette.dark ? L"dark" : L"light",
              g_buttonsEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabButtons=0)",
              g_menuEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabMenu=0)",
-             g_dragEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabDrag=0)");
+             g_dragEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabDrag=0)",
+             g_lookEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabStyle=0)",
+             g_sampleEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabThemeSample=0)");
 }
 
 void StripAttachFrame(HWND frame)
@@ -2112,9 +3343,7 @@ void StripAttachFrame(HWND frame)
     memset(state, 0, sizeof(*state));
     state->frame   = frame;
     state->enabled = TRUE;
-    state->dpi     = DpiOf(frame);
-    state->stripH  = Scaled(STRIP_LOGICAL_H, state->dpi);
-    MakeFont(state);
+    ApplyMetrics(state);
 
     TryBind(state);
 }
@@ -2137,6 +3366,7 @@ void StripDetachFrame(HWND frame)
         state->wwf = NULL;
         state->strip = NULL;
         if (state->font) { DeleteObject(state->font); state->font = NULL; }
+        ReleaseSurface(state);
     }
 
     int index = (int)(state - g_strips);
@@ -2170,9 +3400,10 @@ void StripOnFrameDpiChanged(HWND frame)
 
     LogWrite(L"strip  hwnd=0x%p  DPI %d -> %d, re-scaling the strip", (void*)frame, state->dpi, dpi);
 
-    state->dpi    = dpi;
-    state->stripH = Scaled(STRIP_LOGICAL_H, dpi);
-    MakeFont(state);
+    // One call, and it is the same one StripAttachFrame and TryBind make. Everything derived from
+    // DPI - the height, the font, the size of the back buffer - is rebuilt from the new value in one
+    // place, which is what stops the next thing derived from DPI being rebuilt in only two of three.
+    ApplyMetrics(state);
 
     // The old shift was computed at the old scale, so the current rect is not a natural one. Undo
     // it, then let the next layout - or the janitor - re-apply at the new height.
@@ -2200,6 +3431,15 @@ void StripStop(void)
     for (int i = 0; i < g_stripCount; i++)
         Restore(&g_strips[i]);
     g_stripCount = 0;
+
+    // The palette's two handles. This used to free nothing at all, which was harmless while they
+    // were created once and leaked once at process exit - but they are re-created now every time
+    // Word changes theme, and a leak per theme change is a different thing.
+    if (g_backBrush)     { DeleteObject(g_backBrush);     g_backBrush = NULL; }
+    if (g_menuBackBrush) { DeleteObject(g_menuBackBrush); g_menuBackBrush = NULL; }
+    g_paletteReady = FALSE;
+    g_openMenu = NULL;
+    g_menuItemCount = 0;
 
     // The window class is not unregistered here: frames.cpp's FramesStop does the same for its
     // coordinator class, and the module is pinned in the process anyway.

@@ -407,6 +407,28 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         StripOnFrameDpiChanged(hwnd);
         break;
 
+    // The tab context menu is owner-drawn, and an owner-drawn menu asks the window that owns it to
+    // measure and paint each item. Its owner is this frame - it has to be; see StripOnMenuMeasure in
+    // wordtab.h - so the requests arrive here.
+    //
+    // These are the first two cases in this file that return without chaining, and the condition is
+    // the whole of their safety. Word owner-draws its own menus and controls on this same window,
+    // and any of them would arrive here too; answering for one of those would stop it drawing. So
+    // the strip answers TRUE only for items it can prove are its own, and everything else falls
+    // through the `break` to DefSubclassProc exactly as before.
+    //
+    // Nothing is logged from either: WM_DRAWITEM fires per item, and again per item every time the
+    // highlight moves, and a log line here is a file write inside a modal loop.
+    case WM_MEASUREITEM:
+        if (StripOnMenuMeasure(hwnd, (MEASUREITEMSTRUCT*)lParam))
+            return TRUE;
+        break;
+
+    case WM_DRAWITEM:
+        if (StripOnMenuDraw(hwnd, (DRAWITEMSTRUCT*)lParam))
+            return TRUE;
+        break;
+
     case WM_NCDESTROY:
         // Last message a window ever gets. Detaching here is not optional: leaving our procedure
         // on a dead window, or in the chain after the DLL unloads, is a crash in Word.

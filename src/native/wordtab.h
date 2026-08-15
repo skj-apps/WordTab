@@ -140,6 +140,21 @@ void StripStart(void);
 void StripAttachFrame(HWND frame);
 void StripDetachFrame(HWND frame);
 void StripOnFrameDpiChanged(HWND frame);
+
+// The tab context menu is owner-drawn, so that it is dark on a dark Word instead of being a white
+// rectangle the system chose. An owner-drawn menu sends its measure and draw requests to the window
+// that *owns* it, and that has to be Word's frame rather than the strip: the strip is
+// WS_EX_NOACTIVATE and can never be foreground, and a popup menu whose owner is not foreground does
+// not dismiss when the user clicks away from it. So they arrive at frames.cpp and come back here.
+//
+// Both answer TRUE only for our own items, identified by a pointer into our own array rather than by
+// item id - the ids are 1 to 5 and would collide with anything. The frame must return TRUE without
+// chaining for those, and pass everything else through untouched: Word owner-draws its own menus on
+// this window, and so, for all we know, does the other tab add-in that is installed on these
+// machines.
+BOOL StripOnMenuMeasure(HWND frame, MEASUREITEMSTRUCT* item);
+BOOL StripOnMenuDraw(HWND frame, DRAWITEMSTRUCT* item);
+
 void StripStop(void);
 
 // What the stack needs from the strip. All of these exist because Word lays out only the focused
