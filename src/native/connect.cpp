@@ -86,6 +86,118 @@ static BSTR GetDocumentCount(IDispatch* app)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Word's Application object, held for the life of the connection.
+//
+// WordTab is a window program: it subclasses Word's frames, moves them and paints on them, and the
+// object model knows nothing about any of it. There is exactly one thing windows cannot do, which
+// is make a document - so the Application object is kept for that and for nothing else. Keeping it
+// in a file static rather than passing it around is deliberate: it is set once, on Word's UI thread,
+// and read from one place.
+// ---------------------------------------------------------------------------------------------
+
+static IDispatch* g_application = NULL;
+
+static void SetApplication(IDispatch* application)
+{
+    if (g_application)
+    {
+        g_application->Release();
+        g_application = NULL;
+    }
+    if (application)
+    {
+        application->AddRef();
+        g_application = application;
+    }
+}
+
+// Free the strings Word may have put in an EXCEPINFO. Skipping this leaks a BSTR every time a call
+// into Word fails, which is exactly when nobody is looking.
+static void ClearExceptionInfo(EXCEPINFO* error)
+{
+    if (!error)
+        return;
+    if (error->bstrSource)      { SysFreeString(error->bstrSource);      error->bstrSource = NULL; }
+    if (error->bstrDescription) { SysFreeString(error->bstrDescription); error->bstrDescription = NULL; }
+    if (error->bstrHelpFile)    { SysFreeString(error->bstrHelpFile);    error->bstrHelpFile = NULL; }
+}
+
+// Application.Documents.Add(), late-bound like everything else here so the build needs nothing from
+// Office.
+//
+// Word 2013 and later gives every document its own OpusApp frame, so the new document arrives as a
+// new top-level window - which the CBT hook sees, the strip binds and the janitor joins to the
+// stack. Nothing here has to place it or make it a tab: it becomes one by the same route every
+// other document does, which is the whole reason this is three calls rather than a feature.
+BOOL WordTabNewDocument(void)
+{
+    if (!g_application)
+    {
+        LogWrite(L"new document: no Application object - was OnConnection ever called?");
+        return FALSE;
+    }
+
+    DISPID documentsId = 0;
+    LPOLESTR name = (LPOLESTR)L"Documents";
+    HRESULT hr = g_application->GetIDsOfNames(IID_NULL, &name, 1, LOCALE_USER_DEFAULT, &documentsId);
+    if (FAILED(hr))
+    {
+        LogWrite(L"new document: Application has no Documents (hr=0x%08lX)", (unsigned long)hr);
+        return FALSE;
+    }
+
+    DISPPARAMS noArgs = { NULL, NULL, 0, 0 };
+    VARIANT documents;
+    VariantInit(&documents);
+
+    hr = g_application->Invoke(documentsId, IID_NULL, LOCALE_USER_DEFAULT,
+                               DISPATCH_PROPERTYGET, &noArgs, &documents, NULL, NULL);
+    if (FAILED(hr) || documents.vt != VT_DISPATCH || !documents.pdispVal)
+    {
+        LogWrite(L"new document: Documents unavailable (hr=0x%08lX vt=%d)",
+                 (unsigned long)hr, (int)documents.vt);
+        VariantClear(&documents);
+        return FALSE;
+    }
+
+    DISPID addId = 0;
+    name = (LPOLESTR)L"Add";
+    hr = documents.pdispVal->GetIDsOfNames(IID_NULL, &name, 1, LOCALE_USER_DEFAULT, &addId);
+    if (SUCCEEDED(hr))
+    {
+        VARIANT created;
+        VariantInit(&created);
+        EXCEPINFO error;
+        memset(&error, 0, sizeof(error));
+
+        // No arguments at all: a blank document on the Normal template, which is what Ctrl+N does.
+        // Every parameter of Documents.Add is optional, and leaving them out is how you say so
+        // through IDispatch.
+        hr = documents.pdispVal->Invoke(addId, IID_NULL, LOCALE_USER_DEFAULT,
+                                        DISPATCH_METHOD, &noArgs, &created, &error, NULL);
+
+        if (hr == DISP_E_EXCEPTION)
+        {
+            LogWrite(L"new document: Word raised an error - %s",
+                     error.bstrDescription ? error.bstrDescription : L"(no description)");
+        }
+        ClearExceptionInfo(&error);
+        VariantClear(&created);
+    }
+
+    VariantClear(&documents);
+
+    if (FAILED(hr))
+    {
+        LogWrite(L"new document: Documents.Add failed (hr=0x%08lX)", (unsigned long)hr);
+        return FALSE;
+    }
+
+    LogWrite(L"new document: Documents.Add succeeded - the new frame joins the stack by itself");
+    return TRUE;
+}
+
+// ---------------------------------------------------------------------------------------------
 // The load banner - the visible proof that we are inside Word.
 //
 // Shown on a background thread on purpose. A modal dialog on Word's UI thread during startup
@@ -306,6 +418,9 @@ public:
         m_addInInst = addInInst;
         if (m_addInInst) m_addInInst->AddRef();
 
+        // The strip's new-tab button reaches Word through this, and the strip is not a COM object.
+        SetApplication(application);
+
         // Interrogating the Application object is the proof we are talking to the real Word
         // rather than merely having been instantiated. The build number should match the one
         // recorded for this rig.
@@ -408,6 +523,7 @@ public:
 private:
     void ReleaseHostObjects()
     {
+        SetApplication(NULL);
         if (m_addInInst)   { m_addInInst->Release();   m_addInInst = NULL; }
         if (m_application) { m_application->Release(); m_application = NULL; }
     }

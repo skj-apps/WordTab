@@ -184,8 +184,12 @@ Test-Stacked 'After resizing the active window' | Out-Null
 
 # ---- clicking the tabs -------------------------------------------------------------------------
 #
-# The tab geometry mirrors TabRect in src\native\strip.cpp. If the two ever diverge, the clicks
-# land between tabs and the "distinct window per tab" assertion below fails loudly.
+# The tab geometry comes from [WordLayout]::Tabs, which mirrors ComputeLayout in
+# src\native\strip.cpp. If the two ever diverge, the clicks land between tabs and the "distinct
+# window per tab" assertion below fails loudly.
+#
+# The click aims at the middle of the tab's *label*, not the middle of the tab: the right-hand end
+# now carries a close button, and a click there closes the document rather than selecting it.
 
 Write-Step 'Clicking each tab'
 [WordLayout]::Focus($active) | Out-Null
@@ -196,19 +200,18 @@ $count = $parts.Count
 $top   = @($parts | Where-Object { $_.Frame -eq [WordLayout]::GetForeground() })[0]
 if (-not $top) { $top = $parts[0] }
 
-$dpi   = [WordLayout]::Dpi($top.Frame)
-$pad   = [int](6 * $dpi / 96)
-$avail = ($top.Strip.Right - $top.Strip.Left) - $pad * 2
-$width = [int](220 * $dpi / 96)
-if ($width * $count -gt $avail) { $width = [int]($avail / $count) }
-$minimum = [int](70 * $dpi / 96)
-if ($width -lt $minimum) { $width = $minimum }
-
-$stripScreen = [WordLayout]::RectOf($top.Strip.Hwnd)
 $activated = @()
 for ($i = 0; $i -lt $count; $i++) {
-    $x = $stripScreen.Left + $pad + $i * $width + [int]($width / 2)
-    $y = $stripScreen.Top + [int](($stripScreen.Bottom - $stripScreen.Top) / 2)
+    # Measured inside the loop, not once before it. The strip moves whenever Word relays a window
+    # out, and it was measured shifting 46 pixels between two clicks a second apart - after which a
+    # rectangle taken before the loop points into the document and the click does nothing at all.
+    $live = @(Get-Frames | ForEach-Object { Get-Parts $_ } |
+              Where-Object { $_.Frame -eq [WordLayout]::GetForeground() })[0]
+    if (-not $live) { $live = $top }
+    $tab = ([WordLayout]::Tabs($live.Strip.Hwnd, $count)).Tabs[$i]
+
+    $x = $tab.Left + [int](($tab.Right - $tab.Left) / 3)
+    $y = [int](($tab.Top + $tab.Bottom) / 2)
     [WordLayout]::Click($x, $y)
     Start-Sleep -Milliseconds 900
 

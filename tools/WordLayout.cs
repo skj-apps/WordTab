@@ -45,6 +45,7 @@ public static class WordLayout
 
     const uint INPUT_MOUSE = 0, INPUT_KEYBOARD = 1, KEYEVENTF_KEYUP = 2;
     const uint MOUSEEVENTF_MOVE = 0x0001, MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;
+    const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020, MOUSEEVENTF_MIDDLEUP = 0x0040;
     const uint MOUSEEVENTF_ABSOLUTE = 0x8000, MOUSEEVENTF_VIRTUALDESK = 0x4000;
     public const int SW_MAXIMIZE = 3, SW_RESTORE = 9;
     const uint SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001;
@@ -315,6 +316,140 @@ public static class WordLayout
         Key(0x1B, false);           // VK_ESCAPE
         Thread.Sleep(40);
         Key(0x1B, true);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The tab strip's layout, mirroring ComputeLayout in src\native\strip.cpp.
+    //
+    // There is no way to share these numbers across the process boundary, so there are two copies
+    // and this is the second. If they ever drift the injected clicks land somewhere other than what
+    // was drawn and the assertions fail loudly - which is the intended failure. The alternative, a
+    // test that computes its own idea of where a tab is and clicks confidently into the gap between
+    // two of them, passes while testing nothing.
+    //
+    // Everything comes back in **screen** coordinates, ready to click.
+    // ---------------------------------------------------------------------------------------------
+
+    public class TabLayout
+    {
+        public RECT[] Tabs;      // one per document, left to right
+        public RECT[] Close;     // the X on each; empty when the tab is too narrow to carry one
+        public RECT Plus;        // the new-document button
+        public bool HasPlus;
+    }
+
+    // MulDiv's rounding, which is to nearest with ties away from zero - not Math.Round's, which is
+    // to even and would put a tab boundary one pixel out at some DPIs and not others.
+    static int Sc(int logical, int dpi) { return (logical * dpi + 48) / 96; }
+
+    static bool Empty(RECT r) { return r.Right <= r.Left || r.Bottom <= r.Top; }
+    public static bool IsEmptyRect(RECT r) { return Empty(r); }
+    public static POINT Center(RECT r) { POINT p; p.X = (r.Left + r.Right) / 2; p.Y = (r.Top + r.Bottom) / 2; return p; }
+
+    public static TabLayout Tabs(IntPtr strip, int count)
+    {
+        RECT s = RectOf(strip);
+        int dpi = Dpi(strip);
+        int w = s.Right - s.Left;            // a borderless child: client size == window size
+        int h = s.Bottom - s.Top;
+
+        int pad = Sc(6, dpi), gap = Sc(4, dpi);
+        int minimum = Sc(70, dpi), desired = Sc(220, dpi);
+        int plusW = Sc(26, dpi), closeW = Sc(16, dpi);
+
+        int available = w - pad * 2 - plusW - gap;
+        if (available < minimum) available = minimum;
+
+        int width = desired;
+        if (count > 0 && width * count > available) width = available / count;
+        if (width < minimum) width = minimum;
+
+        TabLayout layout = new TabLayout();
+        layout.Tabs = new RECT[count];
+        layout.Close = new RECT[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            RECT t;
+            t.Left = pad + i * width;
+            t.Right = t.Left + width - Sc(2, dpi);
+            t.Top = Sc(3, dpi);
+            t.Bottom = h;
+
+            RECT c;
+            c.Left = 0; c.Top = 0; c.Right = 0; c.Bottom = 0;
+            if ((t.Right - t.Left) >= closeW * 3)
+            {
+                int middle = (t.Top + t.Bottom) / 2;
+                c.Right = t.Right - Sc(6, dpi);
+                c.Left = c.Right - closeW;
+                c.Top = middle - closeW / 2;
+                c.Bottom = c.Top + closeW;
+                c.Left += s.Left; c.Right += s.Left; c.Top += s.Top; c.Bottom += s.Top;
+            }
+
+            t.Left += s.Left; t.Right += s.Left; t.Top += s.Top; t.Bottom += s.Top;
+            layout.Tabs[i] = t;
+            layout.Close[i] = c;
+        }
+
+        int after = (count > 0) ? (layout.Tabs[count - 1].Right - s.Left + gap) : pad;
+        int limit = w - pad - plusW;
+        if (after > limit) after = limit;
+        if (after < pad) after = pad;
+
+        RECT p;
+        p.Left = after; p.Right = after + plusW;
+        p.Top = Sc(6, dpi); p.Bottom = h - Sc(6, dpi);
+        layout.HasPlus = p.Right <= w && p.Bottom > p.Top;
+        p.Left += s.Left; p.Right += s.Left; p.Top += s.Top; p.Bottom += s.Top;
+        layout.Plus = p;
+
+        return layout;
+    }
+
+    // Park the pointer somewhere without clicking - how a hover is produced for a camera.
+    public static void MouseTo(int x, int y) { Move(x, y, 0); Thread.Sleep(120); }
+
+    // What the system thinks is under a point, which is the only authority on where a click will
+    // land. Worth asking directly: a click that produces nothing looks identical whether it missed
+    // the window or the window ignored it, and these two answer which.
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+
+    public static IntPtr WindowAt(int x, int y) { POINT p; p.X = x; p.Y = y; return WindowFromPoint(p); }
+    public static POINT Cursor() { POINT p; GetCursorPos(out p); return p; }
+
+    // A keystroke, for making a document dirty so the save prompt can be provoked on purpose.
+    public static void Press(ushort vk) { Key(vk, false); Thread.Sleep(40); Key(vk, true); Thread.Sleep(60); }
+    public static string ClassOf(IntPtr hwnd)
+    {
+        StringBuilder cls = new StringBuilder(96);
+        GetClassName(hwnd, cls, 96);
+        return cls.ToString();
+    }
+
+    public static void MiddleClick(int x, int y)
+    {
+        Move(x, y, 0);
+        Thread.Sleep(150);
+        Move(x, y, MOUSEEVENTF_MIDDLEDOWN);
+        Thread.Sleep(80);
+        Move(x, y, MOUSEEVENTF_MIDDLEUP);
+        Thread.Sleep(200);
+    }
+
+    // Press on one point and release on another - the gesture that must *not* fire a button.
+    public static void PressAndSlideOff(int x1, int y1, int x2, int y2)
+    {
+        Move(x1, y1, 0);
+        Thread.Sleep(150);
+        Move(x1, y1, MOUSEEVENTF_LEFTDOWN);
+        Thread.Sleep(120);
+        Move(x2, y2, 0);
+        Thread.Sleep(120);
+        Move(x2, y2, MOUSEEVENTF_LEFTUP);
+        Thread.Sleep(250);
     }
 
     // PW_RENDERFULLCONTENT (2) so a window that is partly off-screen or occluded still prints.

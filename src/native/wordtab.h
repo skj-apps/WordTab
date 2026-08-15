@@ -107,6 +107,11 @@ const wchar_t* LogFilePath(void);
 // The object Word instantiates.
 HRESULT WordTabCreateConnect(REFIID riid, void** ppv);
 
+// Ask Word for a new blank document, through the Application object it handed us at OnConnection.
+// The one thing WordTab needs from Word's object model: everything else it does, it does to windows.
+// Returns FALSE if Word declined or there is no Application - it never throws and never blocks.
+BOOL WordTabNewDocument(void);
+
 // ---------------------------------------------------------------------------------------------
 // Frame windows - the in-process subclass of Word's OpusApp frames. See frames.cpp.
 //
@@ -177,6 +182,11 @@ BOOL StackIsSyncing(void);
 // The tab row, and what a click on one does. `out` receives the frames, left to right.
 int  StackTabs(HWND frame, HWND* out, int max, int* activeIndex);
 void StackActivate(HWND frame);
+
+// Close the document behind a tab. Activates it first - see the comment on the definition, which is
+// about where a modal save prompt ends up in the z-order - and returns the user to the tab they were
+// on if it was not the one they closed.
+void StackCloseTab(HWND frame);
 
 // Read a DWORD switch from HKCU\Software\WordTab as a boolean. Absent means the default, so a
 // fresh install behaves like a configured one. Used for the switches that must be flippable

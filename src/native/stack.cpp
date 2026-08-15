@@ -54,6 +54,12 @@ static BOOL   g_inSync      = FALSE;  // our own SetWindowPos calls come back th
 static BOOL   g_altTab      = TRUE;
 static BOOL   g_minimized   = FALSE;  // the whole stack is down on the taskbar
 
+// Where to put the user back when the active tab goes away, set only by StackCloseTab. Closing a
+// background tab has to activate it first (see there), which moves the user off the document they
+// were reading; this is how they get back to it rather than to whatever happens to be next in the
+// row. Always re-validated before use - the window may have closed in the meantime.
+static HWND   g_returnTo    = NULL;
+
 static Member* Find(HWND frame)
 {
     for (int i = 0; i < g_memberCount; i++)
@@ -300,9 +306,37 @@ static void Leave(Member* member, const wchar_t* why, BOOL restorePosition)
 
     if (g_active == member->frame)
     {
-        g_active = FirstJoined(member->frame);
+        // Where the user was before a close took them somewhere else, if that is still a live tab.
+        // Deliberately checked here rather than keyed to the frame we posted WM_CLOSE to: frame
+        // lifetime is not document lifetime, and closing a document was measured to hide one window
+        // and destroy a different one. What matters is that the active slot is being vacated, not
+        // which window vacated it.
+        HWND next = NULL;
+        if (g_returnTo && g_returnTo != member->frame && IsWindow(g_returnTo))
+        {
+            Member* back = Find(g_returnTo);
+            if (back && back->joined)
+                next = g_returnTo;
+        }
+
+        BOOL returning = (next != NULL);
+        if (!next)
+            next = FirstJoined(member->frame);
+
+        g_active = next;
         if (g_active)
+        {
             SetWindowPos(g_active, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (returning)
+            {
+                // Raising is not enough here: the window the user was on has to take the keyboard
+                // back too, or they are looking at one document and typing into the z-order.
+                SetForegroundWindow(g_active);
+                LogWrite(L"stack  hwnd=0x%p  active again - back to the tab the user was on",
+                         (void*)g_active);
+            }
+        }
+        g_returnTo = NULL;
     }
 
     LogWrite(L"stack  hwnd=0x%p  left the stack (%s)  (%d remain)",
@@ -720,6 +754,7 @@ void StackStop(void)
 
     g_memberCount = 0;
     g_active = NULL;
+    g_returnTo = NULL;
     g_minimized = FALSE;
     LogWrite(L"StackStop  done");
 }
@@ -776,4 +811,46 @@ void StackActivate(HWND frame)
     SetForegroundWindow(frame);
 
     StackOnFrameActivate(frame);
+}
+
+// Close the document behind a tab.
+//
+// WM_CLOSE, posted, rather than the object model. That is the exact path Word takes when the user
+// clicks its own close button, so the save prompt, any document-close macros and Word's own
+// bookkeeping all behave identically and none of it has to be reimplemented here. Posted rather than
+// sent because we are called from inside a click handler on a window Word is about to destroy.
+//
+// **The tab is activated first, and that is not cosmetic.** Every window in the stack sits at the
+// same rectangle with the active one on top. A modal save prompt belonging to a window underneath
+// can end up behind the window in front of it - and an invisible modal dialog is, from the user's
+// side, Word beeping and refusing to respond with nothing on screen to explain why. Activating first
+// makes that impossible: the prompt is always about the document that is visible. The cost is one
+// window switch, and g_returnTo pays it back.
+void StackCloseTab(HWND frame)
+{
+    if (!frame || !IsWindow(frame))
+        return;
+
+    Member* member = Find(frame);
+    if (!member || !member->joined)
+    {
+        // Not stacked - a lone window with a strip of its own, or stacking switched off. Still a
+        // document, still closable, and there is no z-order to worry about.
+        LogWrite(L"stack  hwnd=0x%p  close requested (not in a stack)", (void*)frame);
+        PostMessageW(frame, WM_CLOSE, 0, 0);
+        return;
+    }
+
+    g_returnTo = NULL;
+    if (g_active && g_active != frame && IsWindow(g_active))
+    {
+        g_returnTo = g_active;
+        StackActivate(frame);
+    }
+
+    LogWrite(L"stack  hwnd=0x%p  closing this tab%s",
+             (void*)frame,
+             g_returnTo ? L" (a background one - will return to where the user was)" : L"");
+
+    PostMessageW(frame, WM_CLOSE, 0, 0);
 }

@@ -41,6 +41,28 @@
 #define TAB_LOGICAL_W    220
 #define MAX_STRIPS       256
 
+// The affordances on a tab, all in logical pixels and all scaled per window.
+#define TAB_LOGICAL_MIN_W  70    // below this a tab is a colour, not a label
+#define TAB_LOGICAL_PAD     6    // the strip's left and right inset
+#define TAB_LOGICAL_GAP     4    // between the last tab and the new-document button
+#define CLOSE_LOGICAL      16    // the close button's hit target, a square
+#define PLUS_LOGICAL       26    // the new-document button's width
+
+// The tab row is bounded independently of the stack. 128 tabs at the 70px minimum is wider than any
+// monitor sold, so a layout array larger than this could only describe tabs nobody can see - and an
+// unbounded one on the stack of a WM_MOUSEMOVE handler is a different kind of problem.
+#define MAX_TABS         128
+
+// What the pointer is over, or what a button press is claiming. Used for both, which is why HIT_TAB
+// appears as a press kind: it means a *middle* press, since a left press on a tab acts immediately
+// and never waits for a release.
+enum { HIT_NONE = 0, HIT_TAB, HIT_CLOSE, HIT_PLUS };
+
+// Posted to a strip so that a new document is made after the click handler has returned. Calling
+// into Word's object model from inside our own window procedure would re-enter it: Documents.Add
+// creates a window and pumps messages, and some of those messages are ours.
+#define WM_WORDTAB_NEWDOC  (WM_APP + 10)
+
 static const wchar_t* const kWwfClass    = L"_WwF";
 static const wchar_t* const kStripClass  = L"WordTabStrip";
 
@@ -86,22 +108,62 @@ struct StripState
     DWORD lastLogTick;
     int   suppressed;
 
+    // What the pointer is over and what is being pressed, held per strip rather than in one global.
+    // Only the active window's strip is on top, so only it receives mouse messages - but a strip
+    // that was hovered and then covered would otherwise keep drawing a highlight under a pointer
+    // that is somewhere else entirely, and show it again the moment its tab came forward.
+    //
+    // Frames, not indices. The tab row can change between a press and its release - that is exactly
+    // what closing a tab does - and an index that meant one document on the way down can mean a
+    // different one on the way up.
+    int   hotKind;
+    HWND  hotFrame;
+    int   pressKind;      // a left press on a close or new button, waiting for its release
+    HWND  pressFrame;
+    HWND  middleFrame;    // a middle press on a tab, likewise
+    BOOL  tracking;       // TrackMouseEvent armed, so WM_MOUSELEAVE will arrive
+
     wchar_t title[256];
+};
+
+// Where every clickable thing in a strip is, in the strip's client coordinates. One structure
+// computed by one function and used by both painting and hit-testing, so a click can never land
+// somewhere other than what was drawn.
+struct StripLayout
+{
+    int  count;
+    RECT tab[MAX_TABS];
+    RECT close[MAX_TABS];   // empty when the tab is too narrow to carry a button honestly
+    RECT plus;
+    BOOL hasPlus;
+};
+
+// What a point in a strip is over.
+struct StripHit
+{
+    int  kind;
+    HWND frame;             // for HIT_TAB and HIT_CLOSE
 };
 
 static StripState g_strips[MAX_STRIPS];
 static int  g_stripCount = 0;
 static BOOL g_stripEnabled = TRUE;
+static BOOL g_buttonsEnabled = TRUE;     // HKCU\Software\WordTab\TabButtons
 static ATOM g_stripClass = 0;
 static UINT_PTR g_janitor = 0;
 
 static HBRUSH   g_backBrush    = NULL;   // strip background
 static HBRUSH   g_tabBrush     = NULL;   // the selected tab
 static HBRUSH   g_tabIdleBrush = NULL;   // the others
+static HBRUSH   g_tabHotBrush  = NULL;   // an unselected tab under the pointer
+static HBRUSH   g_chipHotBrush = NULL;   // a close or new button under the pointer
+static HBRUSH   g_chipDownBrush = NULL;  // ...and while it is held down
 static HPEN     g_edgePen      = NULL;
 static COLORREF g_edgeColor    = RGB(200, 198, 196);
 static COLORREF g_textColor    = RGB(50, 49, 48);
 static COLORREF g_idleTextColor = RGB(96, 94, 92);
+static COLORREF g_glyphColor    = RGB(96, 94, 92);
+static COLORREF g_glyphHotColor = RGB(32, 31, 30);
 static BOOL     g_darkTheme    = FALSE;
 
 static StripState* FindByFrame(HWND frame)
@@ -544,25 +606,298 @@ static LRESULT CALLBACK WwfSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 // through every relayout. The tab it draws is a placeholder for the real tab strip.
 // ---------------------------------------------------------------------------------------------
 
-// Where tab `index` of `count` sits, in the strip's client coordinates. One function for painting
-// and for hit-testing, so a click can never land somewhere other than what was drawn.
-static void TabRect(StripState* state, int index, int count, const RECT* client, RECT* out)
+// Where everything in the strip sits, in the strip's client coordinates.
+//
+// This is the single source of truth for the tab row: painting draws what it returns and
+// hit-testing reads what it returns, so there is no way for a click to land somewhere other than
+// what the user is looking at. tools\WordLayout.cs mirrors it for the check scripts, and if the two
+// ever drift the injected clicks miss and the assertions fail loudly - which is the intended
+// failure, rather than a test that quietly clicks the wrong tab and passes.
+static void ComputeLayout(StripState* state, const RECT* client, int count, StripLayout* out)
 {
-    int pad     = Scaled(6, state->dpi);
-    int minimum = Scaled(70, state->dpi);
+    int pad     = Scaled(TAB_LOGICAL_PAD, state->dpi);
+    int gap     = Scaled(TAB_LOGICAL_GAP, state->dpi);
+    int minimum = Scaled(TAB_LOGICAL_MIN_W, state->dpi);
     int desired = Scaled(TAB_LOGICAL_W, state->dpi);
+    int plusW   = Scaled(PLUS_LOGICAL, state->dpi);
+    int closeW  = Scaled(CLOSE_LOGICAL, state->dpi);
 
-    int available = (client->right - client->left) - pad * 2;
+    if (count > MAX_TABS)
+        count = MAX_TABS;
+    out->count = count;
+    out->hasPlus = FALSE;
+    SetRectEmpty(&out->plus);
+
+    // The new-document button's width comes out of the space before the tabs are sized, not after.
+    // Tabs shrink as documents are opened; a button does not, and a button that has been squeezed
+    // off the end of the strip is a feature the user cannot reach.
+    int available = (client->right - client->left) - pad * 2 - plusW - gap;
+    if (available < minimum)
+        available = minimum;
+
     int width = desired;
     if (count > 0 && width * count > available)
         width = available / count;
     if (width < minimum)
         width = minimum;
 
-    out->left   = client->left + pad + index * width;
-    out->right  = out->left + width - Scaled(2, state->dpi);   // a hairline between tabs
-    out->top    = client->top + Scaled(3, state->dpi);
-    out->bottom = client->bottom;
+    for (int i = 0; i < count; i++)
+    {
+        RECT* tab = &out->tab[i];
+        tab->left   = client->left + pad + i * width;
+        tab->right  = tab->left + width - Scaled(2, state->dpi);   // a hairline between tabs
+        tab->top    = client->top + Scaled(3, state->dpi);
+        tab->bottom = client->bottom;
+
+        // A close button, but only where there is honestly room for one. A tab narrow enough that
+        // the button covers the name is a tab whose button closes a document the user cannot
+        // identify, so below that width the name wins and there is no button at all.
+        SetRectEmpty(&out->close[i]);
+        if (g_buttonsEnabled && (tab->right - tab->left) >= closeW * 3)
+        {
+            int middle = (tab->top + tab->bottom) / 2;
+            out->close[i].right  = tab->right - Scaled(6, state->dpi);
+            out->close[i].left   = out->close[i].right - closeW;
+            out->close[i].top    = middle - closeW / 2;
+            out->close[i].bottom = out->close[i].top + closeW;
+        }
+    }
+
+    if (!g_buttonsEnabled)
+        return;
+
+    // After the last tab while there is room for it, pinned to the right edge once the tabs have
+    // filled the strip. Either way it ends up inside the strip and clickable, which is the only
+    // property it has to have.
+    int after = (count > 0) ? (out->tab[count - 1].right + gap) : (client->left + pad);
+    int limit = client->right - pad - plusW;
+    if (after > limit)
+        after = limit;
+    if (after < client->left + pad)
+        after = client->left + pad;
+
+    out->plus.left   = after;
+    out->plus.right  = after + plusW;
+    out->plus.top    = client->top + Scaled(6, state->dpi);
+    out->plus.bottom = client->bottom - Scaled(6, state->dpi);
+    out->hasPlus = (out->plus.right <= client->right && out->plus.bottom > out->plus.top);
+}
+
+// What a point is over. The close button is tested before the tab it sits on: they overlap by
+// definition, and the smaller target is the more specific intent.
+static StripHit HitTestStrip(StripState* state, HWND hwnd, POINT point)
+{
+    StripHit hit;
+    hit.kind  = HIT_NONE;
+    hit.frame = NULL;
+
+    RECT client;
+    if (!GetClientRect(hwnd, &client))
+        return hit;
+
+    HWND frames[MAX_STRIPS];
+    int count = StackTabs(state->frame, frames, MAX_STRIPS, NULL);
+
+    StripLayout layout;
+    ComputeLayout(state, &client, count, &layout);
+
+    for (int i = 0; i < layout.count; i++)
+    {
+        if (!IsRectEmpty(&layout.close[i]) && PtInRect(&layout.close[i], point))
+        {
+            hit.kind  = HIT_CLOSE;
+            hit.frame = frames[i];
+            return hit;
+        }
+        if (PtInRect(&layout.tab[i], point))
+        {
+            hit.kind  = HIT_TAB;
+            hit.frame = frames[i];
+            return hit;
+        }
+    }
+
+    if (layout.hasPlus && PtInRect(&layout.plus, point))
+        hit.kind = HIT_PLUS;
+
+    return hit;
+}
+
+static POINT PointOf(LPARAM lParam)
+{
+    POINT point;
+    point.x = (short)LOWORD(lParam);
+    point.y = (short)HIWORD(lParam);
+    return point;
+}
+
+// Repaint only when what is under the pointer has actually changed. WM_MOUSEMOVE arrives on every
+// pixel of movement; invalidating on each one would repaint the strip continuously while the user
+// is doing nothing but crossing it on the way to the ribbon.
+static void SetHot(StripState* state, HWND hwnd, int kind, HWND frame)
+{
+    if (state->hotKind == kind && state->hotFrame == frame)
+        return;
+    state->hotKind  = kind;
+    state->hotFrame = frame;
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+// Ask for the one WM_MOUSELEAVE that tells us the pointer has gone. Without it a highlight stays
+// lit under a pointer that left the strip a minute ago - there is no "mouse exited" message
+// otherwise, and polling for it would be a timer for something an API already answers.
+static void ArmLeaveTracking(StripState* state, HWND hwnd)
+{
+    if (state->tracking)
+        return;
+
+    TRACKMOUSEEVENT track;
+    memset(&track, 0, sizeof(track));
+    track.cbSize    = sizeof(track);
+    track.dwFlags   = TME_LEAVE;
+    track.hwndTrack = hwnd;
+    if (TrackMouseEvent(&track))
+        state->tracking = TRUE;
+}
+
+// The two glyphs, drawn as lines rather than as characters. A font is not guaranteed to have a
+// multiplication sign or a heavy plus at any particular weight, and one that substitutes silently
+// gives a close button that looks like a lowercase x. Two lines cannot be substituted.
+static void DrawGlyphLines(HDC dc, const RECT* box, COLORREF color, int dpi, BOOL cross)
+{
+    HPEN pen = CreatePen(PS_SOLID, Scaled(1, dpi), color);
+    if (!pen)
+        return;
+
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+
+    if (cross)
+    {
+        int inset = Scaled(5, dpi);
+        MoveToEx(dc, box->left + inset, box->top + inset, NULL);
+        LineTo(dc, box->right - inset, box->bottom - inset);
+        MoveToEx(dc, box->right - inset - 1, box->top + inset, NULL);
+        LineTo(dc, box->left + inset - 1, box->bottom - inset);
+    }
+    else
+    {
+        int cx  = (box->left + box->right) / 2;
+        int cy  = (box->top + box->bottom) / 2;
+        int arm = Scaled(5, dpi);
+        MoveToEx(dc, cx - arm, cy, NULL);
+        LineTo(dc, cx + arm + 1, cy);
+        MoveToEx(dc, cx, cy - arm, NULL);
+        LineTo(dc, cx, cy + arm + 1);
+    }
+
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+}
+
+// A close or new button's background: nothing at rest, a chip under the pointer, a darker one while
+// it is held. Slightly larger than the hit rectangle so the glyph is not touching its own edge.
+static void DrawChip(HDC dc, const RECT* box, BOOL hot, BOOL down, int dpi)
+{
+    if (!hot && !down)
+        return;
+    RECT chip = *box;
+    InflateRect(&chip, Scaled(2, dpi), Scaled(2, dpi));
+    FillRect(dc, &chip, down ? g_chipDownBrush : g_chipHotBrush);
+}
+
+// Everything in the strip, onto whatever device context is handed in.
+//
+// Separate from PaintStrip so the same drawing serves WM_PAINT, the off-screen bitmap it paints
+// through, and WM_PRINTCLIENT - which is how the check scripts photograph a strip without a camera.
+static void DrawStrip(StripState* state, HDC dc, const RECT* client)
+{
+    FillRect(dc, client, g_backBrush);
+
+    // The tabs are the stack's, not this window's. Every window in the stack draws the same row
+    // with the same one selected, which is what makes switching look like a strip standing still
+    // while the page behind it changes. Off a stack this is simply one tab: our own document.
+    HWND frames[MAX_STRIPS];
+    int  activeIndex = 0;
+    int  count = StackTabs(state->frame, frames, MAX_STRIPS, &activeIndex);
+
+    StripLayout layout;
+    ComputeLayout(state, client, count, &layout);
+
+    HGDIOBJ oldFont = SelectObject(dc, state->font ? (HGDIOBJ)state->font
+                                                   : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(dc, TRANSPARENT);
+
+    for (int i = 0; i < layout.count; i++)
+    {
+        RECT tab = layout.tab[i];
+        if (tab.right <= tab.left || tab.left >= client->right)
+            break;
+        if (tab.right > client->right)
+            tab.right = client->right;
+
+        BOOL selected = (i == activeIndex);
+        BOOL hotTab   = (state->hotFrame == frames[i]) &&
+                        (state->hotKind == HIT_TAB || state->hotKind == HIT_CLOSE);
+
+        HBRUSH fill = selected ? g_tabBrush : (hotTab ? g_tabHotBrush : g_tabIdleBrush);
+        FillRect(dc, &tab, fill);
+
+        HGDIOBJ oldPen   = SelectObject(dc, g_edgePen);
+        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, tab.left, tab.top, tab.right, tab.bottom + 1);
+        SelectObject(dc, oldBrush);
+        SelectObject(dc, oldPen);
+
+        RECT close = layout.close[i];
+        BOOL hasClose = !IsRectEmpty(&close) && close.right <= tab.right;
+
+        wchar_t title[256];
+        WordTabFrameTitle(frames[i], title, 256);
+
+        RECT text = tab;
+        text.left += Scaled(10, state->dpi);
+        // The name stops before the button rather than running under it. A title clipped by an
+        // ellipsis reads as a long name; one running under a close button reads as a bug.
+        text.right = hasClose ? (close.left - Scaled(4, state->dpi))
+                              : (tab.right - Scaled(8, state->dpi));
+        if (text.right > text.left)
+        {
+            SetTextColor(dc, selected ? g_textColor : g_idleTextColor);
+            DrawTextW(dc, title, -1, &text,
+                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+
+        if (hasClose)
+        {
+            BOOL hotClose  = (state->hotKind == HIT_CLOSE && state->hotFrame == frames[i]);
+            BOOL downClose = (state->pressKind == HIT_CLOSE && state->pressFrame == frames[i]);
+            DrawChip(dc, &close, hotClose, downClose, state->dpi);
+            DrawGlyphLines(dc, &close, hotClose || downClose ? g_glyphHotColor : g_glyphColor,
+                           state->dpi, TRUE);
+        }
+    }
+
+    if (layout.hasPlus)
+    {
+        BOOL hotPlus  = (state->hotKind == HIT_PLUS);
+        BOOL downPlus = (state->pressKind == HIT_PLUS);
+        DrawChip(dc, &layout.plus, hotPlus, downPlus, state->dpi);
+        DrawGlyphLines(dc, &layout.plus, hotPlus || downPlus ? g_glyphHotColor : g_glyphColor,
+                       state->dpi, FALSE);
+    }
+
+    SelectObject(dc, oldFont);
+
+    // A hairline along the bottom, so the strip reads as part of Word's chrome rather than as a
+    // rectangle dropped on top of it.
+    RECT line = *client;
+    line.top = line.bottom - 1;
+    HBRUSH edge = CreateSolidBrush(g_edgeColor);
+    if (edge)
+    {
+        FillRect(dc, &line, edge);
+        DeleteObject(edge);
+    }
 }
 
 static void PaintStrip(StripState* state, HWND hwnd)
@@ -575,60 +910,27 @@ static void PaintStrip(StripState* state, HWND hwnd)
     RECT client;
     GetClientRect(hwnd, &client);
 
-    FillRect(dc, &client, g_backBrush);
+    // Drawn into an off-screen bitmap and blitted once. Hover means the strip now repaints whenever
+    // the pointer crosses a tab boundary, and painting straight to the screen shows the background
+    // fill before the tabs land on it - which at 60 crossings a second is a flicker under the
+    // pointer, exactly where the user is looking.
+    HDC     mem = CreateCompatibleDC(dc);
+    HBITMAP bmp = mem ? CreateCompatibleBitmap(dc, client.right, client.bottom) : NULL;
 
-    // The tabs are the stack's, not this window's. Every window in the stack draws the same row
-    // with the same one selected, which is what makes switching look like a strip standing still
-    // while the page behind it changes. Off a stack this is simply one tab: our own document.
-    HWND frames[MAX_STRIPS];
-    int  activeIndex = 0;
-    int  count = StackTabs(state->frame, frames, MAX_STRIPS, &activeIndex);
-
-    HGDIOBJ oldFont = SelectObject(dc, state->font ? (HGDIOBJ)state->font
-                                                   : GetStockObject(DEFAULT_GUI_FONT));
-    SetBkMode(dc, TRANSPARENT);
-
-    for (int i = 0; i < count; i++)
+    if (mem && bmp)
     {
-        RECT tab;
-        TabRect(state, i, count, &client, &tab);
-        if (tab.right <= tab.left || tab.left >= client.right)
-            break;
-        if (tab.right > client.right)
-            tab.right = client.right;
-
-        BOOL selected = (i == activeIndex);
-        FillRect(dc, &tab, selected ? g_tabBrush : g_tabIdleBrush);
-
-        HGDIOBJ oldPen   = SelectObject(dc, g_edgePen);
-        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, tab.left, tab.top, tab.right, tab.bottom + 1);
-        SelectObject(dc, oldBrush);
-        SelectObject(dc, oldPen);
-
-        wchar_t title[256];
-        WordTabFrameTitle(frames[i], title, 256);
-
-        RECT text = tab;
-        text.left  += Scaled(10, state->dpi);
-        text.right -= Scaled(8, state->dpi);
-        SetTextColor(dc, selected ? g_textColor : g_idleTextColor);
-        DrawTextW(dc, title, -1, &text,
-                  DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+        HGDIOBJ oldBitmap = SelectObject(mem, bmp);
+        DrawStrip(state, mem, &client);
+        BitBlt(dc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, oldBitmap);
+    }
+    else
+    {
+        DrawStrip(state, dc, &client);
     }
 
-    SelectObject(dc, oldFont);
-
-    // A hairline along the bottom, so the strip reads as part of Word's chrome rather than as a
-    // rectangle dropped on top of it.
-    RECT line = client;
-    line.top = line.bottom - 1;
-    HBRUSH edge = CreateSolidBrush(g_edgeColor);
-    if (edge)
-    {
-        FillRect(dc, &line, edge);
-        DeleteObject(edge);
-    }
+    if (bmp) DeleteObject(bmp);
+    if (mem) DeleteDC(mem);
 
     EndPaint(hwnd, &ps);
 }
@@ -650,33 +952,154 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         break;
 
-    case WM_LBUTTONDOWN:
-        if (state)
+    // How a strip is photographed. DefWindowProc cannot draw a window's client area for it, so
+    // without this a PrintWindow of a Word frame comes back with a blank band where the tabs are -
+    // and a screenshot that silently omits the thing under test is worse than no screenshot.
+    case WM_PRINTCLIENT:
+        if (state && wParam)
         {
             RECT client;
             GetClientRect(hwnd, &client);
+            DrawStrip(state, (HDC)wParam, &client);
+            return 0;
+        }
+        break;
 
-            POINT point;
-            point.x = (short)LOWORD(lParam);
-            point.y = (short)HIWORD(lParam);
+    case WM_MOUSEMOVE:
+        if (state)
+        {
+            ArmLeaveTracking(state, hwnd);
+            StripHit hit = HitTestStrip(state, hwnd, PointOf(lParam));
+            SetHot(state, hwnd, hit.kind, hit.frame);
+            return 0;
+        }
+        break;
 
-            HWND frames[MAX_STRIPS];
-            int count = StackTabs(state->frame, frames, MAX_STRIPS, NULL);
-            for (int i = 0; i < count; i++)
+    case WM_MOUSELEAVE:
+        if (state)
+        {
+            state->tracking = FALSE;
+            SetHot(state, hwnd, HIT_NONE, NULL);
+            return 0;
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+        if (state)
+        {
+            StripHit hit = HitTestStrip(state, hwnd, PointOf(lParam));
+
+            if (hit.kind == HIT_CLOSE || hit.kind == HIT_PLUS)
             {
-                RECT tab;
-                TabRect(state, i, count, &client, &tab);
-                if (PtInRect(&tab, point))
-                {
-                    LogWrite(L"strip  hwnd=0x%p  tab %d clicked -> 0x%p",
-                             (void*)state->frame, i, (void*)frames[i]);
-                    StackActivate(frames[i]);
-                    break;
-                }
+                // Press and release on the same button, the way every other button in Windows
+                // behaves: pressing one and sliding off cancels it. Acting on the press would mean
+                // a mis-aimed click closes a document with no way to change your mind.
+                state->pressKind  = hit.kind;
+                state->pressFrame = hit.frame;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            else if (hit.kind == HIT_TAB)
+            {
+                // Switching, though, happens on the press. It is instant, it is reversible by
+                // clicking the tab you came from, and waiting for the release makes it feel slow.
+                LogWrite(L"strip  hwnd=0x%p  tab clicked -> 0x%p",
+                         (void*)state->frame, (void*)hit.frame);
+                StackActivate(hit.frame);
             }
             return 0;
         }
         break;
+
+    case WM_LBUTTONUP:
+        if (state && state->pressKind != HIT_NONE)
+        {
+            int  kind  = state->pressKind;
+            HWND frame = state->pressFrame;
+
+            state->pressKind  = HIT_NONE;
+            state->pressFrame = NULL;
+            if (GetCapture() == hwnd)
+                ReleaseCapture();
+
+            StripHit hit = HitTestStrip(state, hwnd, PointOf(lParam));
+            if (hit.kind == kind && hit.frame == frame)
+            {
+                if (kind == HIT_CLOSE)
+                {
+                    LogWrite(L"strip  hwnd=0x%p  close clicked on 0x%p",
+                             (void*)state->frame, (void*)frame);
+                    StackCloseTab(frame);
+                }
+                else
+                {
+                    LogWrite(L"strip  hwnd=0x%p  new-document button clicked",
+                             (void*)state->frame);
+                    PostMessageW(hwnd, WM_WORDTAB_NEWDOC, 0, 0);
+                }
+            }
+            else
+            {
+                LogWrite(L"strip  hwnd=0x%p  button released off target - cancelled",
+                         (void*)state->frame);
+            }
+
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        break;
+
+    // Middle-click closes, which is what a middle click does to a tab everywhere else. Paired the
+    // same way as the close button: the release has to land on the tab the press did.
+    case WM_MBUTTONDOWN:
+        if (state)
+        {
+            StripHit hit = HitTestStrip(state, hwnd, PointOf(lParam));
+            if (hit.kind == HIT_TAB || hit.kind == HIT_CLOSE)
+            {
+                state->middleFrame = hit.frame;
+                SetCapture(hwnd);
+            }
+            return 0;
+        }
+        break;
+
+    case WM_MBUTTONUP:
+        if (state && state->middleFrame)
+        {
+            HWND frame = state->middleFrame;
+            state->middleFrame = NULL;
+            if (GetCapture() == hwnd)
+                ReleaseCapture();
+
+            StripHit hit = HitTestStrip(state, hwnd, PointOf(lParam));
+            if ((hit.kind == HIT_TAB || hit.kind == HIT_CLOSE) && hit.frame == frame)
+            {
+                LogWrite(L"strip  hwnd=0x%p  middle-clicked 0x%p", (void*)state->frame, (void*)frame);
+                StackCloseTab(frame);
+            }
+            return 0;
+        }
+        break;
+
+    // Capture can be taken away without a button release - a dialog appearing, Alt+Tab, Word
+    // starting a modal loop. Anything half-pressed at that point is cancelled, not completed.
+    case WM_CAPTURECHANGED:
+        if (state && (state->pressKind != HIT_NONE || state->middleFrame))
+        {
+            state->pressKind   = HIT_NONE;
+            state->pressFrame  = NULL;
+            state->middleFrame = NULL;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        break;
+
+    case WM_WORDTAB_NEWDOC:
+        // Deliberately out here rather than in the click handler: Documents.Add makes a window and
+        // pumps messages while it does, and some of those messages come back to this procedure.
+        if (!WordTabNewDocument())
+            LogWrite(L"strip  hwnd=0x%p  new document declined by Word", (void*)hwnd);
+        return 0;
 
     default:
         break;
@@ -1086,6 +1509,11 @@ void StripStart(void)
         return;
     }
 
+    // The close and new-document buttons, switchable like every other piece. Off, the tabs are
+    // exactly what they were before this slice - which is what makes them bisectable if something
+    // about them ever misbehaves.
+    g_buttonsEnabled = WordTabReadFlag(L"TabButtons", TRUE);
+
     if (!g_stripClass)
     {
         WNDCLASSEXW wc;
@@ -1105,18 +1533,28 @@ void StripStart(void)
         g_edgeColor     = RGB(77, 77, 77);
         g_textColor     = RGB(255, 255, 255);
         g_idleTextColor = RGB(186, 186, 186);
-        if (!g_backBrush)    g_backBrush    = CreateSolidBrush(RGB(38, 38, 38));
-        if (!g_tabBrush)     g_tabBrush     = CreateSolidBrush(RGB(66, 66, 66));
-        if (!g_tabIdleBrush) g_tabIdleBrush = CreateSolidBrush(RGB(45, 45, 45));
+        g_glyphColor    = RGB(186, 186, 186);
+        g_glyphHotColor = RGB(255, 255, 255);
+        if (!g_backBrush)     g_backBrush     = CreateSolidBrush(RGB(38, 38, 38));
+        if (!g_tabBrush)      g_tabBrush      = CreateSolidBrush(RGB(66, 66, 66));
+        if (!g_tabIdleBrush)  g_tabIdleBrush  = CreateSolidBrush(RGB(45, 45, 45));
+        if (!g_tabHotBrush)   g_tabHotBrush   = CreateSolidBrush(RGB(55, 55, 55));
+        if (!g_chipHotBrush)  g_chipHotBrush  = CreateSolidBrush(RGB(90, 90, 90));
+        if (!g_chipDownBrush) g_chipDownBrush = CreateSolidBrush(RGB(112, 112, 112));
     }
     else
     {
         g_edgeColor     = RGB(200, 198, 196);
         g_textColor     = RGB(50, 49, 48);
         g_idleTextColor = RGB(96, 94, 92);
-        if (!g_backBrush)    g_backBrush    = CreateSolidBrush(RGB(237, 235, 233));
-        if (!g_tabBrush)     g_tabBrush     = CreateSolidBrush(RGB(255, 255, 255));
-        if (!g_tabIdleBrush) g_tabIdleBrush = CreateSolidBrush(RGB(225, 223, 221));
+        g_glyphColor    = RGB(96, 94, 92);
+        g_glyphHotColor = RGB(32, 31, 30);
+        if (!g_backBrush)     g_backBrush     = CreateSolidBrush(RGB(237, 235, 233));
+        if (!g_tabBrush)      g_tabBrush      = CreateSolidBrush(RGB(255, 255, 255));
+        if (!g_tabIdleBrush)  g_tabIdleBrush  = CreateSolidBrush(RGB(225, 223, 221));
+        if (!g_tabHotBrush)   g_tabHotBrush   = CreateSolidBrush(RGB(240, 238, 236));
+        if (!g_chipHotBrush)  g_chipHotBrush  = CreateSolidBrush(RGB(205, 203, 201));
+        if (!g_chipDownBrush) g_chipDownBrush = CreateSolidBrush(RGB(188, 186, 184));
     }
     if (!g_edgePen) g_edgePen = CreatePen(PS_SOLID, 1, g_edgeColor);
 
@@ -1125,10 +1563,11 @@ void StripStart(void)
     if (!g_janitor)
         g_janitor = SetTimer(NULL, 0, 500, JanitorProc);
 
-    LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s",
+    LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s",
              g_stripClass ? L"registered" : L"FAILED",
              g_janitor ? L"running" : L"FAILED", STRIP_LOGICAL_H,
-             g_darkTheme ? L"dark" : L"light");
+             g_darkTheme ? L"dark" : L"light",
+             g_buttonsEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabButtons=0)");
 }
 
 void StripAttachFrame(HWND frame)
