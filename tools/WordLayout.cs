@@ -166,6 +166,41 @@ public static class WordLayout
 
     public static IntPtr GetForeground() { return GetForegroundWindow(); }
 
+    [DllImport("user32.dll")] static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
+    const int GWL_EXSTYLE = -20;
+    public const long WS_EX_TOOLWINDOW = 0x00000080;
+
+    public static long ExStyle(IntPtr hwnd) { return (long)GetWindowLongPtr(hwnd, GWL_EXSTYLE); }
+    public static bool IsToolWindow(IntPtr hwnd) { return (ExStyle(hwnd) & WS_EX_TOOLWINDOW) != 0; }
+    public static bool Minimized(IntPtr hwnd) { return IsIconic(hwnd); }
+
+    // The virtual desktop, for full-screen captures. Alt+Tab and the taskbar cannot be enumerated
+    // through any API, so the only honest way to check them is to photograph the screen.
+    public static RECT ScreenRect()
+    {
+        RECT r;
+        r.Left = GetSystemMetrics(76); r.Top = GetSystemMetrics(77);
+        r.Right = r.Left + GetSystemMetrics(78); r.Bottom = r.Top + GetSystemMetrics(79);
+        return r;
+    }
+
+    // Hold Alt and tap Tab, leaving the switcher on screen for a caller to photograph. AltRelease
+    // must always be called afterwards, including on failure: a stuck Alt key is a wrecked desktop.
+    public static void AltTabHold()
+    {
+        Key(0x12, false);           // VK_MENU down, held
+        Thread.Sleep(120);
+        Key(0x09, false);           // VK_TAB
+        Thread.Sleep(60);
+        Key(0x09, true);
+    }
+
+    public static void AltRelease()
+    {
+        Key(0x12, true);
+        Thread.Sleep(200);
+    }
+
     public static void Show(IntPtr hwnd, int cmd) { ShowWindow(hwnd, cmd); }
 
     public static bool Focus(IntPtr hwnd)

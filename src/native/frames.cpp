@@ -357,6 +357,9 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             LogWrite(L"WM_SIZE  hwnd=0x%p  %s  %dx%d", (void*)hwnd,
                      SizeTypeName(wParam), (int)LOWORD(lParam), (int)HIWORD(lParam));
         }
+        // The stack is one window to the user, so it goes down to the taskbar and comes back as
+        // one. This is where that is noticed.
+        StackOnFrameSize(hwnd, wParam);
         break;
 
     case WM_SYSCOMMAND:

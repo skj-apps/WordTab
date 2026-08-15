@@ -150,8 +150,19 @@ void StackStart(void);
 void StackAttachFrame(HWND frame);
 void StackDetachFrame(HWND frame);
 void StackOnFrameActivate(HWND frame);
+void StackOnFrameSize(HWND frame, WPARAM sizeType);
 void StackJanitor(void);
 void StackStop(void);
+
+// ---------------------------------------------------------------------------------------------
+// The taskbar - one button for the whole stack, following the active tab. See taskbar.cpp.
+// TaskbarShow(frame, TRUE) must be reachable for every window the add-in ever hid: a window with
+// no taskbar button, underneath another window, cannot be reached by the user at all.
+// ---------------------------------------------------------------------------------------------
+
+void TaskbarStart(void);
+void TaskbarShow(HWND frame, BOOL show);
+void TaskbarStop(void);
 
 // Returns how many other windows were moved with this one, so the drag trace can report it.
 int  StackOnFramePosChanging(HWND frame, const WINDOWPOS* pos);

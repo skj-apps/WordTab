@@ -337,13 +337,14 @@ static void AdjustProposed(StripState* state, WINDOWPOS* pos)
     if (!state->enabled || !pos || !state->wwf)
         return;
 
-    // Freeze while the window is hidden. Word dismantles a frame's layout on the way out - closing
-    // a document was measured to leave `_WwF` filling the whole client area, top edge at 0 - and
-    // accepting that as a natural rect puts the strip over the ribbon. Worse, it then gets
-    // broadcast to every other window in the stack, so one document closing wrecks the layout of
-    // all of them. Nobody can see a hidden window, so there is nothing to be gained by shifting it;
-    // the janitor re-derives from scratch when it is shown again.
-    if (!IsWindowVisible(state->frame))
+    // Freeze while the window is not on screen - hidden, or minimised. Word dismantles a frame's
+    // layout on the way out (closing a document was measured to leave `_WwF` filling the whole
+    // client area, top edge at 0) and squeezes it to nothing on the way down to the taskbar.
+    // Accepting either as a natural rect puts the strip over the ribbon, and if that window is the
+    // active one it is then broadcast to every other window in the stack. Nobody can see a window
+    // that is not on screen, so there is nothing to gain by shifting it; the janitor re-derives
+    // when it comes back.
+    if (!IsWindowVisible(state->frame) || IsIconic(state->frame))
         return;
 
     RECT current;
@@ -894,7 +895,7 @@ static void TryBind(StripState* state)
     // Seeded from what is true now, not left at zero: otherwise the first janitor tick reads a
     // window that has been visible all along as having just appeared, and re-derives a layout that
     // did not need re-deriving.
-    state->wasVisible = IsWindowVisible(state->frame) ? TRUE : FALSE;
+    state->wasVisible = (IsWindowVisible(state->frame) && !IsIconic(state->frame)) ? TRUE : FALSE;
     state->dpi    = DpiOf(state->frame);
     state->stripH = Scaled(STRIP_LOGICAL_H, state->dpi);
     if (!state->font)
@@ -994,7 +995,9 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
         // ignored on purpose (see AdjustProposed), so what is there now is Word's own idea of the
         // layout and is exactly what "natural" means. Re-derive from it rather than carrying
         // forward a rect from before the window went away.
-        BOOL visible = IsWindowVisible(state->frame) ? TRUE : FALSE;
+        // "On screen", not merely WS_VISIBLE: a minimised window keeps that style, and its layout
+        // is frozen for the same reason a hidden one's is.
+        BOOL visible = (IsWindowVisible(state->frame) && !IsIconic(state->frame)) ? TRUE : FALSE;
         if (visible && !state->wasVisible)
         {
             // ApplyInitial does nothing if the document frame is still where we put it, which is

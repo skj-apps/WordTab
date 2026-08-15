@@ -69,6 +69,7 @@ $sources = @(
     (Join-Path $SourceDir 'frames.cpp')
     (Join-Path $SourceDir 'strip.cpp')
     (Join-Path $SourceDir 'stack.cpp')
+    (Join-Path $SourceDir 'taskbar.cpp')
     (Join-Path $SourceDir 'log.cpp')
 )
 

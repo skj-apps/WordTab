@@ -224,6 +224,76 @@ Assert (@($activated | Where-Object { $frames -contains $_ }).Count -eq $count) 
 
 Test-Stacked 'After switching tabs' | Out-Null
 
+# ---- one window to the rest of Windows ----------------------------------------------------------
+#
+# The taskbar and Alt+Tab cannot be enumerated through any API, so what is asserted here is the
+# mechanism - exactly one window presented, and it is the active one - and the result itself is
+# photographed for a human to confirm. WS_EX_TOOLWINDOW is what Alt+Tab reads; ITaskbarList is what
+# the taskbar is told, and its calls are logged by the add-in.
+
+Write-Step 'One window presented to the taskbar and Alt+Tab'
+$parts = @(Get-Frames | ForEach-Object { Get-Parts $_ })
+$foreground = [WordLayout]::GetForeground()
+$tools = @($parts | Where-Object { [WordLayout]::IsToolWindow($_.Frame) })
+$activeIsTool = [WordLayout]::IsToolWindow($foreground)
+
+foreach ($p in $parts) {
+    Write-Note ("0x{0:X}  toolwindow={1}  {2}" -f [int64]$p.Frame, [WordLayout]::IsToolWindow($p.Frame),
+                $(if ($p.Frame -eq $foreground) { '<- active' } else { '' }))
+}
+Assert ($tools.Count -eq $parts.Count - 1) "exactly one window is left in Alt+Tab ($($tools.Count) of $($parts.Count) hidden)"
+Assert (-not $activeIsTool) 'the one left is the active one'
+
+if ($Screenshot) {
+    New-Item -ItemType Directory -Path $ShotDir -Force | Out-Null
+    $screen = [WordLayout]::ScreenRect()
+    [WordLayout]::AltTabHold()
+    Start-Sleep -Milliseconds 900
+    try {
+        $bmp = New-Object System.Drawing.Bitmap(($screen.Right - $screen.Left), ($screen.Bottom - $screen.Top))
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.CopyFromScreen($screen.Left, $screen.Top, 0, 0, $bmp.Size)
+        $bmp.Save((Join-Path $ShotDir 'wordtab-alttab.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+        $g.Dispose(); $bmp.Dispose()
+        Write-Note (Join-Path $ShotDir 'wordtab-alttab.png')
+    } finally {
+        [WordLayout]::AltRelease()
+    }
+
+    # And the taskbar, which is the bottom strip of the primary screen.
+    Start-Sleep -Milliseconds 600
+    $h = 120
+    $bmp = New-Object System.Drawing.Bitmap(($screen.Right - $screen.Left), $h)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen($screen.Left, ($screen.Bottom - $h), 0, 0, $bmp.Size)
+    $bmp.Save((Join-Path $ShotDir 'wordtab-taskbar.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+    $g.Dispose(); $bmp.Dispose()
+    Write-Note (Join-Path $ShotDir 'wordtab-taskbar.png')
+}
+
+# ---- minimising ----------------------------------------------------------------------------------
+#
+# The stack is one window to the user, so it goes down and comes back as one. Only the active window
+# has a taskbar button, so if the others did not come back with it they would be stranded: minimised,
+# no button, no Alt+Tab entry.
+
+Write-Step 'Minimising the stack'
+$before = @(Get-Frames)
+[WordLayout]::Focus($before[0]) | Out-Null
+$activeNow = [WordLayout]::GetForeground()
+if (-not ($before -contains $activeNow)) { $activeNow = $before[0] }
+
+[WordLayout]::Show($activeNow, 6)          # SW_MINIMIZE
+Start-Sleep -Milliseconds 1500
+$down = @($before | Where-Object { [WordLayout]::Minimized($_) })
+Assert ($down.Count -eq $before.Count) "every window went down with it ($($down.Count) of $($before.Count))"
+
+[WordLayout]::Show($activeNow, 9)          # SW_RESTORE
+Start-Sleep -Seconds 2
+$up = @($before | Where-Object { -not [WordLayout]::Minimized($_) })
+Assert ($up.Count -eq $before.Count) "every window came back with it ($($up.Count) of $($before.Count))"
+Test-Stacked 'After minimise and restore' | Out-Null
+
 # ---- closing a document ------------------------------------------------------------------------
 
 Write-Step 'Closing one document'
@@ -234,6 +304,26 @@ Start-Sleep -Seconds 4
 $after = Get-Frames
 Assert ($after.Count -eq $count - 1) "the stack closed up: $($after.Count) window(s) left, expected $($count - 1)"
 if ($after.Count -gt 1) { Test-Stacked 'After closing a document' | Out-Null }
+
+# Down to one window, which is the case that has to be safe above all others: the last window must
+# be reachable. A window with no taskbar button and no Alt+Tab entry is gone as far as the user is
+# concerned, and "the add-in ate my document" is not a recoverable first impression.
+Write-Step 'Closing down to the last window'
+for ($guard = 0; $guard -lt 6; $guard++) {
+    $open = @(Get-Frames)
+    if ($open.Count -le 1) { break }
+    [WordLayout]::Close($open[0])
+    Start-Sleep -Seconds 4
+}
+$last = @(Get-Frames)
+if ($last.Count -eq 1) {
+    Assert (-not [WordLayout]::IsToolWindow($last[0])) 'the last window is back in Alt+Tab'
+    $parts = @(Get-Parts $last[0])
+    Assert ($parts[0].Strip -and $parts[0].Wwf -and $parts[0].Strip.Bottom -eq $parts[0].Wwf.Top) `
+        'the last window still has its strip, correctly placed'
+} else {
+    Write-Note "expected one window left, found $($last.Count) - skipping the last-window checks"
+}
 
 # ---- pictures ----------------------------------------------------------------------------------
 

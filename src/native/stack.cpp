@@ -48,6 +48,8 @@ static HWND   g_active      = NULL;
 static BOOL   g_enabled     = TRUE;
 static BOOL   g_started     = FALSE;
 static BOOL   g_inSync      = FALSE;  // our own SetWindowPos calls come back through the subclass
+static BOOL   g_altTab      = TRUE;
+static BOOL   g_minimized   = FALSE;  // the whole stack is down on the taskbar
 
 static Member* Find(HWND frame)
 {
@@ -66,12 +68,26 @@ static int JoinedCount(void)
     return count;
 }
 
-// Is this window one we should be stacking? Visible, not minimised, and carrying a document frame.
-// A Start-screen window - Word launched with no document - has no `_WwF` and is deliberately left
-// out: it has no document to be a tab for.
-static BOOL Eligible(HWND frame)
+// Joining and staying are different tests, and the difference is minimising.
+//
+// To *join*, a window has to be one we can measure and place: on screen, not minimised, a sensible
+// size, and carrying a document frame. A Start-screen window - Word launched with no document -
+// has no `_WwF` and is deliberately left out: it has no document to be a tab for.
+//
+// To *stay*, all that is required is that it still exists and still has a document. A minimised
+// window is still a document and still deserves its tab; more to the point, when the whole stack
+// goes down to the taskbar together, dropping every window out of the stack would leave nothing to
+// bring back and the only window with a taskbar button would come back alone.
+static BOOL EligibleToStay(HWND frame)
 {
-    if (!frame || !IsWindow(frame) || !IsWindowVisible(frame) || IsIconic(frame))
+    if (!frame || !IsWindow(frame) || !IsWindowVisible(frame))
+        return FALSE;
+    return StripHasDocumentFrame(frame);
+}
+
+static BOOL EligibleToJoin(HWND frame)
+{
+    if (!EligibleToStay(frame) || IsIconic(frame))
         return FALSE;
 
     RECT rect;
@@ -80,7 +96,7 @@ static BOOL Eligible(HWND frame)
     if ((rect.right - rect.left) < 200 || (rect.bottom - rect.top) < 200)
         return FALSE;
 
-    return StripHasDocumentFrame(frame);
+    return TRUE;
 }
 
 static HWND FirstJoined(HWND except)
@@ -136,6 +152,59 @@ static void MatchTo(HWND master, HWND frame)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Presentation: how many windows the rest of Windows is allowed to see.
+//
+// Stacking makes N windows look like one *inside* Word's frame. Everything outside it - the
+// taskbar, Alt+Tab - still counts N, which gives the whole thing away at a glance. So the stack
+// presents exactly one window: the active one.
+//
+// Two different mechanisms, because they are two different systems:
+//   - the taskbar is told, through ITaskbarList (see taskbar.cpp). Styles are not involved.
+//   - Alt+Tab reads WS_EX_TOOLWINDOW off the window when it is invoked, so setting that style on
+//     the windows behind is enough. Deliberately *without* SWP_FRAMECHANGED: we want the shell's
+//     classification to change, not the window's frame to be recalculated. Word draws its own
+//     caption over the non-client area anyway, and the windows this is applied to are underneath
+//     the active one where nothing about them is visible.
+//
+// The safety rule for both: a window that leaves the stack gets everything back. A window with no
+// taskbar button and no Alt+Tab entry that is also underneath another window is unreachable by any
+// means the user has.
+// ---------------------------------------------------------------------------------------------
+
+static void PresentWindow(HWND frame, BOOL show)
+{
+    TaskbarShow(frame, show);
+
+    if (!g_altTab || !IsWindow(frame))
+        return;
+
+    LONG_PTR style = GetWindowLongPtrW(frame, GWL_EXSTYLE);
+    LONG_PTR wanted = show ? (style & ~(LONG_PTR)WS_EX_TOOLWINDOW)
+                           : (style |  (LONG_PTR)WS_EX_TOOLWINDOW);
+    if (wanted != style)
+        SetWindowLongPtrW(frame, GWL_EXSTYLE, wanted);
+}
+
+static void Present(void)
+{
+    if (!g_enabled)
+        return;
+
+    int joined = JoinedCount();
+
+    for (int i = 0; i < g_memberCount; i++)
+    {
+        if (!g_members[i].joined)
+            continue;
+
+        // One window in the stack is just Word: it keeps its button and its Alt+Tab entry. Hiding
+        // the only window there is would leave the user with no way back to Word at all.
+        BOOL show = (joined <= 1) || (g_members[i].frame == g_active);
+        PresentWindow(g_members[i].frame, show);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Joining and leaving.
 // ---------------------------------------------------------------------------------------------
 
@@ -165,6 +234,7 @@ static void Join(Member* member)
                  (void*)member->frame, (void*)master, JoinedCount());
     }
 
+    Present();
     StripRefreshTabs();
 }
 
@@ -173,6 +243,10 @@ static void Leave(Member* member, const wchar_t* why, BOOL restorePosition)
     if (!member->joined)
         return;
     member->joined = FALSE;
+
+    // Everything back, first and unconditionally. A window with no taskbar button, no Alt+Tab entry
+    // and another window on top of it cannot be reached by any means the user has.
+    PresentWindow(member->frame, TRUE);
 
     // Put it back where it was before we stacked it. Without this a window that leaves the stack -
     // switched off, or hidden and shown again - is left sitting exactly under the others, which
@@ -212,6 +286,7 @@ static void Leave(Member* member, const wchar_t* why, BOOL restorePosition)
     LogWrite(L"stack  hwnd=0x%p  left the stack (%s)  (%d remain)",
              (void*)member->frame, why, JoinedCount());
 
+    Present();
     StripRefreshTabs();
 }
 
@@ -226,7 +301,12 @@ void StackStart(void)
     g_started = TRUE;
 
     g_enabled = WordTabReadFlag(L"Stack", TRUE);
-    LogWrite(L"StackStart  stacking=%s", g_enabled ? L"on" : L"off (HKCU\\Software\\WordTab\\Stack=0)");
+    g_altTab  = WordTabReadFlag(L"AltTab", TRUE);
+    TaskbarStart();
+
+    LogWrite(L"StackStart  stacking=%s  altTab suppression=%s",
+             g_enabled ? L"on" : L"off (HKCU\\Software\\WordTab\\Stack=0)",
+             g_altTab ? L"on" : L"off");
 }
 
 void StackAttachFrame(HWND frame)
@@ -270,6 +350,11 @@ void StackOnFrameActivate(HWND frame)
 
     g_active = frame;
     LogWrite(L"stack  active -> 0x%p", (void*)frame);
+
+    // The taskbar button and the Alt+Tab entry move with the active tab. If they stayed on one
+    // window, restoring the stack from the taskbar would bring back a document the user was not
+    // looking at.
+    Present();
 
     // The newly focused window is now the layout oracle, and it is the only one Word will lay out.
     // Push what it has to the others so a stale background window is corrected on the way in.
@@ -357,9 +442,10 @@ void StackOnActiveLayout(HWND frame, const RECT* natural)
         return;
 
     // Only a window Word is actually showing can speak for the stack. A frame on its way out gets
-    // its layout dismantled first, and broadcasting that would take every other document's layout
-    // down with it - measured, once, and it put every strip on top of its ribbon.
-    if (!IsWindowVisible(frame))
+    // its layout dismantled first, and one on its way to the taskbar gets squeezed to nothing;
+    // broadcasting either would take every other document's layout down with it - measured, once,
+    // and it put every strip on top of its ribbon.
+    if (!IsWindowVisible(frame) || IsIconic(frame))
         return;
 
     for (int i = 0; i < g_memberCount; i++)
@@ -367,6 +453,73 @@ void StackOnActiveLayout(HWND frame, const RECT* natural)
         if (!g_members[i].joined || g_members[i].frame == frame)
             continue;
         StripSetNatural(g_members[i].frame, natural);
+    }
+}
+
+// Minimising. The stack is one window to the user, so it goes down and comes back as one.
+//
+// This has to be all-or-nothing in both directions, and the reason is the taskbar. Only the active
+// window has a button, so only the active window can be restored by clicking it. If minimising
+// took just that window down, the next document in the stack would be revealed underneath - the
+// illusion collapses, and the "one window" the user minimised is still on screen. And if restoring
+// brought back only the active window, every other document would be left minimised with no
+// taskbar button and no Alt+Tab entry: unreachable.
+void StackOnFrameSize(HWND frame, WPARAM sizeType)
+{
+    if (!g_enabled || g_inSync)
+        return;
+
+    Member* member = Find(frame);
+    if (!member || !member->joined || frame != g_active)
+        return;
+
+    if (sizeType == SIZE_MINIMIZED && !g_minimized)
+    {
+        g_minimized = TRUE;
+        g_inSync = TRUE;
+        int count = 0;
+        for (int i = 0; i < g_memberCount; i++)
+        {
+            if (!g_members[i].joined || g_members[i].frame == frame)
+                continue;
+            if (IsWindow(g_members[i].frame) && !IsIconic(g_members[i].frame))
+            {
+                ShowWindow(g_members[i].frame, SW_MINIMIZE);
+                count++;
+            }
+        }
+        g_inSync = FALSE;
+        LogWrite(L"stack  minimised with the active window: %d other window(s) went down too", count);
+    }
+    else if ((sizeType == SIZE_RESTORED || sizeType == SIZE_MAXIMIZED) && g_minimized)
+    {
+        g_minimized = FALSE;
+        g_inSync = TRUE;
+        int count = 0;
+        for (int i = 0; i < g_memberCount; i++)
+        {
+            if (!g_members[i].joined || g_members[i].frame == frame)
+                continue;
+            if (IsWindow(g_members[i].frame) && IsIconic(g_members[i].frame))
+            {
+                // Not SW_RESTORE: that would activate them, and the window the user clicked on
+                // would end up behind the ones it brought back with it.
+                ShowWindow(g_members[i].frame, SW_SHOWNOACTIVATE);
+                count++;
+            }
+        }
+        g_inSync = FALSE;
+
+        // They come back wherever Windows left them, so put the stack back together.
+        for (int i = 0; i < g_memberCount; i++)
+        {
+            if (g_members[i].joined && g_members[i].frame != frame)
+                MatchTo(frame, g_members[i].frame);
+        }
+
+        SetWindowPos(frame, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        LogWrite(L"stack  restored with the active window: %d other window(s) came back", count);
+        Present();
     }
 }
 
@@ -381,11 +534,13 @@ void StackJanitor(void)
     for (int i = 0; i < g_memberCount; i++)
     {
         Member* member = &g_members[i];
-        BOOL eligible = Eligible(member->frame);
 
-        if (eligible && !member->joined)
-            Join(member);
-        else if (!eligible && member->joined)
+        if (!member->joined)
+        {
+            if (EligibleToJoin(member->frame))
+                Join(member);
+        }
+        else if (!EligibleToStay(member->frame))
         {
             // Left where it is, deliberately. Word hides and re-shows frames of its own accord -
             // closing one document was measured to hide a *different* window for a moment - and
@@ -417,8 +572,17 @@ void StackStop(void)
     for (int i = 0; i < g_memberCount; i++)
         Leave(&g_members[i], L"shutdown", TRUE);
 
+    // Belt and braces over Leave, which has already done this for every joined member: nothing may
+    // be left without a taskbar button or an Alt+Tab entry, including a window that had somehow
+    // stopped being a member without going through Leave.
+    for (int i = 0; i < g_memberCount; i++)
+        PresentWindow(g_members[i].frame, TRUE);
+
+    TaskbarStop();
+
     g_memberCount = 0;
     g_active = NULL;
+    g_minimized = FALSE;
     LogWrite(L"StackStop  done");
 }
 
