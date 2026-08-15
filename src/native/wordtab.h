@@ -6,6 +6,16 @@
 
 #pragma once
 
+// Target Windows 10 and later. Stated rather than left to the toolchain's default, which is old
+// enough to hide WM_DPICHANGED and comctl32's window subclassing behind version guards - both of
+// which the frame code needs, and neither of which fails loudly if the guard silently excludes it.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef WINVER
+#define WINVER 0x0A00
+#endif
+
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 #include <windows.h>
@@ -96,3 +106,13 @@ const wchar_t* LogFilePath(void);
 
 // The object Word instantiates.
 HRESULT WordTabCreateConnect(REFIID riid, void** ppv);
+
+// ---------------------------------------------------------------------------------------------
+// Frame windows - the in-process subclass of Word's OpusApp frames. See frames.cpp.
+//
+// Both calls are idempotent and must both happen on Word's UI thread. FramesStop must run before
+// Word tears its windows down, or our window procedure is left in a chain we no longer control.
+// ---------------------------------------------------------------------------------------------
+
+void FramesStart(void);
+void FramesStop(void);

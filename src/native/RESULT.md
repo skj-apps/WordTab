@@ -109,3 +109,7 @@ signing policy), but "should" is not "did".
 
 The add-in does nothing yet beyond announcing itself. Subclassing `OpusApp` and moving the window
 work in-process — the whole point of getting here — is the next slice.
+
+**Done: see `RESULT-subclass.md`.** WordTab is now in the message path of every frame, and the
+"a 30ms poll cannot follow a drag" claim that justified all of this is measured there rather than
+asserted.

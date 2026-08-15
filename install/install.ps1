@@ -100,6 +100,16 @@ if ($SkipBuild) {
 
 if (-not (Test-Path $BuiltDll)) { throw "Build output not found: $BuiltDll" }
 
+# A stale DLL is the most expensive kind of wrong: everything installs cleanly, Word loads it
+# happily, and the change under test simply is not in it. Compare against the sources rather than
+# trusting that a build just happened - -SkipBuild bypasses it, and a failed build leaves the
+# previous DLL sitting there looking perfectly valid.
+$newestSource = Get-ChildItem -Path $NativeDir -Include '*.cpp', '*.h', '*.def' -File -Recurse |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($newestSource -and (Get-Item $BuiltDll).LastWriteTime -lt $newestSource.LastWriteTime) {
+    throw "$DllName is older than $($newestSource.Name) - it does not contain the current sources. Build it (drop -SkipBuild, and check the build actually succeeded)."
+}
+
 # ---- install files ------------------------------------------------------------------------------
 
 Write-Step "Installing to $InstallDir"

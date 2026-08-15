@@ -1,9 +1,9 @@
 // WordTab - the COM object Word instantiates. This is the entry point for everything WordTab
 // will ever do inside WINWORD.
 //
-// At this stage it only proves it loaded: it logs every callback and shows a one-shot banner.
-// The window work (subclassing OpusApp, shrinking _WwF, painting the strip) comes next and hangs
-// off OnStartupComplete / OnDisconnection.
+// It logs every callback, shows a one-shot banner, and hands off to the frame code in frames.cpp,
+// which subclasses Word's OpusApp windows. Shrinking _WwF and painting the strip come next and
+// hang off the same two points: FramesStart at OnStartupComplete, FramesStop at shutdown.
 //
 // Rule for every callback below: nothing escapes and nothing throws. An error returned or an
 // exception raised across the COM boundary during load makes Word add us to its
@@ -327,6 +327,17 @@ public:
         SysFreeString(docs);
 
         ShowBannerOnce(connectMode);
+
+        // ext_cm_AfterStartup means we were switched on mid-session: Word is already up and no
+        // OnStartupComplete is coming, so the frame work has to start here instead. In the normal
+        // startup case it waits, because Word has not finished making its first window yet.
+        if (connectMode != ext_cm_Startup)
+        {
+            LogWrite(L"OnConnection  mode is not ext_cm_Startup - starting frame work here, "
+                     L"since no OnStartupComplete will arrive");
+            FramesStart();
+        }
+
         return S_OK;
     }
 
@@ -358,6 +369,11 @@ public:
 
         LogWrite(L"OnStartupComplete  OpusApp windows: total=%d visible=%d first=0x%p",
                  total, visible, (void*)first);
+
+        // Subclass the frame(s) and start watching for new ones. Note this does not wait for the
+        // window to become visible: at this point it reliably is not (total=1 visible=0, every
+        // run), and waiting for visibility here waits forever.
+        FramesStart();
         return S_OK;
     }
 
@@ -370,6 +386,10 @@ public:
     HRESULT STDMETHODCALLTYPE OnBeginShutdown(SAFEARRAY**)
     {
         LogWrite(L"OnBeginShutdown");
+
+        // The last safe moment to take our window procedure back out of Word's frames: they still
+        // exist here, and by OnDisconnection some of them may not.
+        FramesStop();
         return S_OK;
     }
 
@@ -377,9 +397,10 @@ public:
     {
         LogWrite(L"OnDisconnection  mode=%d", (int)removeMode);
 
-        // ext_dm_UserClosed means Word keeps running without us, so teardown has to be real.
-        // Once this class owns window state, undoing it belongs here and must not rely on the
-        // process exiting.
+        // ext_dm_UserClosed means Word keeps running without us, so teardown has to be real and
+        // cannot rely on the process exiting. FramesStop is idempotent - on a normal shutdown
+        // OnBeginShutdown has already run it.
+        FramesStop();
         ReleaseHostObjects();
         return S_OK;
     }

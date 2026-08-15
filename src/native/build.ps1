@@ -66,6 +66,7 @@ New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 $sources = @(
     (Join-Path $SourceDir 'dllmain.cpp')
     (Join-Path $SourceDir 'connect.cpp')
+    (Join-Path $SourceDir 'frames.cpp')
     (Join-Path $SourceDir 'log.cpp')
 )
 
@@ -81,8 +82,11 @@ $flags = @(
 $flags += if ($DebugBuild) { @('-O0', '-g') } else { @('-O2', '-s') }   # -s strips symbols
 
 # Import libraries. ole32/oleaut32 for COM and BSTR, uuid for the standard IIDs, shell32 for
-# the known-folder lookup the logger uses, user32 for the banner.
-$libs = @('-lole32', '-loleaut32', '-luuid', '-lshell32', '-ladvapi32', '-luser32')
+# the known-folder lookup the logger uses, user32 for the windows and hooks, comctl32 for
+# SetWindowSubclass - which is used rather than swapping GWLP_WNDPROC by hand because it is the
+# only way to leave a subclass chain safely when another add-in has subclassed the same window
+# after us.
+$libs = @('-lole32', '-loleaut32', '-luuid', '-lshell32', '-ladvapi32', '-luser32', '-lcomctl32')
 
 $arguments = $flags + $sources + (Join-Path $SourceDir 'wordtab.def') + @('-o', $OutDll) + $libs
 
