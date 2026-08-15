@@ -47,6 +47,16 @@ static void Reconcile(void);
 static void CloseBatchStep(void);
 static void CloseBatchEnd(const wchar_t* why);
 
+// **The order of this array is the order of the tabs.** There is no separate order field, and that
+// is a decision rather than an omission: an `order` int has to be kept consistent with the array by
+// every path that adds a member, drops one, or compacts the array after a close, and any one of them
+// getting it wrong produces two tabs claiming the same position. An array cannot disagree with
+// itself about what order it is in.
+//
+// It also makes the rest of this file read in tab order for free: FirstJoined becomes the leftmost
+// tab rather than the earliest-joined one, and a batch close runs left to right. Joining appends, so
+// a new document arrives at the end of the row, which is where every other tabbed application puts
+// one. See StackMoveTab.
 static Member g_members[MAX_MEMBERS];
 static int    g_memberCount = 0;      // frames we know about, joined or not
 static HWND   g_active      = NULL;
@@ -800,6 +810,90 @@ int StackTabs(HWND frame, HWND* out, int max, int* activeIndex)
         count++;
     }
     return count;
+}
+
+// Where a tab sits in the row: joined members, counted left to right. -1 for a window that is not a
+// tab in a stack - stacking switched off, a lone window, one Word has hidden - which is the answer
+// the strip needs, because none of those can be reordered.
+int StackTabIndex(HWND frame)
+{
+    if (!g_enabled || !frame)
+        return -1;
+
+    int index = 0;
+    for (int i = 0; i < g_memberCount; i++)
+    {
+        if (!g_members[i].joined)
+            continue;
+        if (g_members[i].frame == frame)
+            return index;
+        index++;
+    }
+    return -1;
+}
+
+// Move a tab to a position in the row.
+//
+// The move is expressed in tab positions and performed in array positions, and the two are not the
+// same: g_members also holds windows that are not joined - one Word has hidden, one on its way in or
+// out - and those have no place in the row. So the tab index is translated to the array slot the tab
+// at that position actually occupies, and the entry is moved there.
+//
+// Returns TRUE only when the row really changed. A drag calls this on every mouse movement, so "it
+// is already there" has to be free and has to be silent - otherwise the log fills with a line per
+// pixel of a gesture that did nothing.
+BOOL StackMoveTab(HWND frame, int toIndex)
+{
+    int from = StackTabIndex(frame);
+    if (from < 0)
+        return FALSE;
+
+    int joined = JoinedCount();
+    if (joined < 2)
+        return FALSE;
+
+    if (toIndex < 0)
+        toIndex = 0;
+    if (toIndex > joined - 1)
+        toIndex = joined - 1;
+    if (toIndex == from)
+        return FALSE;
+
+    int fromSlot = -1, toSlot = -1, seen = 0;
+    for (int i = 0; i < g_memberCount; i++)
+    {
+        if (!g_members[i].joined)
+            continue;
+        if (seen == from)
+            fromSlot = i;
+        if (seen == toIndex)
+            toSlot = i;
+        seen++;
+    }
+    if (fromSlot < 0 || toSlot < 0)
+        return FALSE;
+
+    // Whole-struct moves, so joinRect, joinZoomed and the repair counter travel with the window they
+    // describe. Nothing outside this function may hold a Member* across the call - the entries move -
+    // and nothing does: every caller reaches the stack through an HWND.
+    Member moving = g_members[fromSlot];
+    if (fromSlot < toSlot)
+    {
+        for (int i = fromSlot; i < toSlot; i++)
+            g_members[i] = g_members[i + 1];
+    }
+    else
+    {
+        for (int i = fromSlot; i > toSlot; i--)
+            g_members[i] = g_members[i - 1];
+    }
+    g_members[toSlot] = moving;
+
+    LogWrite(L"stack  hwnd=0x%p  tab moved %d -> %d (of %d)", (void*)frame, from, toIndex, joined);
+
+    // Every window in the stack draws the same row, so a reorder is a repaint of all of them.
+    StripRefreshTabs();
+    return TRUE;
 }
 
 // Every strip draws the *stack's* active tab as selected, not its own - which is what makes a

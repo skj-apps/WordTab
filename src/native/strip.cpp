@@ -48,6 +48,12 @@
 #define CLOSE_LOGICAL      16    // the close button's hit target, a square
 #define PLUS_LOGICAL       26    // the new-document button's width
 
+// How far a press has to travel before it is a drag rather than a click. Four logical pixels is what
+// Windows itself uses (SM_CXDRAG's default), but taken as our own scaled constant rather than read
+// from the system: SM_CXDRAG is not per-monitor DPI scaled, so on this 150% rig it would be a third
+// smaller than everything else in this file, and the check script mirrors these numbers.
+#define DRAG_LOGICAL_SLOP   4
+
 // The tab row is bounded independently of the stack. 128 tabs at the 70px minimum is wider than any
 // monitor sold, so a layout array larger than this could only describe tabs nobody can see - and an
 // unbounded one on the stack of a WM_MOUSEMOVE handler is a different kind of problem.
@@ -155,6 +161,8 @@ struct StripHit
 {
     int  kind;
     HWND frame;             // for HIT_TAB and HIT_CLOSE
+    int  index;             // ...and where in the row it is, -1 otherwise
+    RECT tab;               // ...and the tab's rectangle, so picking one up needs no second layout
 };
 
 static StripState g_strips[MAX_STRIPS];
@@ -162,6 +170,33 @@ static int  g_stripCount = 0;
 static BOOL g_stripEnabled = TRUE;
 static BOOL g_buttonsEnabled = TRUE;     // HKCU\Software\WordTab\TabButtons
 static BOOL g_menuEnabled = TRUE;        // HKCU\Software\WordTab\TabMenu
+static BOOL g_dragEnabled = TRUE;        // HKCU\Software\WordTab\TabDrag
+
+// ---------------------------------------------------------------------------------------------
+// A tab being dragged.
+//
+// Global, unlike hover and the pressed buttons, which are per strip. The reason is that a press on a
+// tab activates that document *before* the drag begins - and activating raises a different window,
+// whose strip is now the one in front. So the strip holding the mouse capture is very often not the
+// strip the user can see. Per-strip state would draw the tab travelling on a window that is
+// underneath another one, and nothing at all on the window they are looking at.
+//
+// Held as the add-in's state instead, every strip can draw the same carried tab, and the one on top
+// is by construction the one that shows it. They are all the same width at the same position - that
+// is what the stack guarantees - so one x coordinate is meaningful in all of them.
+//
+// g_dragStrip doubles as "this strip is holding the mouse capture for a tab gesture". g_dragFrame is
+// cleared on cancel while the capture is kept, because the left button is still down and letting go
+// of the mouse mid-gesture would deliver the release to whatever is underneath.
+// ---------------------------------------------------------------------------------------------
+
+static HWND g_dragStrip  = NULL;    // the strip that owns the capture, NULL when no press is held
+static HWND g_dragFrame  = NULL;    // the tab under that press, NULL once cancelled
+static int  g_dragPressX = 0;       // where the press landed, in strip client coordinates
+static int  g_dragGrabDx = 0;       // how far into the tab, so it does not jump when picked up
+static int  g_dragLeft   = 0;       // the carried tab's left edge right now
+static int  g_dragFrom   = 0;       // the position it was picked up from - the log, and the undo
+static BOOL g_dragging   = FALSE;   // past the slop: this is a drag, not a click that has not ended
 static ATOM g_stripClass = 0;
 static UINT_PTR g_janitor = 0;
 
@@ -703,6 +738,8 @@ static StripHit HitTestStrip(StripState* state, HWND hwnd, POINT point)
     StripHit hit;
     hit.kind  = HIT_NONE;
     hit.frame = NULL;
+    hit.index = -1;
+    SetRectEmpty(&hit.tab);
 
     RECT client;
     if (!GetClientRect(hwnd, &client))
@@ -720,12 +757,16 @@ static StripHit HitTestStrip(StripState* state, HWND hwnd, POINT point)
         {
             hit.kind  = HIT_CLOSE;
             hit.frame = frames[i];
+            hit.index = i;
+            hit.tab   = layout.tab[i];
             return hit;
         }
         if (PtInRect(&layout.tab[i], point))
         {
             hit.kind  = HIT_TAB;
             hit.frame = frames[i];
+            hit.index = i;
+            hit.tab   = layout.tab[i];
             return hit;
         }
     }
@@ -818,6 +859,51 @@ static void DrawChip(HDC dc, const RECT* box, BOOL hot, BOOL down, int dpi)
     FillRect(dc, &chip, down ? g_chipDownBrush : g_chipHotBrush);
 }
 
+// One tab: its background, its border, its name and its close button.
+//
+// Its rectangle is a parameter rather than an index into the layout, and that is the whole point: a
+// tab being carried is drawn by this same function at wherever the pointer has taken it, so a
+// dragged tab cannot end up looking like a different kind of object from a tab sitting still.
+static void DrawOneTab(StripState* state, HDC dc, HWND frame,
+                       RECT tab, RECT close, BOOL selected, BOOL hot)
+{
+    HBRUSH fill = selected ? g_tabBrush : (hot ? g_tabHotBrush : g_tabIdleBrush);
+    FillRect(dc, &tab, fill);
+
+    HGDIOBJ oldPen   = SelectObject(dc, g_edgePen);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, tab.left, tab.top, tab.right, tab.bottom + 1);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+
+    BOOL hasClose = !IsRectEmpty(&close) && close.right <= tab.right;
+
+    wchar_t title[256];
+    WordTabFrameTitle(frame, title, 256);
+
+    RECT text = tab;
+    text.left += Scaled(10, state->dpi);
+    // The name stops before the button rather than running under it. A title clipped by an
+    // ellipsis reads as a long name; one running under a close button reads as a bug.
+    text.right = hasClose ? (close.left - Scaled(4, state->dpi))
+                          : (tab.right - Scaled(8, state->dpi));
+    if (text.right > text.left)
+    {
+        SetTextColor(dc, selected ? g_textColor : g_idleTextColor);
+        DrawTextW(dc, title, -1, &text,
+                  DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+
+    if (hasClose)
+    {
+        BOOL hotClose  = (state->hotKind == HIT_CLOSE && state->hotFrame == frame);
+        BOOL downClose = (state->pressKind == HIT_CLOSE && state->pressFrame == frame);
+        DrawChip(dc, &close, hotClose, downClose, state->dpi);
+        DrawGlyphLines(dc, &close, hotClose || downClose ? g_glyphHotColor : g_glyphColor,
+                       state->dpi, TRUE);
+    }
+}
+
 // Everything in the strip, onto whatever device context is handed in.
 //
 // Separate from PaintStrip so the same drawing serves WM_PAINT, the off-screen bitmap it paints
@@ -840,57 +926,56 @@ static void DrawStrip(StripState* state, HDC dc, const RECT* client)
                                                    : GetStockObject(DEFAULT_GUI_FONT));
     SetBkMode(dc, TRANSPARENT);
 
+    // The tab being carried, if it is one of ours. Held out of the loop and drawn afterwards, so it
+    // is on top of the tabs it is passing over rather than half under them.
+    int carried = -1;
+    if (g_dragging && g_dragFrame)
+    {
+        for (int i = 0; i < layout.count; i++)
+            if (frames[i] == g_dragFrame)
+                carried = i;
+    }
+
     for (int i = 0; i < layout.count; i++)
     {
+        if (i == carried)
+            continue;
+
         RECT tab = layout.tab[i];
         if (tab.right <= tab.left || tab.left >= client->right)
             break;
         if (tab.right > client->right)
             tab.right = client->right;
 
-        BOOL selected = (i == activeIndex);
-
         // A tab with its context menu open is drawn hot for as long as the menu is up, which is
         // the only thing on screen saying which document those commands are about.
-        BOOL hotTab   = ((state->hotFrame == frames[i]) &&
-                         (state->hotKind == HIT_TAB || state->hotKind == HIT_CLOSE)) ||
-                        (state->menuFrame && state->menuFrame == frames[i]);
+        BOOL hotTab = ((state->hotFrame == frames[i]) &&
+                       (state->hotKind == HIT_TAB || state->hotKind == HIT_CLOSE)) ||
+                      (state->menuFrame && state->menuFrame == frames[i]);
 
-        HBRUSH fill = selected ? g_tabBrush : (hotTab ? g_tabHotBrush : g_tabIdleBrush);
-        FillRect(dc, &tab, fill);
+        DrawOneTab(state, dc, frames[i], tab, layout.close[i], (i == activeIndex), hotTab);
+    }
 
-        HGDIOBJ oldPen   = SelectObject(dc, g_edgePen);
-        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, tab.left, tab.top, tab.right, tab.bottom + 1);
-        SelectObject(dc, oldBrush);
-        SelectObject(dc, oldPen);
+    if (carried >= 0)
+    {
+        // Offset by however far the tab has been taken from the slot it currently occupies. The row
+        // has already rearranged underneath it - StackMoveTab runs live during the drag - so this
+        // offset shrinks back to nothing as the tab arrives over its new position, and the tab is
+        // never drawn in two places or missing from one.
+        LONG shift = g_dragLeft - layout.tab[carried].left;
 
-        RECT close = layout.close[i];
-        BOOL hasClose = !IsRectEmpty(&close) && close.right <= tab.right;
+        RECT tab = layout.tab[carried];
+        OffsetRect(&tab, shift, 0);
 
-        wchar_t title[256];
-        WordTabFrameTitle(frames[i], title, 256);
+        RECT close = layout.close[carried];
+        if (!IsRectEmpty(&close))
+            OffsetRect(&close, shift, 0);
 
-        RECT text = tab;
-        text.left += Scaled(10, state->dpi);
-        // The name stops before the button rather than running under it. A title clipped by an
-        // ellipsis reads as a long name; one running under a close button reads as a bug.
-        text.right = hasClose ? (close.left - Scaled(4, state->dpi))
-                              : (tab.right - Scaled(8, state->dpi));
-        if (text.right > text.left)
+        if (tab.left < client->right && tab.right > tab.left)
         {
-            SetTextColor(dc, selected ? g_textColor : g_idleTextColor);
-            DrawTextW(dc, title, -1, &text,
-                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
-        }
-
-        if (hasClose)
-        {
-            BOOL hotClose  = (state->hotKind == HIT_CLOSE && state->hotFrame == frames[i]);
-            BOOL downClose = (state->pressKind == HIT_CLOSE && state->pressFrame == frames[i]);
-            DrawChip(dc, &close, hotClose, downClose, state->dpi);
-            DrawGlyphLines(dc, &close, hotClose || downClose ? g_glyphHotColor : g_glyphColor,
-                           state->dpi, TRUE);
+            if (tab.right > client->right)
+                tab.right = client->right;
+            DrawOneTab(state, dc, g_dragFrame, tab, close, (carried == activeIndex), TRUE);
         }
     }
 
@@ -1045,6 +1130,131 @@ static HWND MenuTargetAt(StripState* state, HWND hwnd, POINT point)
     return NULL;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Dragging a tab to reorder it.
+//
+// The row rearranges *live*, as the tab is carried, rather than showing an insertion marker and
+// rearranging on the drop. Both are defensible; live wins here because every window in the stack
+// draws the same row, so a live reorder is a thing all of them already know how to show, whereas an
+// insertion marker would be state the drawing code would have to be taught. It also means the drop
+// itself has nothing to do: by the time the button is released the order is already what the user
+// can see, and releasing is only letting go.
+//
+// The consequence is that cancelling has to undo, which is why the position the tab was picked up
+// from is kept for the whole gesture.
+// ---------------------------------------------------------------------------------------------
+
+// Forget the gesture without touching the row: a drop that was agreed to, or a strip destroyed
+// underneath one.
+static void DragForget(void)
+{
+    g_dragStrip = NULL;
+    g_dragFrame = NULL;
+    g_dragging  = FALSE;
+}
+
+// Put the row back exactly as it was and stop carrying the tab - but keep the capture, because the
+// left button is still down and letting the mouse go now would deliver its release to whatever
+// happens to be underneath the pointer.
+//
+// There is deliberately no Escape. The strip is WS_EX_NOACTIVATE and never holds the keyboard focus,
+// so a keypress never reaches it, and reading GetAsyncKeyState between two mouse movements is
+// exactly the mistake the batch close was written twice to avoid: a state that can come and go
+// inside a polling interval has to arrive as an event or it is not being observed at all. The two
+// cancels that *are* events - the right button, and losing the capture - both come through here, and
+// dragging the tab back where it came from is the third.
+static void DragUndo(HWND hwnd, const wchar_t* why)
+{
+    HWND frame = g_dragFrame;
+    BOOL was   = g_dragging;
+    int  from  = g_dragFrom;
+
+    g_dragFrame = NULL;
+    g_dragging  = FALSE;
+
+    if (!was || !frame || !IsWindow(frame))
+        return;
+
+    StackMoveTab(frame, from);
+    LogWrite(L"strip  hwnd=0x%p  drag cancelled (%s) - 0x%p back at tab %d",
+             (void*)hwnd, why, (void*)frame, from);
+    StripRefreshTabs();
+}
+
+// The pointer has moved with a tab held down. Below the slop this is still a click that has not
+// finished; past it the tab is being carried, and the row rearranges under it.
+static void DragMove(StripState* state, HWND hwnd, POINT point)
+{
+    // The document behind a carried tab can go away mid-gesture: Word hiding the window, a close
+    // that was already in flight, the janitor dropping it from the stack. There is then nothing to
+    // carry and nowhere to put it back, so the gesture is simply over.
+    if (!IsWindow(g_dragFrame) || StackTabIndex(g_dragFrame) < 0)
+    {
+        BOOL was = g_dragging;
+        g_dragFrame = NULL;
+        g_dragging  = FALSE;
+        if (was)
+        {
+            LogWrite(L"strip  hwnd=0x%p  drag abandoned - that tab is no longer in the row",
+                     (void*)hwnd);
+            StripRefreshTabs();
+        }
+        return;
+    }
+
+    int slop = Scaled(DRAG_LOGICAL_SLOP, state->dpi);
+    int dx   = point.x - g_dragPressX;
+
+    if (!g_dragging)
+    {
+        // Horizontal distance only. The row has no vertical meaning - there is no tear-off in this
+        // add-in, so dragging a tab downwards is not a different gesture, it is the same one done
+        // untidily - and a threshold that counted vertical movement would start a reorder from a
+        // hand that slipped while clicking.
+        if (dx > -slop && dx < slop)
+            return;
+
+        g_dragging = TRUE;
+        LogWrite(L"strip  hwnd=0x%p  drag started on 0x%p (tab %d)",
+                 (void*)hwnd, (void*)g_dragFrame, g_dragFrom);
+    }
+
+    RECT client;
+    if (!GetClientRect(hwnd, &client))
+        return;
+
+    HWND frames[MAX_STRIPS];
+    int count = StackTabs(state->frame, frames, MAX_STRIPS, NULL);
+
+    StripLayout layout;
+    ComputeLayout(state, &client, count, &layout);
+    if (layout.count <= 0)
+        return;
+
+    // Where the tab is now: carried from the point inside it that was grabbed, so it does not jump
+    // under the pointer when it is picked up, and never past either end of the row - there is
+    // nowhere further to go, and a tab drawn off the strip is one being aimed blind.
+    int left = point.x - g_dragGrabDx;
+    if (left < layout.tab[0].left)
+        left = layout.tab[0].left;
+    if (left > layout.tab[layout.count - 1].left)
+        left = layout.tab[layout.count - 1].left;
+    g_dragLeft = left;
+
+    // Which slot it belongs in: the one containing the carried tab's own centre. Measured from the
+    // tab rather than from the pointer, so the row swaps when the tab is visibly half way past its
+    // neighbour - the pointer can be anywhere along it, and swapping on the pointer makes a tab
+    // grabbed by its right-hand edge jump a place the instant it is picked up.
+    int centre = left + (layout.tab[0].right - layout.tab[0].left) / 2;
+    int target = 0;
+    for (int i = 0; i < layout.count; i++)
+        if (layout.tab[i].left <= centre)
+            target = i;
+
+    StackMoveTab(g_dragFrame, target);   // free, and silent, while the tab is already there
+    StripRefreshTabs();
+}
+
 static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     StripState* state = (StripState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -1078,6 +1288,15 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     case WM_MOUSEMOVE:
         if (state)
         {
+            // A held tab takes the whole message. Hover means nothing while the button is down - the
+            // pointer is on the tab it is carrying - and the carried tab is its own feedback.
+            if (g_dragStrip == hwnd)
+            {
+                if (g_dragFrame)
+                    DragMove(state, hwnd, PointOf(lParam));
+                return 0;
+            }
+
             ArmLeaveTracking(state, hwnd);
             StripHit hit = HitTestStrip(state, hwnd, PointOf(lParam));
             SetHot(state, hwnd, hit.kind, hit.frame);
@@ -1116,12 +1335,57 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 LogWrite(L"strip  hwnd=0x%p  tab clicked -> 0x%p",
                          (void*)state->frame, (void*)hit.frame);
                 StackActivate(hit.frame);
+
+                // ...and the same press may turn out to be a drag. Nothing is committed here: the
+                // tab is only claimed, and it stays a plain click until the pointer travels far
+                // enough to mean something else.
+                //
+                // The capture is taken *after* the activation, not before. Activating raises a
+                // different window, and the one thing that has to be true when this returns is that
+                // this strip owns the mouse. A tab that is not in a stack has no row to be reordered
+                // within, so it is not picked up at all.
+                if (g_dragEnabled && StackTabIndex(hit.frame) >= 0)
+                {
+                    POINT point  = PointOf(lParam);
+                    g_dragStrip  = hwnd;
+                    g_dragFrame  = hit.frame;
+                    g_dragPressX = point.x;
+                    g_dragGrabDx = point.x - hit.tab.left;
+                    g_dragLeft   = hit.tab.left;
+                    g_dragFrom   = hit.index;
+                    g_dragging   = FALSE;
+                    SetCapture(hwnd);
+                }
             }
             return 0;
         }
         break;
 
+    // Letting go of a tab. The drop has nothing to commit - the row rearranged as the tab was
+    // carried - so this is bookkeeping and a log line. It is also where a press that never became a
+    // drag ends, which is a plain click and was already handled on the way down.
     case WM_LBUTTONUP:
+        if (g_dragStrip == hwnd)
+        {
+            HWND frame = g_dragFrame;
+            BOOL was   = g_dragging;
+            int  from  = g_dragFrom;
+
+            // Cleared *before* the capture goes back. ReleaseCapture sends this window a
+            // WM_CAPTURECHANGED, and that handler's job is to put an interrupted drag back where it
+            // started - which is the exact opposite of what a completed drop means.
+            DragForget();
+            if (GetCapture() == hwnd)
+                ReleaseCapture();
+
+            if (was && frame)
+            {
+                LogWrite(L"strip  hwnd=0x%p  drag ended: 0x%p is tab %d (was %d)",
+                         (void*)hwnd, (void*)frame, StackTabIndex(frame), from);
+                StripRefreshTabs();
+            }
+            return 0;
+        }
         if (state && state->pressKind != HIT_NONE)
         {
             int  kind  = state->pressKind;
@@ -1162,6 +1426,8 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     // Middle-click closes, which is what a middle click does to a tab everywhere else. Paired the
     // same way as the close button: the release has to land on the tab the press did.
     case WM_MBUTTONDOWN:
+        if (g_dragStrip == hwnd)
+            return 0;              // a tab is being held; a second button is not a second gesture
         if (state)
         {
             StripHit hit = HitTestStrip(state, hwnd, PointOf(lParam));
@@ -1196,6 +1462,13 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     // the release. Consistent with them on purpose: a press that lands on the wrong tab is still
     // taken back by sliding off it before letting go.
     case WM_RBUTTONDOWN:
+        // The right button while a tab is held is the cancel, not a menu. The capture is kept: the
+        // left button is still down, and the gesture is not over until it is let go of.
+        if (g_dragStrip == hwnd)
+        {
+            DragUndo(hwnd, L"right button");
+            return 0;
+        }
         if (state && g_menuEnabled)
         {
             state->rightDown  = TRUE;
@@ -1206,6 +1479,11 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         break;
 
     case WM_RBUTTONUP:
+        // Swallowed while a tab is held, and not merely ignored. DefWindowProc turns a right release
+        // into WM_CONTEXTMENU, and a child window's WM_CONTEXTMENU goes to its parent - so letting
+        // this one through would end a cancelled drag by opening Word's own context menu.
+        if (g_dragStrip == hwnd)
+            return 0;
         if (state && state->rightDown)
         {
             POINT point  = PointOf(lParam);
@@ -1230,6 +1508,14 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     // Capture can be taken away without a button release - a dialog appearing, Alt+Tab, Word
     // starting a modal loop. Anything half-pressed at that point is cancelled, not completed.
     case WM_CAPTURECHANGED:
+        // Something took the mouse away mid-gesture: a dialog, Alt+Tab, Word starting a modal loop.
+        // A drag that was interrupted was never agreed to, so the row goes back exactly as it was.
+        // A drop clears the drag before releasing the capture, so it does not arrive here.
+        if (g_dragStrip == hwnd)
+        {
+            DragUndo(hwnd, L"the mouse capture was taken away");
+            DragForget();
+        }
         if (state && (state->pressKind != HIT_NONE || state->middleFrame || state->rightDown))
         {
             state->pressKind   = HIT_NONE;
@@ -1588,6 +1874,12 @@ static void Restore(StripState* state)
 {
     state->enabled = FALSE;
 
+    // A drag whose strip is being destroyed is over. Forgotten rather than undone: a window going
+    // away says nothing about whether the user meant the moves they had already made, and
+    // DestroyWindow releases the capture, which would otherwise arrive as a cancel.
+    if (state->strip && g_dragStrip == state->strip)
+        DragForget();
+
     if (state->strip && IsWindow(state->strip))
     {
         DestroyWindow(state->strip);
@@ -1705,6 +1997,11 @@ void StripStart(void)
     // which is what it did before this slice.
     g_menuEnabled = WordTabReadFlag(L"TabMenu", TRUE);
 
+    // Dragging a tab to reorder it. Off, a press on a tab switches to it and nothing else, which is
+    // what it did before this slice - and the mouse capture is never taken, so the whole mechanism
+    // is out of the way rather than merely inert.
+    g_dragEnabled = WordTabReadFlag(L"TabDrag", TRUE);
+
     if (!g_stripClass)
     {
         WNDCLASSEXW wc;
@@ -1755,12 +2052,13 @@ void StripStart(void)
         g_janitor = SetTimer(NULL, 0, 500, JanitorProc);
 
     LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s  "
-             L"tab menu=%s",
+             L"tab menu=%s  tab drag=%s",
              g_stripClass ? L"registered" : L"FAILED",
              g_janitor ? L"running" : L"FAILED", STRIP_LOGICAL_H,
              g_darkTheme ? L"dark" : L"light",
              g_buttonsEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabButtons=0)",
-             g_menuEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabMenu=0)");
+             g_menuEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabMenu=0)",
+             g_dragEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabDrag=0)");
 }
 
 void StripAttachFrame(HWND frame)
@@ -1796,6 +2094,8 @@ void StripDetachFrame(HWND frame)
     else
     {
         state->enabled = FALSE;
+        if (state->strip && g_dragStrip == state->strip)
+            DragForget();
         state->wwf = NULL;
         state->strip = NULL;
         if (state->font) { DeleteObject(state->font); state->font = NULL; }

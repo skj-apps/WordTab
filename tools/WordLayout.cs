@@ -263,6 +263,74 @@ public static class WordLayout
         return steps;
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Dragging inside one of *our* windows, as opposed to DragBy above, which is about driving
+    // Word's own modal move loop by the caption.
+    //
+    // The intermediate movements are the point. A drag implemented as press, teleport, release
+    // crosses no threshold, produces one WM_MOUSEMOVE at the destination, and would let a strip that
+    // reorders nothing at all pass a reorder check. These deliver a real path.
+    //
+    // Split into hold and release so a check can photograph the strip while the button is still
+    // down. Every caller of DragHold must call DragRelease from a finally block: a left button left
+    // down is a wrecked desktop, exactly like a held Alt key.
+    // ---------------------------------------------------------------------------------------------
+
+    public static void DragHold(int x1, int y1, int x2, int y2, int steps, int delayMs)
+    {
+        if (steps < 1) steps = 1;
+        Move(x1, y1, 0);
+        Thread.Sleep(200);
+        Move(x1, y1, MOUSEEVENTF_LEFTDOWN);
+        Thread.Sleep(250);
+
+        for (int i = 1; i <= steps; i++)
+        {
+            int x = x1 + (int)((long)(x2 - x1) * i / steps);
+            int y = y1 + (int)((long)(y2 - y1) * i / steps);
+            Move(x, y, 0);
+            Thread.Sleep(delayMs);
+        }
+        Thread.Sleep(200);
+    }
+
+    // Carry on from where DragHold left off, button still down. Lets one gesture be asserted in
+    // stages - a short move that must not reorder anything, then a long one that must.
+    public static void DragMoveTo(int x1, int y1, int x2, int y2, int steps, int delayMs)
+    {
+        if (steps < 1) steps = 1;
+        for (int i = 1; i <= steps; i++)
+        {
+            int x = x1 + (int)((long)(x2 - x1) * i / steps);
+            int y = y1 + (int)((long)(y2 - y1) * i / steps);
+            Move(x, y, 0);
+            Thread.Sleep(delayMs);
+        }
+        Thread.Sleep(200);
+    }
+
+    public static void DragRelease(int x, int y)
+    {
+        Move(x, y, MOUSEEVENTF_LEFTUP);
+        Thread.Sleep(500);
+    }
+
+    public static void DragTo(int x1, int y1, int x2, int y2, int steps, int delayMs)
+    {
+        try { DragHold(x1, y1, x2, y2, steps, delayMs); }
+        finally { DragRelease(x2, y2); }
+    }
+
+    // A tap of the right button without letting the left one go - the cancel gesture. The left
+    // button is released afterwards where it is, which is what a user who changed their mind does.
+    public static void RightTap(int x, int y)
+    {
+        Move(x, y, MOUSEEVENTF_RIGHTDOWN);
+        Thread.Sleep(120);
+        Move(x, y, MOUSEEVENTF_RIGHTUP);
+        Thread.Sleep(250);
+    }
+
     static void Move(int x, int y, uint extraFlags)
     {
         int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77);

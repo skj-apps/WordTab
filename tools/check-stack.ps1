@@ -85,6 +85,37 @@ function Get-Parts($frame) {
 
 function Format-Rect($r) { "({0},{1} {2}x{3})" -f $r.Left, $r.Top, ($r.Right - $r.Left), ($r.Bottom - $r.Top) }
 
+# The window on top, or the first one if the foreground belongs to another application entirely.
+#
+# Written as a search with a fallback rather than as `@(... | Where-Object ...)[0]`, because under
+# Set-StrictMode indexing an empty result is a hard error, not $null - the same trap as
+# `(Get-Frames).Count` on no frames. And "nothing matched" is a state this genuinely reaches:
+# switching tabs ends in SetForegroundWindow, which Windows refuses from a process that is not
+# already the foreground application, so anything that steals the desktop mid-run leaves the
+# foreground outside Word. That has to read as a failed assertion, not as a crashed script.
+function Get-TopParts($all) {
+    $fg = [WordLayout]::GetForeground()
+    foreach ($p in @($all)) { if ($p.Frame -eq $fg) { return $p } }
+    if (@($all).Count -gt 0) { return @($all)[0] }
+    return $null
+}
+
+# Bring Word forward and wait until one of its frames really is the foreground window. Focus() does
+# the AttachThreadInput handshake, which is how a process that is not foreground asks for it.
+function Set-WordForeground($seconds = 6) {
+    $frames = @(Get-Frames)
+    if ($frames.Count -eq 0) { return $false }
+    if ($frames -contains [WordLayout]::GetForeground()) { return $true }
+
+    [WordLayout]::Focus($frames[0]) | Out-Null
+    $deadline = (Get-Date).AddSeconds($seconds)
+    while ((Get-Date) -lt $deadline) {
+        if (@(Get-Frames) -contains [WordLayout]::GetForeground()) { return $true }
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
+}
+
 # One rectangle, or several? Compared as strings because that is exactly the question - identical
 # or not - and it prints usefully when the answer is "not".
 function Test-Stacked($label) {
@@ -195,18 +226,18 @@ Write-Step 'Clicking each tab'
 [WordLayout]::Focus($active) | Out-Null
 Start-Sleep -Milliseconds 500
 
+Assert (Set-WordForeground) 'Word is the foreground application, so a tab click can switch to it'
+
 $parts = @(Get-Frames | ForEach-Object { Get-Parts $_ })
 $count = $parts.Count
-$top   = @($parts | Where-Object { $_.Frame -eq [WordLayout]::GetForeground() })[0]
-if (-not $top) { $top = $parts[0] }
+$top   = Get-TopParts $parts
 
 $activated = @()
 for ($i = 0; $i -lt $count; $i++) {
     # Measured inside the loop, not once before it. The strip moves whenever Word relays a window
     # out, and it was measured shifting 46 pixels between two clicks a second apart - after which a
     # rectangle taken before the loop points into the document and the click does nothing at all.
-    $live = @(Get-Frames | ForEach-Object { Get-Parts $_ } |
-              Where-Object { $_.Frame -eq [WordLayout]::GetForeground() })[0]
+    $live = Get-TopParts @(Get-Frames | ForEach-Object { Get-Parts $_ })
     if (-not $live) { $live = $top }
     $tab = ([WordLayout]::Tabs($live.Strip.Hwnd, $count)).Tabs[$i]
 

@@ -196,6 +196,13 @@ BOOL StackIsSyncing(void);
 int  StackTabs(HWND frame, HWND* out, int max, int* activeIndex);
 void StackActivate(HWND frame);
 
+// Where a tab sits in the row, and how to move it. The index space is the one StackTabs hands out:
+// joined windows, left to right, which is exactly what the strip draws. StackTabIndex answers -1 for
+// a window that is not a tab in a stack, and StackMoveTab returns TRUE only if the row changed - so
+// a drag can call it on every mouse movement and it costs nothing while the tab is already there.
+int  StackTabIndex(HWND frame);
+BOOL StackMoveTab(HWND frame, int toIndex);
+
 // Close the document behind a tab. Activates it first - see the comment on the definition, which is
 // about where a modal save prompt ends up in the z-order - and returns the user to the tab they were
 // on if it was not the one they closed.
