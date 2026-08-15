@@ -174,6 +174,10 @@ public static class WordLayout
     public static bool IsToolWindow(IntPtr hwnd) { return (ExStyle(hwnd) & WS_EX_TOOLWINDOW) != 0; }
     public static bool Minimized(IntPtr hwnd) { return IsIconic(hwnd); }
 
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hwnd);
+    // Named to avoid colliding with the Win32 import above, which has to stay private.
+    public static bool IsWindow2(IntPtr hwnd) { return IsWindow(hwnd); }
+
     // The virtual desktop, for full-screen captures. Alt+Tab and the taskbar cannot be enumerated
     // through any API, so the only honest way to check them is to photograph the screen.
     public static RECT ScreenRect()

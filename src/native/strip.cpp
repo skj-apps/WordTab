@@ -281,16 +281,54 @@ static void LogRelayout(StripState* state, const wchar_t* why)
 }
 
 // Put our window in the gap. Cheap to call repeatedly: it does nothing unless the rectangle moved.
-static void PlaceStrip(StripState* state)
+//
+// The strip's position is derived from where the document frame **actually is**, not from the
+// natural rect we computed for it. The two ought to be the same and are almost always, but "almost"
+// was worth a visible seam: Word occasionally reports a child a pixel away from where we put it -
+// the frame's client origin shifts by one when Windows redraws the border - and a strip positioned
+// from stored numbers then sits a pixel off the document frame it is supposed to be flush against.
+// Derived from the live rect, the two cannot disagree, whatever either of them is doing.
+//
+// `wwfRect` overrides that when the caller already knows where the document frame is about to be:
+// during WM_WINDOWPOSCHANGING it has not moved yet, so reading it would place the strip a message
+// behind.
+static void PlaceStrip(StripState* state, const RECT* wwfRect)
 {
     if (!state->strip || !state->hasApplied)
         return;
 
+    // Not while the window is off screen: its layout is frozen and deliberately not trusted (see
+    // AdjustProposed), so the document frame down there is not something to line up against.
+    if (!wwfRect && (!IsWindowVisible(state->frame) || IsIconic(state->frame)))
+        return;
+
+    RECT document = state->applied;
+    if (wwfRect)
+    {
+        document = *wwfRect;
+    }
+    else if (state->wwf && IsWindow(state->wwf))
+    {
+        RECT live;
+        if (ChildRect(state->frame, state->wwf, &live))
+        {
+            // The live rect is trusted for pixel-level disagreement, not for a different layout.
+            // A document frame a pixel from where we put it is the border artifact this whole
+            // derivation exists to absorb; one 48 pixels away is Word mid-transition - it has reset
+            // the frame and we have not shifted it back yet - and following it there would put the
+            // strip over the ribbon or off the top of the window. Measured, both.
+            LONG drift = live.top - state->applied.top;
+            if (drift < 0) drift = -drift;
+            if (drift < state->stripH)
+                document = live;
+        }
+    }
+
     RECT want;
-    want.left   = state->natural.left;
-    want.top    = state->natural.top;
-    want.right  = state->natural.right;
-    want.bottom = state->natural.top + state->stripH;
+    want.left   = document.left;
+    want.top    = document.top - state->stripH;
+    want.right  = document.right;
+    want.bottom = document.top;
 
     // Compared against where the strip *actually is*, not against where we last put it. Those are
     // not the same thing - Word, another add-in, or a message we did not see can move it - and
@@ -429,8 +467,10 @@ static void AdjustProposed(StripState* state, WINDOWPOS* pos)
     pos->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
 
     // In the same message as the document frame moves, rather than waiting for the CHANGED that
-    // follows: the two are meant to be flush against each other, so they should move together.
-    PlaceStrip(state);
+    // follows: the two are meant to be flush against each other, so they should move together. The
+    // rect is passed in because the document frame has not moved yet - reading it here would place
+    // the strip against where it used to be.
+    PlaceStrip(state, &applied);
 
     if (naturalMoved)
     {
@@ -464,7 +504,7 @@ static LRESULT CALLBACK WwfSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         if (state && state->wwf == hwnd)
         {
             const WINDOWPOS* pos = (const WINDOWPOS*)lParam;
-            PlaceStrip(state);
+            PlaceStrip(state, NULL);
 
             // Backstage and window minimisation both take `_WwF` away; the strip belongs with it,
             // not with the frame.
@@ -749,7 +789,7 @@ static void ApplyInitial(StripState* state)
     // stop being possible just because this path is called "initial".
     if (state->hasApplied && SameRect(&current, &state->applied))
     {
-        PlaceStrip(state);
+        PlaceStrip(state, NULL);
         return;
     }
 
@@ -776,7 +816,7 @@ static void ApplyInitial(StripState* state)
 
     RememberClient(state);
     LogRelayout(state, L"initial");
-    PlaceStrip(state);
+    PlaceStrip(state, NULL);
     StackOnActiveLayout(state->frame, &state->natural);
 }
 
@@ -835,7 +875,7 @@ void StripSetNatural(HWND frame, const RECT* natural)
                  applied.right - applied.left, applied.bottom - applied.top,
                  SWP_NOZORDER | SWP_NOACTIVATE);
 
-    PlaceStrip(state);
+    PlaceStrip(state, NULL);
 }
 
 // Refit a window's document frame to the window's *own* current size. Needed when a window leaves
@@ -1013,7 +1053,7 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
         // Cheap when nothing has moved - it compares against the strip's real rect and returns.
         // This is what makes any drift heal within half a second rather than staying wrong.
         if (visible)
-            PlaceStrip(state);
+            PlaceStrip(state, NULL);
 
         // The strip belongs with the document frame: shown when it is shown, hidden when Backstage
         // or a minimise takes it away.

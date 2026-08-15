@@ -40,7 +40,10 @@ struct Member
     BOOL joined;
     RECT joinRect;      // where the window was before we stacked it, so it can be put back
     BOOL joinZoomed;
+    int  repairs;       // consecutive attempts to put this one back in step - see Reconcile
 };
+
+static void Reconcile(void);
 
 static Member g_members[MAX_MEMBERS];
 static int    g_memberCount = 0;      // frames we know about, joined or not
@@ -111,10 +114,33 @@ static HWND FirstJoined(HWND except)
 // Geometry.
 // ---------------------------------------------------------------------------------------------
 
+// Maximize or restore a window *without activating it*.
+//
+// `ShowWindow(SW_MAXIMIZE)` and `SW_RESTORE` both activate, and activating a window behind the one
+// the user is looking at pulls it in front and hands it the keyboard. `SetWindowPlacement` changes
+// the same state and does not activate, which is the only reason it is used here.
+static void SetZoomState(HWND frame, BOOL zoom)
+{
+    WINDOWPLACEMENT placement;
+    memset(&placement, 0, sizeof(placement));
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(frame, &placement))
+        return;
+
+    UINT wanted = zoom ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+    if (placement.showCmd == wanted)
+        return;
+
+    placement.showCmd = wanted;
+    placement.flags = 0;
+    SetWindowPlacement(frame, &placement);
+}
+
 // Make `frame` match `master` exactly: same rect, and the same maximized-or-not *state* rather
 // than only the same rectangle. Spike 2 could copy rectangles only, which left a stacked window
-// looking maximized without being maximized - its title bar then behaved oddly on a double click.
-// In-process the state itself is reachable, so it is used.
+// looking maximized without being maximized - and it is not even the same rectangle: a maximized
+// window covers the taskbar's strip of screen and a window merely resized to "maximized size" does
+// not, so the two differ by the height of the taskbar. In-process the state itself is reachable.
 static void MatchTo(HWND master, HWND frame)
 {
     if (!IsWindow(master) || !IsWindow(frame) || master == frame)
@@ -122,23 +148,19 @@ static void MatchTo(HWND master, HWND frame)
 
     g_inSync = TRUE;
 
-    if (IsZoomed(master))
-    {
-        if (!IsZoomed(frame))
-            ShowWindow(frame, SW_MAXIMIZE);
-    }
-    else
-    {
-        if (IsZoomed(frame))
-            ShowWindow(frame, SW_RESTORE);
+    // State first, then rectangle, and the rectangle **always**. Two windows can both be maximized
+    // and still not be the same size - measured: a maximized window that the shell classifies
+    // differently gets the full screen where another gets the work area, 72px shorter. Setting the
+    // state alone leaves them looking like two windows; copying the rect alone leaves a window that
+    // looks maximized without being maximized, which is what spike 2 could not fix.
+    SetZoomState(frame, IsZoomed(master) ? TRUE : FALSE);
 
-        RECT rect;
-        if (GetWindowRect(master, &rect))
-        {
-            SetWindowPos(frame, NULL, rect.left, rect.top,
-                         rect.right - rect.left, rect.bottom - rect.top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+    RECT rect;
+    if (GetWindowRect(master, &rect))
+    {
+        SetWindowPos(frame, NULL, rect.left, rect.top,
+                     rect.right - rect.left, rect.bottom - rect.top,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     g_inSync = FALSE;
@@ -382,6 +404,13 @@ int StackOnFramePosChanging(HWND frame, const WINDOWPOS* pos)
     if (IsIconic(frame))
         return 0;
 
+    // A maximized window is not a rectangle to be copied. Its rect covers the strip of screen the
+    // taskbar sits on, which a window merely *resized* to those numbers does not - measured, the
+    // two differ by 72px on this rig. Maximizing is a state, and it is propagated as one from
+    // WM_SIZE below.
+    if (IsZoomed(frame))
+        return 0;
+
     RECT current;
     if (!GetWindowRect(frame, &current))
         return 0;
@@ -484,14 +513,53 @@ void StackOnFrameSize(HWND frame, WPARAM sizeType)
                 continue;
             if (IsWindow(g_members[i].frame) && !IsIconic(g_members[i].frame))
             {
-                ShowWindow(g_members[i].frame, SW_MINIMIZE);
+                // SW_SHOWMINNOACTIVE, not SW_MINIMIZE: the latter activates the next window in the
+                // z-order on its way down, which here means handing focus to another document in
+                // the same stack while the user is trying to put the whole thing away.
+                ShowWindow(g_members[i].frame, SW_SHOWMINNOACTIVE);
                 count++;
             }
         }
         g_inSync = FALSE;
         LogWrite(L"stack  minimised with the active window: %d other window(s) went down too", count);
+        return;
     }
-    else if ((sizeType == SIZE_RESTORED || sizeType == SIZE_MAXIMIZED) && g_minimized)
+
+    // Maximize and restore are *states*, and they have to be propagated as states rather than as
+    // rectangles - see MatchTo. This is the gap spike 2 could not close, and it is visible: a
+    // window given a maximized window's rectangle is 72px shorter than a maximized one on this rig,
+    // because a real maximized window covers the taskbar's strip of screen.
+    if (!g_minimized && (sizeType == SIZE_MAXIMIZED || sizeType == SIZE_RESTORED))
+    {
+        BOOL zoom = (sizeType == SIZE_MAXIMIZED);
+        g_inSync = TRUE;
+        int count = 0;
+        for (int i = 0; i < g_memberCount; i++)
+        {
+            HWND other = g_members[i].frame;
+            if (!g_members[i].joined || other == frame || !IsWindow(other) || IsIconic(other))
+                continue;
+            if ((IsZoomed(other) ? TRUE : FALSE) != zoom)
+            {
+                SetZoomState(other, zoom);
+                count++;
+            }
+        }
+        g_inSync = FALSE;
+
+        if (count > 0)
+        {
+            for (int i = 0; i < g_memberCount; i++)
+                if (g_members[i].joined && g_members[i].frame != frame)
+                    MatchTo(frame, g_members[i].frame);
+
+            LogWrite(L"stack  %s with the active window: %d other window(s) followed",
+                     zoom ? L"maximized" : L"restored", count);
+        }
+        return;
+    }
+
+    if ((sizeType == SIZE_RESTORED || sizeType == SIZE_MAXIMIZED) && g_minimized)
     {
         g_minimized = FALSE;
         g_inSync = TRUE;
@@ -560,6 +628,76 @@ void StackJanitor(void)
         Member* member = Find(foreground);
         if (member && member->joined)
             StackOnFrameActivate(foreground);
+    }
+
+    Reconcile();
+}
+
+// Put back together anything that has come apart.
+//
+// Every divergence found so far had its own cause and its own event - a maximize that propagated as
+// a rectangle rather than a state, a window whose restore arrived while it was not the active one -
+// and fixing each one individually is a losing game: the next cause is one Word update away. So
+// rather than trust that every event was caught, the stack compares itself against the active
+// window twice a second and repairs what does not match. The same principle as the strip comparing
+// itself against where it actually is rather than where it last put itself.
+//
+// Cheap when nothing is wrong: two rectangle comparisons per window and no calls at all.
+static void Reconcile(void)
+{
+    if (!g_enabled || g_minimized || g_inSync || !g_active || !IsWindow(g_active))
+        return;
+    if (IsIconic(g_active) || JoinedCount() < 2)
+        return;
+
+    RECT master;
+    if (!GetWindowRect(g_active, &master))
+        return;
+
+    BOOL masterZoomed = IsZoomed(g_active) ? TRUE : FALSE;
+
+    for (int i = 0; i < g_memberCount; i++)
+    {
+        HWND frame = g_members[i].frame;
+        if (!g_members[i].joined || frame == g_active || !IsWindow(frame) || IsIconic(frame))
+            continue;
+
+        RECT rect;
+        if (!GetWindowRect(frame, &rect))
+            continue;
+
+        BOOL zoomed = IsZoomed(frame) ? TRUE : FALSE;
+        if (zoomed == masterZoomed &&
+            rect.left == master.left && rect.top == master.top &&
+            rect.right == master.right && rect.bottom == master.bottom)
+        {
+            g_members[i].repairs = 0;
+            continue;
+        }
+
+        // A window that will not stay put is worse than one that is wrong: forcing it every half
+        // second forever would be a permanent cost for no gain. Log it once and leave it.
+        if (g_members[i].repairs >= 10)
+            continue;
+
+        if (g_members[i].repairs == 0)
+        {
+            LogWrite(L"stack  hwnd=0x%p  out of step: (%ld,%ld %ldx%ld) zoomed=%d, master "
+                     L"(%ld,%ld %ldx%ld) zoomed=%d - putting it back",
+                     (void*)frame,
+                     rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, (int)zoomed,
+                     master.left, master.top, master.right - master.left, master.bottom - master.top,
+                     (int)masterZoomed);
+        }
+
+        g_members[i].repairs++;
+        if (g_members[i].repairs == 10)
+        {
+            LogWrite(L"stack  hwnd=0x%p  will not stay in step after 10 attempts - leaving it "
+                     L"alone rather than fighting it every half second", (void*)frame);
+        }
+
+        MatchTo(g_active, frame);
     }
 }
 

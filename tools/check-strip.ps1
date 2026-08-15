@@ -115,7 +115,13 @@ if ($SecondDocument) {
     }
 }
 
-$target = $frames[0]
+# Drive the window that is in front, and put it in front first. This is not tidiness: Word lays out
+# only the focused window, and when several documents are open the add-in stacks them and drives the
+# geometry from the active one. Resizing a window behind the stack is not something a user can do,
+# and measuring one is measuring a window Word has stopped maintaining.
+$target = [WordLayout]::GetForeground()
+if (-not ($frames -contains $target)) { $target = $frames[0] }
+[WordLayout]::Focus($target) | Out-Null
 Write-Note ("target frame 0x{0:X}  `"{1}`"  ({2} visible frame(s))" -f [int64]$target, [WordLayout]::TitleOf($target), $frames.Count)
 
 # ---- the measurement ---------------------------------------------------------------------------
@@ -218,6 +224,9 @@ Test-Layout 'Baseline'
 
 # ---- resize ----------------------------------------------------------------------------------
 
+# Focused again before each geometry step: Word only lays out the window that has focus, so a step
+# driven against a window that has lost it measures nothing.
+[WordLayout]::Focus($target) | Out-Null
 if ([WordLayout]::Maximized($target)) { [WordLayout]::Show($target, [WordLayout]::SW_RESTORE); Start-Sleep -Milliseconds 800 }
 
 foreach ($size in @(@(1000, 800), @(1360, 900), @(900, 700))) {
@@ -228,6 +237,7 @@ foreach ($size in @(@(1000, 800), @(1360, 900), @(900, 700))) {
 
 # ---- maximize / restore -------------------------------------------------------------------------
 
+[WordLayout]::Focus($target) | Out-Null
 [WordLayout]::Show($target, [WordLayout]::SW_MAXIMIZE)
 Start-Sleep -Milliseconds 1200
 Test-Layout 'Maximized'
@@ -246,10 +256,13 @@ Test-Layout 'Restored'
 $logFile = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
 function Get-StripLineCount {
     if (-not (Test-Path $logFile)) { return 0 }
-    # Only our own lines. frames.cpp also writes a dozen lines per drag, but those are the previous
-    # slice's timing report, buffered in memory and flushed once at WM_EXITSIZEMOVE - deliberately
-    # not a per-frame cost, and not what this is watching for.
-    return @(Get-Content $logFile | Where-Object { $_ -match '\bstrip\s+hwnd=' }).Count
+    # Only this window's own lines. frames.cpp also writes a dozen lines per drag, but those are the
+    # previous slice's timing report, buffered in memory and flushed once at WM_EXITSIZEMOVE -
+    # deliberately not a per-frame cost, and not what this is watching for. And every other window
+    # in the stack keeps its own log, so counting all of them would just measure how many documents
+    # happen to be open.
+    $mine = 'hwnd=0x{0:X16}' -f [int64]$target
+    return @(Get-Content $logFile | Where-Object { $_ -match '\bstrip\s+hwnd=' -and $_ -match $mine }).Count
 }
 $linesBefore = Get-StripLineCount
 
