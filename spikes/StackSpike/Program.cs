@@ -44,6 +44,7 @@ namespace StackSpike
             public RECT StripAt;
             public bool StripPlaced;
             public bool OnTaskbar = true;  // Word gives every window a button to start with
+            public bool HiddenByUs;        // parked out of sight for the duration of a drag
         }
 
         static readonly List<WordWin> _wins = new List<WordWin>();
@@ -55,8 +56,12 @@ namespace StackSpike
         static bool _hasMaster;
 
         static uint _wordPid, _mainTid;
-        static IntPtr _hook, _inst;
+        static IntPtr _hook, _moveHook, _inst;
         static int _tick;
+
+        // True while the user is inside Word's modal move/size loop.
+        static bool _inMoveSize;
+        static int _moveSizeTick;
 
         // Delegates handed to unmanaged code must outlive the call — keep them rooted.
         static WndProcDelegate _wndProc;
@@ -109,6 +114,15 @@ namespace StackSpike
                 Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS);
             Log(_hook == IntPtr.Zero ? "WARN: WinEvent hook failed; relying on the poll timer"
                                      : "WinEvent hook installed");
+
+            // Separate range: the move/size events sit far below the object events, and one
+            // hook covering both would also deliver every event in between.
+            _moveHook = Native.SetWinEventHook(
+                Native.EVENT_SYSTEM_MOVESIZESTART, Native.EVENT_SYSTEM_MOVESIZEEND,
+                IntPtr.Zero, _winEventProc, _wordPid, 0,
+                Native.WINEVENT_OUTOFCONTEXT | Native.WINEVENT_SKIPOWNPROCESS);
+            if (_moveHook == IntPtr.Zero)
+                Log("WARN: move/size hook failed; dragging will glitch");
 
             _timerProc = OnTimer;
             Native.SetTimer(IntPtr.Zero, UIntPtr.Zero, POLL_MS, _timerProc);
@@ -184,7 +198,12 @@ namespace StackSpike
                 // Word keeps a permanent hidden background OpusApp with a full _Ww* tree,
                 // and minimized windows park off-screen near -32000 (scaled by DPI, so
                 // -21333 at 150%) at a stub size. Neither is something we can lay out into.
-                if (Native.IsWindowVisible(h) && !Native.IsCloaked(h) && !Native.IsIconic(h)
+                // A window we hid ourselves for a drag is still part of the stack — without
+                // this it would look closed, lose its strip, and never come back.
+                bool visible = Native.IsWindowVisible(h)
+                               || _wins.Exists(x => x.Opus == h && x.HiddenByUs);
+
+                if (visible && !Native.IsCloaked(h) && !Native.IsIconic(h)
                     && wwf != IntPtr.Zero
                     && (r.right - r.left) >= 200 && (r.bottom - r.top) >= 200)
                 {
@@ -561,7 +580,17 @@ namespace StackSpike
 
         static void OnTimer(IntPtr h, uint m, UIntPtr id, uint t)
         {
-            if (++_tick % RESCAN_EVERY == 0) { Rescan(); SyncTaskbar(); }
+            _tick++;
+
+            // Watchdog: if MOVESIZEEND never arrives (the drag was interrupted, the hook
+            // dropped an event), the followers would stay hidden forever. Roughly 15s.
+            if (_inMoveSize && _tick - _moveSizeTick > 500)
+            {
+                Log("WARN: move/size never ended — restoring followers anyway");
+                EndMoveSize();
+            }
+
+            if (_tick % RESCAN_EVERY == 0) { Rescan(); SyncTaskbar(); }
             SyncAll();
         }
 
@@ -572,7 +601,56 @@ namespace StackSpike
             if (idObject != Native.OBJID_WINDOW) return;
             bool ours = _wins.Exists(w => w.Opus == hWnd || w.Wwf == hWnd);
             if (!ours) return;
+
+            if (ev == Native.EVENT_SYSTEM_MOVESIZESTART) { BeginMoveSize(); return; }
+            if (ev == Native.EVENT_SYSTEM_MOVESIZEEND) { EndMoveSize(); return; }
+
             SyncAll();
+        }
+
+        /// <summary>
+        /// Dragging a stack is where out-of-process shows its seams. Word moves the dragged
+        /// window smoothly inside a modal loop; we only get to reposition the others once per
+        /// 30ms poll, so they visibly lag behind and peek out from under the one being dragged.
+        ///
+        /// There is no way to win that race from another process — an in-process add-in would
+        /// handle WM_WINDOWPOSCHANGING and move all of them in the same frame. So instead of
+        /// showing a bad approximation, hide the followers for the duration of the drag and put
+        /// them back in place when it ends.
+        /// </summary>
+        static void BeginMoveSize()
+        {
+            if (_inMoveSize) return;
+            _inMoveSize = true;
+            _moveSizeTick = _tick;
+
+            var active = _wins[Math.Min(_activeIdx, _wins.Count - 1)];
+            foreach (var w in _wins)
+            {
+                if (w == active || w.HiddenByUs || !Native.IsWindow(w.Opus)) continue;
+                Native.ShowWindow(w.Opus, Native.SW_HIDE);
+                w.HiddenByUs = true;
+            }
+            Log("move/size started — followers hidden");
+        }
+
+        static void EndMoveSize()
+        {
+            if (!_inMoveSize) return;
+            _inMoveSize = false;
+
+            // Put them where the drag ended *before* revealing them, or they flash at the old
+            // position for a frame.
+            SyncAll();
+
+            foreach (var w in _wins)
+            {
+                if (!w.HiddenByUs || !Native.IsWindow(w.Opus)) continue;
+                Native.ShowWindow(w.Opus, Native.SW_SHOWNA);
+                w.HiddenByUs = false;
+            }
+            SyncAll();
+            Log("move/size ended — followers restored");
         }
 
         static void SyncAll()
@@ -624,7 +702,8 @@ namespace StackSpike
 
             if (!_hasMaster || !Same(cur, _master))
             {
-                if (_hasMaster)
+                // Not during a drag: that fires every poll and buries the log in noise.
+                if (_hasMaster && !_inMoveSize)
                     Log(string.Format("master rect -> ({0},{1} {2}x{3}) from \"{4}\"",
                                       cur.left, cur.top, cur.right - cur.left, cur.bottom - cur.top,
                                       active.Title));
@@ -634,6 +713,10 @@ namespace StackSpike
 
             int mw = _master.right - _master.left, mh = _master.bottom - _master.top;
             if (mw < 1 || mh < 1) return;
+
+            // Mid-drag the followers are hidden; moving them every poll is what caused the
+            // glitching in the first place. They get placed once, when the drag ends.
+            if (_inMoveSize) return;
 
             foreach (var w in _wins)
             {
@@ -798,7 +881,17 @@ namespace StackSpike
             Log("restoring every window...");
 
             if (_hook != IntPtr.Zero) Native.UnhookWinEvent(_hook);
+            if (_moveHook != IntPtr.Zero) Native.UnhookWinEvent(_moveHook);
             RestoreTaskbar();
+
+            // Anything we hid for a drag must come back, or the user is left with documents
+            // they cannot reach by any means.
+            foreach (var w in _wins)
+            {
+                if (!w.HiddenByUs || !Native.IsWindow(w.Opus)) continue;
+                Native.ShowWindow(w.Opus, Native.SW_SHOWNA);
+                w.HiddenByUs = false;
+            }
 
             foreach (var w in _wins)
             {

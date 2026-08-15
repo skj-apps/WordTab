@@ -77,6 +77,55 @@ minimized rather than closed — without that it would be unreachable.
 taskbar; all three windows still appear in the Alt+Tab list. Suppressing those means
 `WS_EX_TOOLWINDOW` or DWM cloaking, neither of which was tried here.
 
+## Dragging: where out-of-process shows its seams
+
+Reported by hand, and it was real: dragging the window "really glitches out".
+
+Word moves the dragged window smoothly inside a modal move/size loop. We only get to
+reposition the other windows once per 30ms poll, so they lag behind and visibly peek
+out from under the one being dragged. There is no way to win that race from another
+process — an in-process add-in would handle `WM_WINDOWPOSCHANGING` and move every window
+in the same frame.
+
+So rather than show a bad approximation, the followers are **hidden for the duration of
+the drag** and put back when it ends. The modal loop is detectable from outside via a
+second `SetWinEventHook` on `EVENT_SYSTEM_MOVESIZESTART`..`EVENT_SYSTEM_MOVESIZEEND` —
+a separate range from the object events, because one hook spanning both would deliver
+everything in between.
+
+```
+switch -> [0] "Document12"  foreground=True
+move/size started — followers hidden
+move/size ended — followers restored
+```
+
+After the drag, all four windows measured at the same rect with strips in place. The
+`master rect ->` spam that used to fill the log during a drag is gone, because the
+followers are no longer shoved 30 times a second.
+
+Three details this needs to be safe, all of which bit during development:
+
+- `Rescan` must treat a window we hid as still part of the stack, or it looks closed,
+  loses its strip, and never comes back.
+- A watchdog forces the followers back after ~15s if `MOVESIZEEND` never arrives.
+- Cleanup un-hides unconditionally. Leaving a document hidden makes it unreachable by
+  any means the user has.
+
+**This is the clearest argument yet for going in-process.** The geometry, the stacking
+and the taskbar all work from outside; smooth dragging is the first thing that does not,
+and hiding the followers is a workaround, not a fix.
+
+## A note on Word's Start screen
+
+Windows opened by launching `WINWORD.EXE` with no document sit on Word's Start screen
+("Good evening / New"). They join the stack and get a tab like any other window, but
+they have no document and therefore no Back button, so switching to one looks like the
+app "went back to start" and the only way out is to create a document — which opens
+*another* window, which also joins the stack.
+
+That is Word behaving normally, not a stacking defect, but a real product would want a
+policy for Start-screen windows rather than tabbing them like documents.
+
 ## The finding that actually matters
 
 **Word only lays out a window's interior while that window has focus.**

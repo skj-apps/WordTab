@@ -100,6 +100,8 @@ namespace StackSpike
         /// <summary>Posted to the main thread by the console reader: wParam = tab index.</summary>
         public const uint WM_SWITCH = WM_APP + 1;
 
+        public const uint EVENT_SYSTEM_MOVESIZESTART = 0x000A;
+        public const uint EVENT_SYSTEM_MOVESIZEEND = 0x000B;
         public const uint EVENT_OBJECT_SHOW = 0x8002;
         public const uint EVENT_OBJECT_LOCATIONCHANGE = 0x800B;
         public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
@@ -167,6 +169,12 @@ namespace StackSpike
 
         [DllImport("user32.dll")]
         public static extern bool BringWindowToTop(IntPtr hWnd);
+
+        public const int SW_HIDE = 0;
+        public const int SW_SHOWNA = 8;   // show without activating or changing z-order
+
+        [DllImport("user32.dll")]
+        public static extern bool ShowWindow(IntPtr hWnd, int cmd);
 
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
