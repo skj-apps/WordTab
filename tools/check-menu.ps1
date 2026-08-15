@@ -107,7 +107,55 @@ function Get-Parts($frame) {
     }
 }
 
+# Make sure Word is the foreground application before a reading, and say so if it will not be.
+#
+# The same hardening check-stack.ps1 and check-reorder.ps1 already carry, and this suite needed it
+# too: run from a terminal that holds the desktop, the reading of the tab row here came back naming
+# "Terminal" as one of the documents, and every menu assertion after it failed. SetForegroundWindow
+# is refused from a process that is not already foreground, so a click can switch the document
+# *inside* Word without Word coming forward, and GetForegroundWindow then answers with the other
+# application. Focus() does the AttachThreadInput handshake, which is how a process that is not
+# foreground asks for it.
+#
+# Never while a menu is up: taking the foreground would dismiss the very thing being measured.
+function Set-WordForeground($seconds = 4) {
+    if ((Get-MenuWindow) -ne [IntPtr]::Zero) { return [WordLayout]::GetForeground() }
+
+    $frames = @(Get-Frames)
+    if ($frames.Count -eq 0) { return [IntPtr]::Zero }
+
+    for ($round = 1; $round -le 3; $round++) {
+        $now = [WordLayout]::GetForeground()
+        if ($frames -contains $now) { return $now }
+
+        Write-Note ("the foreground was `"{0}`" - taking it back" -f [WordLayout]::TitleOf($now))
+        [WordLayout]::Focus($frames[0]) | Out-Null
+        $deadline = (Get-Date).AddSeconds($seconds)
+        while ((Get-Date) -lt $deadline) {
+            $now = [WordLayout]::GetForeground()
+            if (@(Get-Frames) -contains $now) { return $now }
+            Start-Sleep -Milliseconds 250
+        }
+
+        # It would not give the foreground up. Last resort, and a deliberate one: this suite drives
+        # real mouse and keyboard input at screen coordinates, so a window sitting over Word does not
+        # merely steal the keystrokes - it *receives the clicks*, and every assertion after that is
+        # measuring the wrong application. Measured: run from a terminal that covers Word, the tab
+        # row read back "Terminal" as one of the documents. Minimising it is recoverable from the
+        # taskbar and is far better than a green run that measured nothing.
+        $now = [WordLayout]::GetForeground()
+        if ($now -ne [IntPtr]::Zero -and -not (@(Get-Frames) -contains $now)) {
+            Write-Note ("minimising `"{0}`" - it is sitting over Word and taking the input meant for it" -f `
+                        [WordLayout]::TitleOf($now))
+            [WordLayout]::Show($now, 6)      # SW_MINIMIZE
+            Start-Sleep -Milliseconds 800
+        }
+    }
+    return [WordLayout]::GetForeground()
+}
+
 function Get-TopStrip {
+    Set-WordForeground | Out-Null
     $frames = @(Get-Frames)
     if ($frames.Count -eq 0) { throw 'No Word windows.' }
     $top = [WordLayout]::GetForeground()
@@ -238,33 +286,151 @@ function Wait-Frames($expected, $seconds = 25) {
     return $false
 }
 
-# Put the caret in the document and type, so the document is genuinely modified. A keystroke sent to
-# a window that was activated programmatically goes nowhere in Word - one real click into the page
-# fixes it, which is why this clicks first.
+# Put the caret in the document and type, so the document behind tab $index is genuinely modified -
+# and *prove* it before returning.
+#
+# A keystroke sent to a window that was only activated programmatically goes nowhere in Word, which
+# is why this clicks into the page first. Two further things make this the most fragile step in the
+# suite, and both fail silently.
+#
+# Clicking a tab ends in SetForegroundWindow inside Word, and Windows refuses that call from a
+# process that is not already the foreground application - so the document can switch without Word
+# coming forward, and the keystroke then goes to whatever does own the desktop. That is not
+# hypothetical: run from a terminal, this suite typed into the terminal and reported "Save wrote the
+# document to disk" as a failure, twice, with the add-in behaving perfectly and its own log saying
+# so ("Document.Save returned (Word confirmed the window handle)"). A Save on an *unmodified*
+# document correctly writes nothing, so a missed keystroke is indistinguishable from a broken Save.
+#
+# So the keystrokes are checked by photographing the page before and after. A threshold rather than
+# "any pixel changed", because the caret blinks: a caret is a couple of pixels wide and several
+# characters are not, and the two are hundreds of sampled pixels apart.
 function Set-Dirty($index) {
-    $spot = Get-Spot 'label' $index
-    [WordLayout]::Click($spot.X, $spot.Y)
-    Start-Sleep -Milliseconds 900
+    for ($try = 1; $try -le 6; $try++) {
+        Set-WordForeground | Out-Null
+        $spot = Get-Spot 'label' $index
+        [WordLayout]::Click($spot.X, $spot.Y)
+        Start-Sleep -Milliseconds 900
 
-    $top = Get-TopStrip
-    $strip = [WordLayout]::RectOf($top.Strip.Hwnd)
-    $x = $strip.Left + [int](($strip.Right - $strip.Left) / 3)
-    $y = $strip.Bottom + 300
-    [WordLayout]::Click($x, $y)
-    Start-Sleep -Milliseconds 500
-    [WordLayout]::Press($VK.X)
-    Start-Sleep -Milliseconds 500
+        $top = Get-TopStrip
+        if (-not $top.Wwf) { throw 'The foreground Word window has no document frame to type into.' }
+
+        # Aimed at the document frame itself, never at a fixed offset from the strip. Word remembers
+        # its window size between sessions, and this suite has seen it come back small enough that
+        # "the strip's bottom plus 300 pixels" landed on the *desktop* - measured, the click reported
+        # SysListView32 under it and the foreground as "Program Manager". Nothing was typed, the
+        # document was never modified, and the assertion that failed was "Save wrote the document to
+        # disk", which is three steps away from the actual cause.
+        $view = [WordLayout]::RectOf($top.Wwf.Hwnd)
+        $vw = $view.Right - $view.Left
+        $vh = $view.Bottom - $view.Top
+        if ($vw -lt 200 -or $vh -lt 200) { throw "The document frame is only ${vw}x${vh} - too small to type into." }
+
+        $x = $view.Left + [int]($vw / 3)
+        $y = $view.Top  + [int]($vh / 2)
+
+        # Two bands, both sized from the view so they stay inside it whatever the window size: where
+        # the characters will appear, and a control band below them that five characters cannot
+        # reach. The control is not fastidiousness - it is what stops this check passing for the
+        # wrong reason. If another window covers Word between the two photographs, *every* sampled
+        # pixel differs in both bands, which reads as a huge successful edit. Measured: exactly that,
+        # 15000 of 15000 samples, on a contended desktop.
+        $bandH = [Math]::Min(100, [int]($vh / 6))
+        $bandW = [Math]::Min(600, [int]($vw / 2))
+
+        $page = New-Object WordLayout+RECT
+        $page.Left   = $x - 40
+        $page.Top    = $y - $bandH
+        $page.Right  = $x + $bandW
+        $page.Bottom = $y + $bandH
+
+        $control = New-Object WordLayout+RECT
+        $control.Left   = $page.Left
+        $control.Top    = $page.Bottom + $bandH
+        $control.Right  = $page.Right
+        $control.Bottom = $control.Top + $bandH
+
+        $shot = New-Object WordLayout+RECT
+        $shot.Left = $page.Left; $shot.Top = $page.Top
+        $shot.Right = $page.Right; $shot.Bottom = $control.Bottom
+
+        # The photograph is taken *before* the click, so that the gap between the click into the page
+        # and the keystrokes is as short as it can be. That gap is the whole risk: a real click makes
+        # Word foreground by user input, which Windows honours - and anything that takes the desktop
+        # back before the keys are injected swallows them. Half a second of waiting in here was
+        # measured losing them about half the time.
+        $before = Get-RectShot $shot
+
+        # Deliberately no Focus() here. The click into the page is what makes Word foreground, and it
+        # does it as *user input*, which Windows honours unconditionally; calling Focus() in between
+        # was measured to leave the window activated but the caret unplaced, so the characters went
+        # nowhere and only the click's own repaint showed up in the photograph.
+        [WordLayout]::Click($x, $y)
+        Start-Sleep -Milliseconds 600      # Word needs this to place the caret before it will take keys
+        for ($k = 0; $k -lt 5; $k++) { [WordLayout]::Press($VK.X) }
+        Start-Sleep -Milliseconds 700
+        $after = Get-RectShot $shot
+
+        $changed = Measure-Changed $before.Bitmap $after.Bitmap $before.Origin $page $null
+        $moved   = Measure-Changed $before.Bitmap $after.Bitmap $before.Origin $control $null
+        $before.Bitmap.Dispose(); $after.Bitmap.Dispose()
+
+        # An edit is *localised*: five characters reflow one line inside a band a hundred pixels tall
+        # and six hundred wide, which is a few percent of the samples. A change that fills the band -
+        # or that reaches the control band below it - is a different window being photographed, not
+        # text being typed. Both bounds are load-bearing; without the upper one this check reported a
+        # fully occluded window as a large successful edit.
+        $samples = [int](($page.Right - $page.Left) / 2) * [int](($page.Bottom - $page.Top) / 2)
+        $localised = ($changed -ge 100) -and ($changed -le [int]($samples / 2)) -and ($moved -lt 100)
+
+        if ($localised) {
+            Write-Note "the document was modified ($changed of $samples samples on the line, $moved below it)"
+            return [WordLayout]::GetForeground()
+        }
+
+        $covered = ($moved -ge 100) -or ($changed -gt [int]($samples / 2))
+        $why = if ($covered) {
+            "the whole view changed ($changed of $samples on the line, $moved on the control band) - something covered Word, not a keystroke"
+        } else {
+            "the keystrokes did not reach the document ($changed of $samples samples changed)"
+        }
+        $front = [WordLayout]::GetForeground()
+        Write-Note ("attempt {0}: {1}. Foreground is `"{2}`"" -f $try, $why, [WordLayout]::TitleOf($front))
+
+        # Something is *over* Word rather than merely in front of it in the input queue - an
+        # always-on-top window survives the foreground handshake, which is why Set-WordForeground
+        # cannot see this: it asks GetForegroundWindow, gets a Word frame, and returns happy while
+        # the clicks and keystrokes still land on the window on top. Photographing the page is what
+        # catches it, so this is the right place to get the offender out of the way. Gated on a
+        # proven failure and recoverable from the taskbar.
+        if ($covered) {
+            $front = [WordLayout]::GetForeground()
+            # Never the shell. `Progman` and `WorkerW` are the desktop itself, and minimising the
+            # desktop is "Show Desktop" - it would take Word down with everything else, turning a
+            # recoverable obstruction into a run that cannot continue at all.
+            $cls = if ($front -ne [IntPtr]::Zero) { [WordLayout]::ClassOf($front) } else { '' }
+            if ($front -ne [IntPtr]::Zero -and -not (@(Get-Frames) -contains $front) -and
+                $cls -notin @('Progman', 'WorkerW') -and [WordLayout]::TitleOf($front) -ne '') {
+                Write-Note ("minimising `"{0}`" ({1}) - it is sitting over Word and taking the input meant for it" -f `
+                            [WordLayout]::TitleOf($front), $cls)
+                [WordLayout]::Show($front, 6)      # SW_MINIMIZE
+                Start-Sleep -Milliseconds 900
+            }
+        }
+    }
+
+    Write-Note 'WARNING: could not modify the document - the assertions that need a dirty document will fail'
     return [WordLayout]::GetForeground()
 }
 
-function Get-StripShot($strip) {
-    $r = [WordLayout]::RectOf($strip)
+function Get-RectShot($r) {
     $bmp = New-Object System.Drawing.Bitmap(($r.Right - $r.Left), ($r.Bottom - $r.Top))
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($r.Left, $r.Top, 0, 0, $bmp.Size)
     $g.Dispose()
     return [pscustomobject]@{ Bitmap = $bmp; Origin = $r }
 }
+
+function Get-StripShot($strip) { return Get-RectShot ([WordLayout]::RectOf($strip)) }
 
 # How many sampled pixels differ between two shots inside a rectangle, ignoring anything inside
 # `exclude`. The exclusion is not fastidiousness: an open menu overlaps the bottom of the strip it
@@ -443,7 +609,20 @@ Start-Sleep -Milliseconds 500
 
 $menu = Open-TabMenu 'label' 0
 if ($menu.Window -ne [IntPtr]::Zero) {
-    [WordLayout]::Press($VK.S)
+    # Clicked rather than typed, like the Close test below. A popup menu is a topmost window, so a
+    # click at its item's rectangle lands on it whatever else owns the desktop; an injected access
+    # key only lands if the menu has the keyboard at that instant, and this is the assertion that
+    # suffers most when it does not - a Save that was never invoked and a Save that ran on an
+    # unmodified document both leave the file's timestamp exactly where it was.
+    $save = @($menu.Items | Where-Object { $_.Text -eq '&Save' })
+    if ($save.Count -gt 0 -and $save[0].HasRect) {
+        $centre = [WordLayout]::Center($save[0].Rect)
+        Write-Note ("clicking the Save item at {0}" -f (Format-Rect $save[0].Rect))
+        [WordLayout]::Click($centre.X, $centre.Y)
+    } else {
+        Write-Note 'the Save item has no rectangle to click - using its access key instead'
+        [WordLayout]::Press($VK.S)
+    }
     Wait-Menu $false | Out-Null
 } else {
     Assert $false 'the menu opened on tab 0'

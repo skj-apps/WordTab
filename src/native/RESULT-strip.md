@@ -136,5 +136,8 @@ is a band with the document's name in it. Resize, maximize, open File and come b
 - **Nothing is clickable.** The strip returns `HTTRANSPARENT`.
 - **Start-screen windows** (Word launched with no document) have no `_WwF` and so get no strip.
   Correct for now, but the product still needs a policy for them.
+  > **Correction, 2026-08-15.** False, and never measured. A Start-screen window *does* have a
+  > `_WwF` — empty — and so did get a strip, and a tab labelled "Word". It now gets a strip with an
+  > empty row and only the `+` on it, and the policy exists. See `RESULT-startscreen.md`.
 - **Office Tab coexistence** and **a DPI change** are both reasoned about in code and untested.
 - Still untested on the work rig.

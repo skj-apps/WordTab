@@ -8,9 +8,9 @@
 
     - Backstage opened while several windows are stacked. Each was tested alone; together, Word
       covers the active window's whole client area while N-1 other windows sit behind it.
-    - Word's Start screen: launching WINWORD with no document gives a window with no `_WwF`, which
-      is deliberately excluded from the stack. It should not join, and it should not disturb what is
-      already stacked.
+    - A window launched with no document arriving on an established stack. It should not disturb
+      what is already stacked. (The document-less states themselves - Word's Start screen, and the
+      empty frame left when the last document is closed - are `check-startscreen.ps1`.)
     - Maximise as a *state* rather than a rectangle. Spike 2 could only copy rectangles, which left
       stacked windows looking maximized without being maximized; every window should now actually be
       maximized.
@@ -180,14 +180,18 @@ if ($opened) {
 
 # ---- Word's Start screen -------------------------------------------------------------------------
 #
-# Launching WINWORD with no document gives a window with no `_WwF`. It is deliberately excluded from
-# the stack - it has no document to be a tab for - so what matters is that it neither joins nor
-# disturbs what is already stacked.
-
-# On this rig Word is configured to open a blank document rather than show the Start screen, so what
-# this actually exercises is a *new* document arriving on an established stack - still worth having,
-# but it is not the Start-screen case. That one needs the "show the Start screen" option turned back
-# on, and remains untested.
+# A window with no document is deliberately excluded from the stack - it has no document to be a tab
+# for - so what matters here is that it neither joins nor disturbs what is already stacked.
+#
+# **The old note here said such a window "has no `_WwF`". That is false**, and believing it is what
+# gave a document-less Word window a tab labelled "Word" for four slices. `_WwF` is the document
+# *frame* and Word keeps it, empty, after the last document closes. The membership test looks inside
+# it now - see StripHasDocument in src\native\strip.cpp and RESULT-startscreen.md.
+#
+# What this block actually exercises, on this rig, is a *new document* arriving on an established
+# stack: launching WINWORD with no arguments while a document is already open makes Word create a
+# blank document with its Start screen drawn over it. Worth having, and it is not the Start-screen
+# case. The document-less states are covered properly by tools\check-startscreen.ps1.
 Write-Step "A window launched with no document"
 $before = @(Get-Frames)
 Start-Process -FilePath 'winword.exe'

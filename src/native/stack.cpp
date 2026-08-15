@@ -26,7 +26,14 @@
 // Membership rules, which are subtler than they look. Frame lifetime is not document lifetime:
 // closing one of two documents was measured to hide one frame and destroy a *different* one, and
 // Word creates frames it never shows. So a window is in the stack while it is visible and has a
-// `_WwF`, and it leaves when either stops being true - never keyed on creation and destruction.
+// document open in it, and it leaves when either stops being true - never keyed on creation and
+// destruction.
+//
+// And the *document frame*'s lifetime is not the document's either, which cost this file four
+// slices of being quietly wrong. `_WwF` is where a document goes, and Word keeps it standing and
+// empty after the last document in that window closes - so "has a `_WwF`" was answering TRUE for a
+// window with nothing in it, which then joined the stack and was given a tab labelled "Word". The
+// test is StripHasDocument, and it looks *inside* the document frame. See RESULT-startscreen.md.
 
 #include "wordtab.h"
 #include <string.h>
@@ -92,18 +99,25 @@ static int JoinedCount(void)
 // Joining and staying are different tests, and the difference is minimising.
 //
 // To *join*, a window has to be one we can measure and place: on screen, not minimised, a sensible
-// size, and carrying a document frame. A Start-screen window - Word launched with no document -
-// has no `_WwF` and is deliberately left out: it has no document to be a tab for.
+// size, and with a document open in it. A window with no document is deliberately left out - Word's
+// Start screen, and the empty frame Word leaves behind when you close its last document - because
+// it has no document to be a tab for. It keeps its own taskbar button and Alt+Tab entry, the stack
+// never moves it, and it joins the row by itself the moment a document appears in it.
+//
+// That was always the intent; until this slice it was not the behaviour, because the test asked
+// whether the window had a `_WwF` and Word keeps the document frame after the document has gone.
+// See StripHasDocument in strip.cpp for what is actually measured.
 //
 // To *stay*, all that is required is that it still exists and still has a document. A minimised
 // window is still a document and still deserves its tab; more to the point, when the whole stack
 // goes down to the taskbar together, dropping every window out of the stack would leave nothing to
-// bring back and the only window with a taskbar button would come back alone.
+// bring back and the only window with a taskbar button would come back alone. (Measured: a
+// minimised document keeps `_WwB` inside its `_WwF`, so it still passes the document test.)
 static BOOL EligibleToStay(HWND frame)
 {
     if (!frame || !IsWindow(frame) || !IsWindowVisible(frame))
         return FALSE;
-    return StripHasDocumentFrame(frame);
+    return StripHasDocument(frame);
 }
 
 static BOOL EligibleToJoin(HWND frame)
@@ -172,6 +186,23 @@ static void MatchTo(HWND master, HWND frame)
     // state alone leaves them looking like two windows; copying the rect alone leaves a window that
     // looks maximized without being maximized, which is what spike 2 could not fix.
     SetZoomState(frame, IsZoomed(master) ? TRUE : FALSE);
+
+    // A minimised master has no rectangle worth copying. Windows parks a minimised window off-screen
+    // near -32000, so copying it would put the joining window - which is the one the user is looking
+    // at, since a document just appeared in it - somewhere they cannot see or reach, and Present()
+    // would then move the taskbar button onto it. StackOnFramePosChanging already refuses this exact
+    // rectangle for the same reason; this is the other half of that guard.
+    //
+    // Left where Word put it instead. That is not a complete answer to "a document arrived while the
+    // stack was down" - it is the answer to "never make a window unreachable", which is the rule that
+    // may not be broken while the better answer is worked out.
+    if (IsIconic(master))
+    {
+        g_inSync = FALSE;
+        LogWrite(L"stack  hwnd=0x%p  joined while the stack is minimised - left where it is, "
+                 L"not snapped to an off-screen rectangle", (void*)frame);
+        return;
+    }
 
     RECT rect;
     if (GetWindowRect(master, &rect))
@@ -656,13 +687,23 @@ void StackJanitor(void)
         }
         else if (!EligibleToStay(member->frame))
         {
-            // Left where it is, deliberately. Word hides and re-shows frames of its own accord -
-            // closing one document was measured to hide a *different* window for a moment - and
-            // moving a window back to its old position every time it blinks makes documents jump
-            // around the screen for no reason the user can see. It is hidden; nobody is looking at
-            // it; and when it comes back the join snaps it to the stack again. Only StackStop puts
-            // windows back where they came from.
-            Leave(member, IsWindow(member->frame) ? L"hidden or minimised" : L"gone", FALSE);
+            // Left where it is, deliberately, and for two different reasons now.
+            //
+            // Hidden: Word hides and re-shows frames of its own accord - closing one document was
+            // measured to hide a *different* window for a moment - and moving a window back to its
+            // old position every time it blinks makes documents jump around the screen for no
+            // reason the user can see. Nobody is looking at it, and when it comes back the join
+            // snaps it to the stack again.
+            //
+            // No document: the user *is* looking at this one, which makes moving it worse rather
+            // than better - they closed a document, not a window. It keeps its place, its taskbar
+            // button and its Alt+Tab entry, and its strip is left showing an empty row and a +.
+            //
+            // Only StackStop puts windows back where they came from.
+            const wchar_t* why = L"gone";
+            if (IsWindow(member->frame))
+                why = IsWindowVisible(member->frame) ? L"no document open" : L"hidden or minimised";
+            Leave(member, why, FALSE);
         }
     }
 
@@ -787,6 +828,17 @@ int StackTabs(HWND frame, HWND* out, int max, int* activeIndex)
 {
     if (activeIndex)
         *activeIndex = 0;
+
+    // No document, no tab. Word leaves the frame alive and on screen after its last document is
+    // closed, and that window is a real thing the user is looking at - but there is nothing for a
+    // tab to name, select or close. The row is drawn empty and only the + is left, which is both an
+    // honest statement that nothing is open and the one button that is still worth pressing:
+    // measured, Word puts the new document into this very window rather than opening another.
+    //
+    // Ahead of the stacking test on purpose. This is a fact about the document, not about the
+    // stack, so it holds with `Stack` switched off too.
+    if (!StripHasDocument(frame))
+        return 0;
 
     // Stacking off, or this window is not in a stack: it is its own single tab. The strip then
     // still shows the document's name, which is the previous slice's behaviour.
@@ -934,6 +986,20 @@ void StackCloseTab(HWND frame)
 {
     if (!frame || !IsWindow(frame))
         return;
+
+    // A close aimed at a tab that no longer exists. Commands are posted, not run where they are
+    // raised - the tab menu's TrackPopupMenu is a modal loop and the janitor keeps ticking inside it
+    // - so a window can lose its last document between the click and the command arriving. IsWindow
+    // is not enough to catch that, because Word leaves the window standing when its document closes.
+    //
+    // Closing it anyway would shut Word down over a tab that had already gone. They closed a
+    // document, not a window.
+    if (!StripHasDocument(frame))
+    {
+        LogWrite(L"stack  hwnd=0x%p  close dropped - that window has no document open any more",
+                 (void*)frame);
+        return;
+    }
 
     Member* member = Find(frame);
     if (!member || !member->joined)
@@ -1183,6 +1249,9 @@ void StackCloseAll(HWND anyTab)
     {
         // No stack to enumerate - stacking switched off, or a window that never joined. Its strip
         // shows exactly one tab, so "close all" means that one document and there is no batch.
+        // Or it shows none, because the window has no document left: StackCloseTab drops the
+        // command in that case rather than closing the window, and this is the route a stale menu
+        // command takes to get there.
         LogWrite(L"stack  hwnd=0x%p  close all: not in a stack, so this is its one document",
                  (void*)anyTab);
         StackCloseTab(anyTab);

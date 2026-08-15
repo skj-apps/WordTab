@@ -981,7 +981,19 @@ static void DrawStrip(StripState* state, HDC dc, const RECT* client)
 
     if (layout.hasPlus)
     {
+        // Checked against where the button actually is, not just against the flag. The hot flag is
+        // written on mouse movement, but the plus *moves* when the number of tabs changes - and the
+        // number of tabs changes with the pointer sitting perfectly still, every time a document
+        // opens or closes. Emptying the row moves it a whole tab width to the left edge, and without
+        // this the strip would light a chip there under nothing at all. Same principle as the strip
+        // measuring where it really is rather than trusting where it last put itself.
         BOOL hotPlus  = (state->hotKind == HIT_PLUS);
+        if (hotPlus && state->strip && IsWindow(state->strip))
+        {
+            POINT cursor;
+            if (GetCursorPos(&cursor) && ScreenToClient(state->strip, &cursor))
+                hotPlus = PtInRect(&layout.plus, cursor) ? TRUE : FALSE;
+        }
         BOOL downPlus = (state->pressKind == HIT_PLUS);
         DrawChip(dc, &layout.plus, hotPlus, downPlus, state->dpi);
         DrawGlyphLines(dc, &layout.plus, hotPlus || downPlus ? g_glyphHotColor : g_glyphColor,
@@ -1228,8 +1240,18 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
 
     StripLayout layout;
     ComputeLayout(state, &client, count, &layout);
+
+    // The row this gesture is happening *in* can empty underneath it. The drag state is global and
+    // the strip holding the capture is usually not the strip on screen, so `g_dragFrame` above can
+    // still be a perfectly good tab in some other window's row while *this* window loses its last
+    // document. There is then nowhere to draw the carried tab and no row to drop it into, and simply
+    // returning would freeze the gesture: every strip would keep drawing the tab at the last position
+    // this function computed, and the release would commit it there.
     if (layout.count <= 0)
+    {
+        DragUndo(hwnd, L"the row it was being carried in has no documents left");
         return;
+    }
 
     // Where the tab is now: carried from the point inside it that was grabbed, so it does not jump
     // under the pointer when it is picked up, and never past either end of the row - there is
@@ -1723,15 +1745,31 @@ static void ApplyInitial(StripState* state)
 // stack has to take that window's interior and hand it to the others itself. See stack.cpp.
 // ---------------------------------------------------------------------------------------------
 
-BOOL StripHasDocumentFrame(HWND frame)
+// Is there a document open in this window?
+//
+// The obvious test - "does the frame have a `_WwF`" - is wrong, and was wrong here for four slices.
+// `_WwF` is the document *frame*, and Word keeps it for the life of the window: closing the last
+// document destroys the `_WwB` and `_WwG` inside it and leaves `_WwF` behind, empty. So a Word window
+// with nothing open passed that test, joined the stack, and was given a tab labelled "Word".
+//
+// Measured on 16.0.20228: `_WwF` holds `_WwB` -> `_WwG` in print layout, read mode, web layout,
+// draft and outline, with Backstage open, and while minimised - and holds nothing whatsoever when
+// there is no document. So the honest question is whether anything is *in* the document frame.
+//
+// `GetWindow(GW_CHILD)` rather than looking for `_WwB` by name, on two grounds: it is one call
+// instead of a recursive enumeration on a half-second timer, and "the document frame is empty" is a
+// weaker assumption about Word's internals than any particular class name inside it - a renamed
+// child would silently break the name test and cannot break this one.
+BOOL StripHasDocument(HWND frame)
 {
     StripState* state = FindByFrame(frame);
-    if (state && state->wwf && IsWindow(state->wwf))
-        return TRUE;
+    HWND wwf = (state && state->wwf && IsWindow(state->wwf))
+             ? state->wwf
+             // Not bound yet - the janitor may not have come round. Ask the window itself rather
+             // than reporting "no document" for what is really "not looked at yet".
+             : FindChildOfClass(frame, kWwfClass);
 
-    // Not bound yet - the janitor may not have come round. Ask the window itself rather than
-    // reporting "no document" for what is really "not looked at yet".
-    return FindChildOfClass(frame, kWwfClass) != NULL;
+    return (wwf != NULL) && (GetWindow(wwf, GW_CHILD) != NULL);
 }
 
 BOOL StripGetNatural(HWND frame, RECT* natural)

@@ -41,6 +41,10 @@ stack is, which tab is selected.
   minimised, and has a `_WwF`. Never keyed on window creation or destruction, because in Word those
   do not line up with documents - closing one of two documents was measured to hide one frame and
   destroy a *different* one. A Start-screen window has no `_WwF` and is deliberately left out.
+  > **Correction, 2026-08-15.** The last sentence is false and was never measured. `_WwF` is the
+  > document *frame* and Word keeps it, empty, after the last document closes — so a window with no
+  > document *did* pass this test, joined the stack, and was given a tab labelled "Word". The test
+  > now looks inside `_WwF`. See `RESULT-startscreen.md`.
 - **Joining** snaps the window to the active window's rectangle, and to its maximized-or-not
   *state* rather than just its rectangle. Spike 2 could copy rectangles only, which left a stacked
   window looking maximized without being maximized.

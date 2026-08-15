@@ -491,6 +491,27 @@ public static class WordLayout
 
     // A keystroke, for making a document dirty so the save prompt can be provoked on purpose.
     public static void Press(ushort vk) { Key(vk, false); Thread.Sleep(40); Key(vk, true); Thread.Sleep(60); }
+
+    // Ctrl+key. Needed for Ctrl+W - Word's *document* close, which is the only way to reach the
+    // state where a Word window is left on screen with no document in it. WM_CLOSE is not the same
+    // thing: it closes the window, and on the last window it closes Word.
+    public static void CtrlPress(ushort vk)
+    {
+        Key(0x11, false);                       // VK_CONTROL
+        Thread.Sleep(60);
+        Key(vk, false); Thread.Sleep(60); Key(vk, true);
+        Thread.Sleep(60);
+        Key(0x11, true);
+        Thread.Sleep(150);
+    }
+
+    // The first child of a window, or IntPtr.Zero if it has none. This is the add-in's own document
+    // test, mirrored: `_WwF` is Word's document *frame* and outlives the document, so "is there a
+    // document" is "is there anything inside the document frame" - see StripHasDocument in
+    // src\native\strip.cpp. EnumChildWindows would answer the same question far more expensively.
+    [DllImport("user32.dll", EntryPoint = "GetWindow")] static extern IntPtr GetWindowRel(IntPtr hwnd, uint cmd);
+    const uint GW_CHILD = 5;
+    public static IntPtr FirstChild(IntPtr hwnd) { return GetWindowRel(hwnd, GW_CHILD); }
     public static string ClassOf(IntPtr hwnd)
     {
         StringBuilder cls = new StringBuilder(96);

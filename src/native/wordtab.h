@@ -144,7 +144,11 @@ void StripStop(void);
 
 // What the stack needs from the strip. All of these exist because Word lays out only the focused
 // window: the stack has to take that window's document-frame rect and hand it to the others.
-BOOL StripHasDocumentFrame(HWND frame);
+
+// Is there a document open in this window? This is the membership test - a window with no document
+// is not a tab - and it is deliberately *not* the same question as "does it have a `_WwF`". Word
+// keeps the document frame for the life of the window and empties it when the last document closes.
+BOOL StripHasDocument(HWND frame);
 BOOL StripGetNatural(HWND frame, RECT* natural);
 void StripSetNatural(HWND frame, const RECT* natural);
 void StripRefit(HWND frame);
@@ -155,8 +159,9 @@ void WordTabFrameTitle(HWND frame, wchar_t* out, int chars);
 
 // ---------------------------------------------------------------------------------------------
 // The stack - several Word windows held at one rectangle so they read as one window with tabs.
-// See stack.cpp. Membership is decided by what is true now (visible, has a document frame), never
-// by window creation and destruction: frame lifetime is not document lifetime in Word.
+// See stack.cpp. Membership is decided by what is true now (visible, has a document open in it),
+// never by window creation and destruction: frame lifetime is not document lifetime in Word, and
+// neither is document-frame lifetime - `_WwF` outlives the document inside it.
 // ---------------------------------------------------------------------------------------------
 
 void StackStart(void);
