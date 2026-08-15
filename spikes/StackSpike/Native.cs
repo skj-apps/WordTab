@@ -55,6 +55,25 @@ namespace StackSpike
     internal delegate void WinEventProcDelegate(IntPtr hook, uint ev, IntPtr hWnd,
                                                 int idObject, int idChild, uint thread, uint time);
 
+    /// <summary>
+    /// The shell's taskbar list. `DeleteTab` is the documented way to take a window off the
+    /// taskbar without touching its styles, and it works cross-process — which matters here,
+    /// because the windows belong to WINWORD, not to us.
+    /// </summary>
+    [ComImport, Guid("56FDF342-FD6D-11d0-958A-006097C9A090"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface ITaskbarList
+    {
+        void HrInit();
+        void AddTab(IntPtr hWnd);
+        void DeleteTab(IntPtr hWnd);
+        void ActivateTab(IntPtr hWnd);
+        void SetActiveAlt(IntPtr hWnd);
+    }
+
+    [ComImport, Guid("56FDF344-FD6D-11d0-958A-006097C9A090"), ClassInterface(ClassInterfaceType.None)]
+    internal class TaskbarListClass { }
+
     internal static class Native
     {
         // ---- window styles / flags -------------------------------------------------

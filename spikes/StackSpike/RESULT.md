@@ -43,6 +43,40 @@ The tab bar renders in every window at the same place, so a switch looks like on
 strip staying put rather than three strips swapping. That is the Office Tab trick,
 reproduced.
 
+## Taskbar: three windows, one button
+
+`ITaskbarList::DeleteTab` on every window except the active one. It works cross-process,
+which matters because the windows belong to WINWORD and not to us, and it needs nothing
+but a `CoCreateInstance` — no styles are touched, so there is nothing to undo badly.
+`Main` is `[STAThread]` because the shell object is apartment-threaded.
+
+Verified by eye on the Windows 11 taskbar, which groups buttons per app and shows the
+difference as a stacked card. Before: the Word button drawn as two layered cards, the
+second card edge visible behind the first. With the spike running: a single flat icon
+with one dot, indistinguishable from the single-window apps either side of it. On exit
+the stacked card comes back.
+
+The button also follows the active tab rather than sticking to one window:
+
+```
+taskbar: hide "Document7"
+taskbar: hide "Document5"
+switch -> [1] "Document7"  foreground=True
+taskbar: hide "Document1"
+taskbar: show "Document7"
+switch -> [2] "Document5"  foreground=True
+taskbar: hide "Document7"
+taskbar: show "Document5"
+```
+
+Exactly one button at every moment, and no HRESULT failures across the run. A window
+that leaves the stack gets its button back on the way out, because it may have been
+minimized rather than closed — without that it would be unreachable.
+
+**Alt+Tab is a separate mechanism and is not addressed.** `DeleteTab` only talks to the
+taskbar; all three windows still appear in the Alt+Tab list. Suppressing those means
+`WS_EX_TOOLWINDOW` or DWM cloaking, neither of which was tried here.
+
 ## The finding that actually matters
 
 **Word only lays out a window's interior while that window has focus.**
@@ -106,8 +140,7 @@ Two changes close it:
 - **Still out-of-process**, for the same reason as spike 1 — no COM add-in, no C++
   toolchain needed, which keeps the spike about stacking alone. The 30ms poll means a
   sub-frame window where geometry is stale.
-- **Taskbar.** Three stacked windows still produce three taskbar buttons.
-  `ITaskbarList::DeleteTab` on the inactive ones is untouched — that is the next slice.
+- **Alt+Tab.** All three windows still show up there; see the taskbar section above.
 - **Maximize/restore state.** Only the *rect* is propagated. A stacked window given a
   maximized window's rect looks right but is not actually maximized, so double-clicking
   its title bar behaves oddly. Not addressed.
@@ -126,6 +159,7 @@ bin\Release\net9.0-windows\win-x64\StackSpike.exe
 ```
 
 Open two or three Word documents first. Click a tab, or press `1`..`9` in the console.
+Watch the taskbar while you switch — there should be one Word button throughout.
 `q` or Ctrl+C restores every window. `--seconds N` exits cleanly after N seconds, which
 is what makes the spike scriptable — Ctrl+C cannot be sent cross-process, and killing it
 would leave every Word window stacked and shifted.

@@ -43,6 +43,7 @@ namespace StackSpike
             public int NaturalBottomGap;  // client height minus NaturalWwf.bottom, for restore
             public RECT StripAt;
             public bool StripPlaced;
+            public bool OnTaskbar = true;  // Word gives every window a button to start with
         }
 
         static readonly List<WordWin> _wins = new List<WordWin>();
@@ -64,8 +65,12 @@ namespace StackSpike
         static TimerProcDelegate _quitProc;
 
         static IntPtr _brBg, _brActive, _brInactive, _brEdge, _font;
+        static ITaskbarList _taskbar;
         static StreamWriter _log;
 
+        // STA because ITaskbarList is an apartment-threaded shell object, and because this
+        // thread runs a Win32 message loop anyway.
+        [STAThread]
         static int Main(string[] args)
         {
             // `--seconds N` exits cleanly after N seconds, which is what lets this be driven
@@ -93,7 +98,9 @@ namespace StackSpike
             if (_wins.Count == 1)
                 Log("NOTE: only one Word window. Open a second document to see the point of this spike.");
 
+            InitTaskbar();
             SyncAll();
+            SyncTaskbar();
 
             _winEventProc = OnWinEvent;
             _hook = Native.SetWinEventHook(
@@ -132,6 +139,7 @@ namespace StackSpike
             Log("  3. drag or resize the Word window -> every stacked window must follow");
             Log("  4. open a new document -> it should join the strip within half a second");
             Log("  5. File (Backstage), then Back -> the strip must come back correctly");
+            Log("  6. look at the taskbar -> one Word button, not one per document");
             Log("Press Ctrl+C here to stop and put every window back where it was.");
             Log("");
 
@@ -191,6 +199,15 @@ namespace StackSpike
                 if (usable.Contains(w.Opus) && Native.IsWindow(w.Opus)) continue;
 
                 Log(string.Format("window left the stack: 0x{0:X} \"{1}\"", w.Opus.ToInt64(), w.Title));
+
+                // It may have only been minimized rather than closed, in which case it needs
+                // its taskbar button back or the user cannot get to it again.
+                if (_taskbar != null && !w.OnTaskbar && Native.IsWindow(w.Opus))
+                {
+                    try { _taskbar.AddTab(w.Opus); }
+                    catch (Exception ex) { Log("WARN: taskbar restore failed: " + ex.Message); }
+                }
+
                 if (w.Strip != IntPtr.Zero)
                 {
                     _byStrip.Remove(w.Strip);
@@ -458,6 +475,66 @@ namespace StackSpike
 
             InvalidateStrips();
             SyncAll();
+            SyncTaskbar();
+        }
+
+        // ------------------------------------------------------------------- the taskbar
+
+        static void InitTaskbar()
+        {
+            try
+            {
+                _taskbar = (ITaskbarList)new TaskbarListClass();
+                _taskbar.HrInit();
+                Log("ITaskbarList ready");
+            }
+            catch (Exception ex)
+            {
+                _taskbar = null;
+                Log("WARN: ITaskbarList unavailable, taskbar buttons will not be suppressed: "
+                    + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// N stacked windows otherwise produce N taskbar buttons, which gives the illusion
+        /// away immediately. Only the window the user can actually see keeps a button.
+        /// </summary>
+        static void SyncTaskbar()
+        {
+            if (_taskbar == null) return;
+
+            for (int i = 0; i < _wins.Count; i++)
+            {
+                var w = _wins[i];
+                bool want = i == _activeIdx;
+                if (w.OnTaskbar == want || !Native.IsWindow(w.Opus)) continue;
+
+                try
+                {
+                    if (want) _taskbar.AddTab(w.Opus);
+                    else _taskbar.DeleteTab(w.Opus);
+                    w.OnTaskbar = want;
+                    Log(string.Format("taskbar: {0} \"{1}\"", want ? "show" : "hide", w.Title));
+                }
+                catch (Exception ex)
+                {
+                    Log(string.Format("WARN: taskbar {0} on \"{1}\" failed: {2}",
+                                      want ? "AddTab" : "DeleteTab", w.Title, ex.Message));
+                }
+            }
+        }
+
+        /// <summary>Give every window its taskbar button back, whatever state we left it in.</summary>
+        static void RestoreTaskbar()
+        {
+            if (_taskbar == null) return;
+            foreach (var w in _wins)
+            {
+                if (w.OnTaskbar || !Native.IsWindow(w.Opus)) continue;
+                try { _taskbar.AddTab(w.Opus); w.OnTaskbar = true; }
+                catch (Exception ex) { Log("WARN: taskbar restore failed: " + ex.Message); }
+            }
         }
 
         static void StartKeyReader()
@@ -484,7 +561,7 @@ namespace StackSpike
 
         static void OnTimer(IntPtr h, uint m, UIntPtr id, uint t)
         {
-            if (++_tick % RESCAN_EVERY == 0) Rescan();
+            if (++_tick % RESCAN_EVERY == 0) { Rescan(); SyncTaskbar(); }
             SyncAll();
         }
 
@@ -721,6 +798,7 @@ namespace StackSpike
             Log("restoring every window...");
 
             if (_hook != IntPtr.Zero) Native.UnhookWinEvent(_hook);
+            RestoreTaskbar();
 
             foreach (var w in _wins)
             {
