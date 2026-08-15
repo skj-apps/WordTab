@@ -1,0 +1,359 @@
+<#
+.SYNOPSIS
+  Measure WordTab's strip inside a running Word, and put Word through the layout changes that are
+  supposed to break it.
+
+.DESCRIPTION
+  The strip's claim is a geometric one: WordTab owns a horizontal band between Word's ribbon and
+  its document, and that band stays exactly there through everything Word does to its own layout.
+  A claim like that should not be checked by looking at it, so this reads the actual rectangles
+  from outside the process and asserts three things after every change:
+
+    - the strip sits immediately above the document frame  (strip.bottom == _WwF.top)
+    - it spans the document frame exactly                  (same left and right)
+    - nothing is left uncovered above it                   (no gap to the chrome above)
+
+  Then it drives the four cases that matter, in order of how likely each was to break it:
+  resize, maximize, restore, and Backstage - the full-screen File menu, which is what reportedly
+  broke the old "Doc Tabs" add-in, because leaving it makes Word rebuild its layout from scratch.
+
+  Word is started if it is not already running, on a scratch document written by this script.
+  Word's documents on the dev rig are disposable test fixtures.
+
+.PARAMETER KeepOpen
+  Leave Word running afterwards instead of closing it. Use this to look at the result by hand.
+
+.PARAMETER Screenshot
+  Save a PNG of each Word frame at the end, next to the script's output.
+
+.PARAMETER SecondDocument
+  Open a second document, so the per-frame strip can be checked on more than one frame.
+
+.EXAMPLE
+  pwsh -File tools\check-strip.ps1
+  pwsh -File tools\check-strip.ps1 -KeepOpen -Screenshot -SecondDocument
+#>
+[CmdletBinding()]
+param(
+    [switch]$KeepOpen,
+    [switch]$Screenshot,
+    [switch]$SecondDocument,
+    [string]$ShotDir = $env:TEMP
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+# The Win32 side lives in tools\WordLayout.cs so probes and later slices can load the same one.
+$source = Get-Content -Raw -Path (Join-Path $PSScriptRoot 'WordLayout.cs')
+
+# The explicit reference list is not decoration: naming any assembly at all replaces PowerShell's
+# default set, so the ones the compiler would otherwise have had for free have to come back too.
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
+    'System.Runtime', 'System.Collections', 'System.Threading.Thread', 'netstandard'
+)
+
+# Physical pixels. This rig is at 150%, and without this every rectangle below is silently scaled.
+[WordLayout]::MakeDpiAware() | Out-Null
+
+$script:Failures = 0
+$script:Checks   = 0
+
+function Write-Step($text) { Write-Host "==> $text" -ForegroundColor Cyan }
+function Write-Note($text) { Write-Host "    $text" -ForegroundColor DarkGray }
+
+function Assert($condition, $text) {
+    $script:Checks++
+    if ($condition) {
+        Write-Host "    PASS  $text" -ForegroundColor Green
+    } else {
+        $script:Failures++
+        Write-Host "    FAIL  $text" -ForegroundColor Red
+    }
+}
+
+# ---- get Word up, with a document -------------------------------------------------------------
+
+$scratch = Join-Path $env:TEMP 'wordtab-check'
+New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+$doc1 = Join-Path $scratch 'wordtab-check-1.rtf'
+$doc2 = Join-Path $scratch 'wordtab-check-2.rtf'
+'{\rtf1\ansi WordTab layout check - document one.\par}' | Set-Content -Path $doc1 -Encoding Ascii
+'{\rtf1\ansi WordTab layout check - document two.\par}' | Set-Content -Path $doc2 -Encoding Ascii
+
+$startedWord = $false
+if (-not (Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
+    Write-Step 'Starting Word'
+    Start-Process -FilePath 'winword.exe' -ArgumentList "`"$doc1`""
+    $startedWord = $true
+}
+
+$deadline = (Get-Date).AddSeconds(60)
+$frames = @()
+while ((Get-Date) -lt $deadline) {
+    $frames = @()
+    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
+        $frames += [WordLayout]::Frames($process.Id)
+    }
+    # A frame with no `_WwF` yet is Word still building its window, not a frame to measure.
+    if ($frames.Count -gt 0) {
+        $kids = [WordLayout]::Children($frames[0])
+        if (@($kids | Where-Object { $_.Class -eq '_WwF' }).Count -gt 0) { break }
+    }
+    Start-Sleep -Milliseconds 500
+}
+if ($frames.Count -eq 0) { throw 'No usable Word frame appeared within 60s.' }
+
+if ($SecondDocument) {
+    Write-Step 'Opening a second document'
+    Start-Process -FilePath 'winword.exe' -ArgumentList "`"$doc2`""
+    Start-Sleep -Seconds 6
+    $frames = @()
+    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
+        $frames += [WordLayout]::Frames($process.Id)
+    }
+}
+
+$target = $frames[0]
+Write-Note ("target frame 0x{0:X}  `"{1}`"  ({2} visible frame(s))" -f [int64]$target, [WordLayout]::TitleOf($target), $frames.Count)
+
+# ---- the measurement ---------------------------------------------------------------------------
+
+function Get-Layout($frame) {
+    $kids = [WordLayout]::Children($frame)
+    $strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' })[0]
+    $wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' })[0]
+    [pscustomobject]@{
+        Frame    = $frame
+        Children = $kids
+        Strip    = $strip
+        Wwf      = $wwf
+        Client   = [WordLayout]::ClientOf($frame)
+    }
+}
+
+function Show-Layout($layout) {
+    # Only the children that lay out the window: the ones spanning most of its width. Word hangs
+    # dozens of small helper windows off the frame and listing them all buries the four that matter.
+    $wide = $layout.Children | Where-Object { $_.Visible -and $_.Width -gt ($layout.Client.Right * 0.6) } |
+            Sort-Object Top
+    foreach ($c in $wide) {
+        $mark = if ($c.Class -eq 'WordTabStrip') { '  <- ours' } else { '' }
+        Write-Note ("{0,-16} y {1,5} .. {2,-5} h={3,-5} x {4,4}..{5,-5}{6}" -f `
+            $c.Class, $c.Top, $c.Bottom, $c.Height, $c.Left, $c.Right, $mark)
+    }
+}
+
+function Test-Layout($label, [switch]$Quiet) {
+    $layout = Get-Layout $target
+    Write-Step $label
+    if (-not $Quiet) { Show-Layout $layout }
+
+    if (-not $layout.Wwf) {
+        Assert $false "$label - `_WwF` not found (Word has no document frame)"
+        return
+    }
+    if (-not $layout.Strip) {
+        Assert $false "$label - no WordTabStrip child (the add-in is not running, or the strip is off)"
+        return
+    }
+
+    $strip = $layout.Strip
+    $wwf   = $layout.Wwf
+
+    Assert ($strip.Bottom -eq $wwf.Top) `
+        ("$label - strip bottom {0} meets document top {1}" -f $strip.Bottom, $wwf.Top)
+    Assert ($strip.Left -eq $wwf.Left -and $strip.Right -eq $wwf.Right) `
+        ("$label - strip spans the document exactly ({0}..{1} vs {2}..{3})" -f $strip.Left, $strip.Right, $wwf.Left, $wwf.Right)
+
+    # Whatever Word draws directly above us - the ribbon - should end exactly where we begin. A gap
+    # means we took a band Word still thinks is its own; an overlap means we are covering chrome.
+    $above = $layout.Children |
+             Where-Object { $_.Visible -and $_.Hwnd -ne $strip.Hwnd -and $_.Hwnd -ne $wwf.Hwnd -and
+                            $_.Bottom -le $strip.Top -and $_.Width -gt ($layout.Client.Right * 0.6) } |
+             Sort-Object Bottom -Descending | Select-Object -First 1
+    if ($above) {
+        Assert ($strip.Top -eq $above.Bottom) `
+            ("$label - no gap above: {0} ends at {1}, strip starts at {2}" -f $above.Class, $above.Bottom, $strip.Top)
+    } else {
+        Write-Note "(nothing above the strip to compare against)"
+    }
+
+    Assert ($wwf.Height -gt 0 -and $wwf.Bottom -le $layout.Client.Bottom) `
+        ("$label - document frame still inside the window (h={0}, bottom {1} <= {2})" -f $wwf.Height, $wwf.Bottom, $layout.Client.Bottom)
+}
+
+function Save-FrameShot($frame, $name) {
+    if (-not $Screenshot) { return }
+    New-Item -ItemType Directory -Path $ShotDir -Force | Out-Null
+    $path = Join-Path $ShotDir "wordtab-$name.png"
+    $r = [WordLayout]::RectOf($frame)
+    $bitmap = New-Object System.Drawing.Bitmap(($r.Right - $r.Left), ($r.Bottom - $r.Top))
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $dc = $graphics.GetHdc()
+    [WordLayout]::Print($frame, $dc) | Out-Null
+    $graphics.ReleaseHdc($dc)
+    $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+    $graphics.Dispose(); $bitmap.Dispose()
+    Write-Note $path
+}
+
+# ---- baseline --------------------------------------------------------------------------------
+
+Test-Layout 'Baseline'
+
+# ---- resize ----------------------------------------------------------------------------------
+
+if ([WordLayout]::Maximized($target)) { [WordLayout]::Show($target, [WordLayout]::SW_RESTORE); Start-Sleep -Milliseconds 800 }
+
+foreach ($size in @(@(1000, 800), @(1360, 900), @(900, 700))) {
+    [WordLayout]::Resize($target, $size[0], $size[1])
+    Start-Sleep -Milliseconds 900
+    Test-Layout ("Resized to {0}x{1}" -f $size[0], $size[1]) -Quiet
+}
+
+# ---- maximize / restore -------------------------------------------------------------------------
+
+[WordLayout]::Show($target, [WordLayout]::SW_MAXIMIZE)
+Start-Sleep -Milliseconds 1200
+Test-Layout 'Maximized'
+
+[WordLayout]::Show($target, [WordLayout]::SW_RESTORE)
+Start-Sleep -Milliseconds 1200
+Test-Layout 'Restored'
+
+# ---- resize by dragging the border -----------------------------------------------------------
+#
+# The stress case. Everything above changes the window once; a drag changes it every frame, inside
+# Word's modal loop, with our code between Word and its own window procedure for each one. Two
+# things are being watched: that the strip still lands correctly at the end, and that the add-in
+# does not write a log line per frame - a file write inside that loop is a stutter the user feels.
+
+$logFile = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
+function Get-StripLineCount {
+    if (-not (Test-Path $logFile)) { return 0 }
+    # Only our own lines. frames.cpp also writes a dozen lines per drag, but those are the previous
+    # slice's timing report, buffered in memory and flushed once at WM_EXITSIZEMOVE - deliberately
+    # not a per-frame cost, and not what this is watching for.
+    return @(Get-Content $logFile | Where-Object { $_ -match '\bstrip\s+hwnd=' }).Count
+}
+$linesBefore = Get-StripLineCount
+
+if ([WordLayout]::Focus($target)) {
+    $r = [WordLayout]::RectOf($target)
+    $grabX = $r.Right - 2
+    $grabY = $r.Top + [int](($r.Bottom - $r.Top) / 2)
+
+    Write-Step 'Resize drag (Word''s modal loop, one relayout per frame)'
+    [WordLayout]::DragBy($grabX, $grabY, 40, -6, 0, 8) | Out-Null
+    Start-Sleep -Milliseconds 600
+    Test-Layout 'During-drag end state (narrower)' -Quiet
+
+    $r = [WordLayout]::RectOf($target)
+    [WordLayout]::DragBy($r.Right - 2, $grabY, 40, 6, 0, 8) | Out-Null
+    Start-Sleep -Milliseconds 600
+    Test-Layout 'Back to the original width' -Quiet
+
+    $written = (Get-StripLineCount) - $linesBefore
+    Assert ($written -lt 15) "the strip stayed quiet during the drag ($written log lines for 80 frames)"
+} else {
+    Write-Warning 'Could not bring Word to the foreground; skipping the resize drag.'
+}
+
+# ---- Backstage ----------------------------------------------------------------------------------
+#
+# The one that reportedly broke the old Doc Tabs add-in: leaving Backstage makes Word rebuild its
+# layout from scratch. Inside Backstage the document frame is gone, so there is nothing to assert
+# except that we did not leave a strip floating over the File menu; the real check is what comes
+# back afterwards.
+
+if ([WordLayout]::Focus($target)) {
+    Write-Step 'Backstage (File menu)'
+
+    # Retried, and confirmed rather than assumed. Injected input into another process's UI fails
+    # quietly, and a Backstage check that silently never opened Backstage is worse than no check.
+    # One click into the document first. Word's ribbon ignores Alt+F when the window was activated
+    # programmatically rather than clicked - measured, and it fails silently.
+    $layout = Get-Layout $target
+    $frameRect = [WordLayout]::RectOf($target)
+    if ($layout.Wwf) {
+        [WordLayout]::Click($frameRect.Left + [int]($layout.Wwf.Width / 2),
+                            $frameRect.Top + $layout.Wwf.Top + [int]($layout.Wwf.Height / 2))
+    }
+
+    $opened = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $opened; $attempt++) {
+        # A failed Alt+F can leave Word showing KeyTips, where the next one means something else.
+        [WordLayout]::CloseBackstage()
+        Start-Sleep -Milliseconds 300
+        [WordLayout]::OpenBackstage()
+        Start-Sleep -Milliseconds 2000
+        $opened = [WordLayout]::BackstageOpen($target)
+    }
+    Assert $opened 'Backstage opened (FullpageUIHost is up)'
+
+    if ($opened) {
+        # A picture answers what the rectangles cannot: whether our strip is sitting on top of the
+        # File menu. It is a child of the frame, so it could be.
+        Save-FrameShot $target 'backstage'
+
+        $inside = Get-Layout $target
+        $hidden = (-not $inside.Strip) -or (-not $inside.Strip.Visible)
+        Assert $hidden 'the strip is hidden while Backstage is up (Word hides its children, ours included)'
+
+        [WordLayout]::CloseBackstage()
+        Start-Sleep -Milliseconds 2500
+        Assert (-not [WordLayout]::BackstageOpen($target)) 'Backstage closed again'
+        Test-Layout 'After leaving Backstage'
+    }
+} else {
+    Write-Warning 'Could not bring Word to the foreground; skipping the Backstage check.'
+}
+
+# ---- every frame, not just the target -----------------------------------------------------------
+
+$frames = @()
+foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
+    $frames += [WordLayout]::Frames($process.Id)
+}
+if ($frames.Count -gt 1) {
+    Write-Step "All $($frames.Count) frames have their own strip"
+    foreach ($frame in $frames) {
+        $layout = Get-Layout $frame
+        $ok = $layout.Strip -and $layout.Wwf -and $layout.Strip.Bottom -eq $layout.Wwf.Top
+        Assert $ok ("frame 0x{0:X} `"{1}`"" -f [int64]$frame, [WordLayout]::TitleOf($frame))
+    }
+}
+
+# ---- pictures -------------------------------------------------------------------------------------
+
+if ($Screenshot) {
+    Write-Step 'Screenshots'
+    $index = 0
+    foreach ($frame in $frames) { Save-FrameShot $frame ("frame-{0}" -f $index++) }
+}
+
+# ---- done -------------------------------------------------------------------------------------
+
+if (-not $KeepOpen -and $startedWord) {
+    Write-Step 'Closing Word'
+    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
+        $process.CloseMainWindow() | Out-Null
+    }
+    Start-Sleep -Seconds 3
+    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
+        # A document Word thinks is unsaved would sit on a dialog forever otherwise. These are
+        # scratch files.
+        $process.Kill()
+    }
+}
+
+Write-Host ''
+if ($script:Failures -eq 0) {
+    Write-Host "PASS  $($script:Checks) checks, 0 failures" -ForegroundColor Green
+} else {
+    Write-Host "FAIL  $($script:Failures) of $($script:Checks) checks failed" -ForegroundColor Red
+}
+Write-Host "Add-in log: $env:LOCALAPPDATA\WordTab\wordtab.log (lines starting 'strip')" -ForegroundColor Gray
+exit $script:Failures

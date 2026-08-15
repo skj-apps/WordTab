@@ -278,7 +278,9 @@ static void TraceFlush(void)
 // rebuild - same shape as ShowLoadBanner.
 // ---------------------------------------------------------------------------------------------
 
-static BOOL ReadFlag(const wchar_t* name, BOOL defaultValue)
+// Declared in wordtab.h and shared with strip.cpp: every switch WordTab has is a DWORD under the
+// same key, and one reader for all of them is one place for the "absent means default" rule.
+BOOL WordTabReadFlag(const wchar_t* name, BOOL defaultValue)
 {
     DWORD value = 0;
     DWORD size = sizeof(value);
@@ -470,6 +472,7 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
     case WM_DPICHANGED:
         // This rig runs at 150%. Every rectangle we compute has to survive a monitor change.
         LogWrite(L"WM_DPICHANGED  hwnd=0x%p  dpi=%d", (void*)hwnd, (int)LOWORD(wParam));
+        StripOnFrameDpiChanged(hwnd);
         break;
 
     case WM_NCDESTROY:
@@ -565,10 +568,18 @@ static void AttachFrame(HWND hwnd, const wchar_t* why)
              (int)IsWindowVisible(hwnd),
              rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
              total);
+
+    // Give the frame its strip. Done after the log line above so the two read in the order they
+    // happened, and after the subclass so a strip can never exist on a frame we are not watching.
+    StripAttachFrame(hwnd);
 }
 
 static void DetachFrame(HWND hwnd, const wchar_t* why)
 {
+    // First, because it puts Word's layout back and destroys our child window, and both need the
+    // frame to still be in a state where its children can be touched.
+    StripDetachFrame(hwnd);
+
     EnsureLock();
     EnterCriticalSection(&g_lock);
 
@@ -655,7 +666,11 @@ void FramesStart(void)
     g_qpcFreq = QueryPerformanceFrequency(&freq) ? freq.QuadPart : 0;
 
     g_uiThread   = GetCurrentThreadId();
-    g_followDrag = ReadFlag(L"FollowDrag", TRUE);
+    g_followDrag = WordTabReadFlag(L"FollowDrag", TRUE);
+
+    // Before any frame is attached: AttachFrame hands each one to the strip code, which has to be
+    // ready to receive it.
+    StripStart();
 
     // A message-only window: no pixels, no taskbar, no z-order. It exists to give the CBT hook
     // somewhere to post to, and it is where the coordinator's timers and state will live later.
@@ -723,6 +738,11 @@ void FramesStop(void)
         UnhookWindowsHookEx(g_cbtHook);
         g_cbtHook = NULL;
     }
+
+    // Puts Word's layout back on every frame while the frames are all still alive. After this the
+    // per-frame DetachFrame calls below find nothing left to restore, which is what we want: by
+    // then Word may already be tearing windows down.
+    StripStop();
 
     // Detach back-to-front: DetachFrame compacts the table as it goes.
     for (;;)

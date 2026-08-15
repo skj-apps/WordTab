@@ -116,3 +116,20 @@ HRESULT WordTabCreateConnect(REFIID riid, void** ppv);
 
 void FramesStart(void);
 void FramesStop(void);
+
+// ---------------------------------------------------------------------------------------------
+// The strip - our band of Word's layout, carved out of the top of the `_WwF` document frame.
+// See strip.cpp. Driven entirely by frames.cpp: there is one strip per subclassed frame, and it
+// lives and dies with it.
+// ---------------------------------------------------------------------------------------------
+
+void StripStart(void);
+void StripAttachFrame(HWND frame);
+void StripDetachFrame(HWND frame);
+void StripOnFrameDpiChanged(HWND frame);
+void StripStop(void);
+
+// Read a DWORD switch from HKCU\Software\WordTab as a boolean. Absent means the default, so a
+// fresh install behaves like a configured one. Used for the switches that must be flippable
+// without a rebuild.
+BOOL WordTabReadFlag(const wchar_t* name, BOOL defaultValue);
