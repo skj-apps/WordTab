@@ -1,0 +1,106 @@
+WORDTAB - WORK RIG COMPATIBILITY CHECKS
+=======================================
+
+Run these on the work laptop. Takes about 2 minutes. No admin rights needed.
+Everything below only reads settings - nothing is installed, nothing is changed,
+no files are written.
+
+WHAT IT TELLS US
+  Whether an add-in I write has to be code-signed before that machine will run
+  it, and how Office Tab's no-admin install was laid out so we can copy it.
+
+
+STEP 1 - OPEN POWERSHELL AS YOUR NORMAL SELF
+  Press the Windows key, type: powershell
+  Press Enter.
+  It may open in C:\WINDOWS\system32 - that is fine and does not matter, every
+  path in the script is absolute.
+  What DOES matter is not being elevated. Check with:
+      ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrator')
+  You want False. If it says True, or the title bar says "Administrator",
+  close it and open PowerShell normally - the point is to see what happens
+  under an ordinary account.
+
+STEP 2 - PASTE THE SCRIPT BELOW AND RUN IT
+  Select everything between the two ---8<--- lines.
+  Click into the PowerShell window and RIGHT-CLICK to paste (that is how
+  PowerShell pastes; Ctrl+V also works). Press Enter.
+  If the prompt turns into >> then press Enter once more.
+  It finishes in about 5 seconds and prints ~14 labelled lines.
+
+STEP 3 - SEND THE RESULTS BACK
+  The last line should say "(also copied to your clipboard)", so just paste.
+  Include any line saying "unreadable" or "Access is denied" - a refused check
+  is still an answer.
+
+STEP 4 - RUN ONE MORE LINE
+  In the same window type:   dotnet --info
+  Send back the first few lines, or the error. "Not recognized" is a fine
+  answer - it just means we build on the home machine instead.
+
+STEP 5 - CHECK OFFICE TAB IS STILL INSTALLED THERE
+  In the results, look for lines starting "OfficeTab." near the bottom.
+  If they are missing, say so.
+
+
+IF IT MISBEHAVES
+  "Running scripts is disabled on this system"
+      Press Windows key, type: ise
+      Open Windows PowerShell ISE, paste into the TOP pane, press F5.
+  Paste arrives mangled or lines run together
+      Use the ISE route above.
+  Red errors partway through
+      Expected on a managed machine. Let it finish, send everything.
+  PowerShell will not open at all
+      That is a finding in itself. Say so.
+
+
+IMPORTANT WHEN EMAILING THIS
+  Send it as PLAIN TEXT. If the mail client formats it as HTML it may turn
+  straight quotes ' " into curly quotes, which breaks the script.
+  In Outlook: Format Text tab > Plain Text, before sending.
+
+
+---8<--- COPY FROM HERE ---8<---
+$r = [ordered]@{}
+try { $svc = Get-CimInstance Win32_Service -Filter "Name='AppIDSvc'" -ErrorAction Stop
+      if ($svc) { $r['AppLocker service'] = "State=$($svc.State) StartMode=$($svc.StartMode)" } else { $r['AppLocker service'] = 'not present' }
+} catch { $r['AppLocker service'] = "unreadable: $($_.Exception.Message)" }
+try { $pol = Get-AppLockerPolicy -Effective -ErrorAction Stop
+      $cols = $pol.RuleCollections | ForEach-Object { "$($_.RuleCollectionType)=$($_.EnforcementMode)/$($_.Count)rules" }
+      if ($cols) { $r['AppLocker collections'] = ($cols -join ', ') } else { $r['AppLocker collections'] = 'no rules defined' }
+} catch { $srpV2 = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\SrpV2'
+      if (Test-Path $srpV2) { $cols = Get-ChildItem $srpV2 -ErrorAction SilentlyContinue | ForEach-Object { $m = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).EnforcementMode; "$($_.PSChildName)=$m" }
+          $r['AppLocker collections'] = 'via registry: ' + ($cols -join ', ') } else { $r['AppLocker collections'] = 'no AppLocker policy present' } }
+try { $dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction Stop
+      $r['WDAC kernel CI'] = $dg.CodeIntegrityPolicyEnforcementStatus
+      $r['WDAC usermode CI'] = $dg.UsermodeCodeIntegrityPolicyEnforcementStatus
+} catch { $r['WDAC'] = "unreadable: $($_.Exception.Message)" }
+$ci = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue
+if ($ci -and $null -ne $ci.VerifiedAndReputablePolicyState) { $r['Smart App Control'] = $ci.VerifiedAndReputablePolicyState } else { $r['Smart App Control'] = 'not configured' }
+$srp = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers' -ErrorAction SilentlyContinue
+if ($srp -and ($null -ne $srp.DefaultLevel -or $null -ne $srp.TransparentEnabled)) { $r['SRP'] = "DefaultLevel=$($srp.DefaultLevel) Transparent=$($srp.TransparentEnabled)" } else { $r['SRP'] = 'not configured' }
+$found = @()
+foreach ($p in @('HKCU:\Software\Policies\Microsoft\Office\16.0\Word\Security','HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\Word\Security','HKCU:\Software\Microsoft\Office\16.0\Word\Security','HKCU:\Software\Policies\Microsoft\Office\16.0\Common\Security')) {
+  $k = Get-ItemProperty $p -ErrorAction SilentlyContinue
+  if ($k) { $k.PSObject.Properties | Where-Object { $_.Name -match 'RequireAddinSig|DisableAllAddins|NoTBPromptUnsignedAddin|DisableCOMAddins' } | ForEach-Object { $found += "$($p.Split('\')[0])..$($_.Name)=$($_.Value)" } } }
+if ($found) { $r['Office add-in policy'] = ($found -join ', ') } else { $r['Office add-in policy'] = 'no signing/disable policy set (good)' }
+$c2r = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue
+if ($c2r) { $r['Office'] = "$($c2r.ProductReleaseIds) v$($c2r.VersionToReport) $($c2r.Platform)" } else { $r['Office'] = 'no ClickToRun key' }
+$shared = 'C:\Program Files\dotnet\shared\Microsoft.NETCore.App'
+if (Test-Path $shared) { $r['.NET runtimes'] = ((Get-ChildItem $shared -Directory).Name -join ', ') } else { $r['.NET runtimes'] = 'none' }
+$ndp = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue
+if ($ndp) { $r['.NET Framework 4.x'] = "Release=$($ndp.Release)" } else { $r['.NET Framework 4.x'] = 'absent' }
+foreach ($hive in @('HKCU:\Software\Microsoft\Office\Word\Addins','HKLM:\SOFTWARE\Microsoft\Office\Word\Addins')) {
+  $names = Get-ChildItem $hive -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName
+  $label = 'Word add-ins ' + $hive.Split('\')[0]
+  if ($names) { $r[$label] = ($names -join ', ') } else { $r[$label] = 'none' } }
+foreach ($progId in @('OfficeTab.TabsforWord2013','OfficeTabs.Connect')) {
+  foreach ($classes in @('HKCU:\Software\Classes','HKLM:\SOFTWARE\Classes')) {
+    $clsid = (Get-ItemProperty "$classes\$progId\CLSID" -ErrorAction SilentlyContinue).'(default)'
+    if ($clsid) { $dll = (Get-ItemProperty "$classes\CLSID\$clsid\InprocServer32" -ErrorAction SilentlyContinue).'(default)'
+        $r["$progId @ $($classes.Split('\')[0])"] = "$clsid -> $dll" } } }
+$txt = ($r.GetEnumerator() | ForEach-Object { '{0,-34} {1}' -f $_.Key, $_.Value }) -join "`r`n"
+$txt
+try { $txt | Set-Clipboard; '' ; '(also copied to your clipboard)' } catch { }
+---8<--- COPY TO HERE ---8<---
