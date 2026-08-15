@@ -47,7 +47,7 @@ public static class WordLayout
     const uint MOUSEEVENTF_MOVE = 0x0001, MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;
     const uint MOUSEEVENTF_ABSOLUTE = 0x8000, MOUSEEVENTF_VIRTUALDESK = 0x4000;
     public const int SW_MAXIMIZE = 3, SW_RESTORE = 9;
-    const uint SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010, SWP_NOMOVE = 0x0002;
+    const uint SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001;
 
     public class Child
     {
@@ -142,6 +142,14 @@ public static class WordLayout
     }
 
     public static RECT ClientOf(IntPtr hwnd) { RECT r; GetClientRect(hwnd, out r); return r; }
+
+    // Windows 10 1607 and later. The rig runs at 150%, so anything that mirrors a DPI-scaled
+    // layout computed inside the add-in needs this rather than an assumed 96.
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
+    public static int Dpi(IntPtr hwnd) { uint d = GetDpiForWindow(hwnd); return d >= 72 ? (int)d : 96; }
+
+    public static void Close(IntPtr hwnd) { PostMessage(hwnd, 0x0010, IntPtr.Zero, IntPtr.Zero); }  // WM_CLOSE
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
     public static RECT RectOf(IntPtr hwnd) { RECT r; GetWindowRect(hwnd, out r); return r; }
     public static bool Maximized(IntPtr hwnd) { return IsZoomed(hwnd); }
     public static string TitleOf(IntPtr hwnd) { StringBuilder t = new StringBuilder(256); GetWindowText(hwnd, t, 256); return t.ToString(); }
@@ -150,6 +158,13 @@ public static class WordLayout
     {
         SetWindowPos(hwnd, IntPtr.Zero, 0, 0, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
     }
+
+    public static void MoveTo(IntPtr hwnd, int x, int y)
+    {
+        SetWindowPos(hwnd, IntPtr.Zero, x, y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+    }
+
+    public static IntPtr GetForeground() { return GetForegroundWindow(); }
 
     public static void Show(IntPtr hwnd, int cmd) { ShowWindow(hwnd, cmd); }
 

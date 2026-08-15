@@ -129,6 +129,44 @@ void StripDetachFrame(HWND frame);
 void StripOnFrameDpiChanged(HWND frame);
 void StripStop(void);
 
+// What the stack needs from the strip. All of these exist because Word lays out only the focused
+// window: the stack has to take that window's document-frame rect and hand it to the others.
+BOOL StripHasDocumentFrame(HWND frame);
+BOOL StripGetNatural(HWND frame, RECT* natural);
+void StripSetNatural(HWND frame, const RECT* natural);
+void StripRefit(HWND frame);
+void StripRefreshTabs(void);
+
+// The name to put on a tab: the frame's title with Word's " - Word" suffix removed.
+void WordTabFrameTitle(HWND frame, wchar_t* out, int chars);
+
+// ---------------------------------------------------------------------------------------------
+// The stack - several Word windows held at one rectangle so they read as one window with tabs.
+// See stack.cpp. Membership is decided by what is true now (visible, has a document frame), never
+// by window creation and destruction: frame lifetime is not document lifetime in Word.
+// ---------------------------------------------------------------------------------------------
+
+void StackStart(void);
+void StackAttachFrame(HWND frame);
+void StackDetachFrame(HWND frame);
+void StackOnFrameActivate(HWND frame);
+void StackJanitor(void);
+void StackStop(void);
+
+// Returns how many other windows were moved with this one, so the drag trace can report it.
+int  StackOnFramePosChanging(HWND frame, const WINDOWPOS* pos);
+
+// Word laid out the focused window; every other window in the stack is given the same interior.
+void StackOnActiveLayout(HWND frame, const RECT* natural);
+
+// TRUE while the stack is moving windows itself, so our own SetWindowPos calls coming back through
+// the subclass are not mistaken for Word's.
+BOOL StackIsSyncing(void);
+
+// The tab row, and what a click on one does. `out` receives the frames, left to right.
+int  StackTabs(HWND frame, HWND* out, int max, int* activeIndex);
+void StackActivate(HWND frame);
+
 // Read a DWORD switch from HKCU\Software\WordTab as a boolean. Absent means the default, so a
 // fresh install behaves like a configured one. Used for the switches that must be flippable
 // without a rebuild.

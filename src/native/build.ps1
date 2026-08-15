@@ -68,6 +68,7 @@ $sources = @(
     (Join-Path $SourceDir 'connect.cpp')
     (Join-Path $SourceDir 'frames.cpp')
     (Join-Path $SourceDir 'strip.cpp')
+    (Join-Path $SourceDir 'stack.cpp')
     (Join-Path $SourceDir 'log.cpp')
 )
 

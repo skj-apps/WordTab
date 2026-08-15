@@ -74,8 +74,10 @@ struct StripState
 
     BOOL  stripPlaced;
     RECT  stripAt;
+    SIZE  clientAtNatural;   // the frame's client size when `natural` was recorded - see StripRefit
 
     BOOL  trippedLogged; // the height tripwire says its piece once per frame, not once per message
+    BOOL  wasVisible;    // to catch hidden -> shown, where the layout has to be re-derived
 
     // Logging a relayout costs a file write, and Word relayouts on every mouse movement of a resize
     // drag. So they are throttled and counted, and the count is reported with the next line that
@@ -93,12 +95,14 @@ static BOOL g_stripEnabled = TRUE;
 static ATOM g_stripClass = 0;
 static UINT_PTR g_janitor = 0;
 
-static HBRUSH   g_backBrush = NULL;   // strip background
-static HBRUSH   g_tabBrush  = NULL;   // the tab itself
-static HPEN     g_edgePen   = NULL;
-static COLORREF g_edgeColor = RGB(200, 198, 196);
-static COLORREF g_textColor = RGB(50, 49, 48);
-static BOOL     g_darkTheme = FALSE;
+static HBRUSH   g_backBrush    = NULL;   // strip background
+static HBRUSH   g_tabBrush     = NULL;   // the selected tab
+static HBRUSH   g_tabIdleBrush = NULL;   // the others
+static HPEN     g_edgePen      = NULL;
+static COLORREF g_edgeColor    = RGB(200, 198, 196);
+static COLORREF g_textColor    = RGB(50, 49, 48);
+static COLORREF g_idleTextColor = RGB(96, 94, 92);
+static BOOL     g_darkTheme    = FALSE;
 
 static StripState* FindByFrame(HWND frame)
 {
@@ -236,6 +240,17 @@ static BOOL SameRect(const RECT* a, const RECT* b)
            a->right == b->right && a->bottom == b->bottom;
 }
 
+// Remember how big the frame was when this natural rect was true. The stack needs it to refit a
+// window's document frame to a new size that Word will not lay out for it - see StripRefit.
+static void RememberClient(StripState* state)
+{
+    RECT client;
+    if (!GetClientRect(state->frame, &client))
+        return;
+    state->clientAtNatural.cx = client.right - client.left;
+    state->clientAtNatural.cy = client.bottom - client.top;
+}
+
 static void LogRelayout(StripState* state, const wchar_t* why)
 {
     DWORD now = GetTickCount();
@@ -277,8 +292,26 @@ static void PlaceStrip(StripState* state)
     want.right  = state->natural.right;
     want.bottom = state->natural.top + state->stripH;
 
-    if (state->stripPlaced && SameRect(&want, &state->stripAt))
+    // Compared against where the strip *actually is*, not against where we last put it. Those are
+    // not the same thing - Word, another add-in, or a message we did not see can move it - and
+    // trusting our own bookkeeping leaves the strip drawn a pixel or two away from the document
+    // frame it is supposed to be flush against, which is visible and was.
+    RECT actual;
+    if (ChildRect(state->frame, state->strip, &actual) && SameRect(&want, &actual))
+    {
+        state->stripAt = want;
+        state->stripPlaced = TRUE;
         return;
+    }
+
+    if (state->stripPlaced && !SameRect(&actual, &state->stripAt))
+    {
+        LogWrite(L"strip  hwnd=0x%p  strip had drifted: at (%ld,%ld %ldx%ld), expected "
+                 L"(%ld,%ld %ldx%ld) - correcting",
+                 (void*)state->frame,
+                 actual.left, actual.top, actual.right - actual.left, actual.bottom - actual.top,
+                 want.left, want.top, want.right - want.left, want.bottom - want.top);
+    }
 
     // SWP_NOZORDER after the first placement, deliberately. The strip is created at the top of the
     // z-order, which is where it needs to be to sit above the frame's background; forcing it back
@@ -302,6 +335,15 @@ static void PlaceStrip(StripState* state)
 static void AdjustProposed(StripState* state, WINDOWPOS* pos)
 {
     if (!state->enabled || !pos || !state->wwf)
+        return;
+
+    // Freeze while the window is hidden. Word dismantles a frame's layout on the way out - closing
+    // a document was measured to leave `_WwF` filling the whole client area, top edge at 0 - and
+    // accepting that as a natural rect puts the strip over the ribbon. Worse, it then gets
+    // broadcast to every other window in the stack, so one document closing wrecks the layout of
+    // all of them. Nobody can see a hidden window, so there is nothing to be gained by shifting it;
+    // the janitor re-derives from scratch when it is shown again.
+    if (!IsWindowVisible(state->frame))
         return;
 
     RECT current;
@@ -377,6 +419,7 @@ static void AdjustProposed(StripState* state, WINDOWPOS* pos)
     state->natural    = natural;
     state->applied    = applied;
     state->hasApplied = TRUE;
+    RememberClient(state);
 
     pos->x  = applied.left;
     pos->y  = applied.top;
@@ -384,8 +427,18 @@ static void AdjustProposed(StripState* state, WINDOWPOS* pos)
     pos->cy = applied.bottom - applied.top;
     pos->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
 
+    // In the same message as the document frame moves, rather than waiting for the CHANGED that
+    // follows: the two are meant to be flush against each other, so they should move together.
+    PlaceStrip(state);
+
     if (naturalMoved)
+    {
         LogRelayout(state, L"relayout");
+
+        // Word has just laid this window out. If it is the focused one it is the only window in
+        // the stack Word will lay out at all, so the rest are given the same interior from here.
+        StackOnActiveLayout(state->frame, &natural);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -450,6 +503,27 @@ static LRESULT CALLBACK WwfSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 // through every relayout. The tab it draws is a placeholder for the real tab strip.
 // ---------------------------------------------------------------------------------------------
 
+// Where tab `index` of `count` sits, in the strip's client coordinates. One function for painting
+// and for hit-testing, so a click can never land somewhere other than what was drawn.
+static void TabRect(StripState* state, int index, int count, const RECT* client, RECT* out)
+{
+    int pad     = Scaled(6, state->dpi);
+    int minimum = Scaled(70, state->dpi);
+    int desired = Scaled(TAB_LOGICAL_W, state->dpi);
+
+    int available = (client->right - client->left) - pad * 2;
+    int width = desired;
+    if (count > 0 && width * count > available)
+        width = available / count;
+    if (width < minimum)
+        width = minimum;
+
+    out->left   = client->left + pad + index * width;
+    out->right  = out->left + width - Scaled(2, state->dpi);   // a hairline between tabs
+    out->top    = client->top + Scaled(3, state->dpi);
+    out->bottom = client->bottom;
+}
+
 static void PaintStrip(StripState* state, HWND hwnd)
 {
     PAINTSTRUCT ps;
@@ -462,19 +536,28 @@ static void PaintStrip(StripState* state, HWND hwnd)
 
     FillRect(dc, &client, g_backBrush);
 
-    // One tab, showing this frame's document. The strip is per-frame for now; the shared strip that
-    // shows every stacked window's tab is the stacking slice.
-    RECT tab = client;
-    tab.left   = client.left + Scaled(6, state->dpi);
-    tab.top    = client.top  + Scaled(3, state->dpi);
-    tab.bottom = client.bottom;
-    tab.right  = tab.left + Scaled(TAB_LOGICAL_W, state->dpi);
-    if (tab.right > client.right - Scaled(6, state->dpi))
-        tab.right = client.right - Scaled(6, state->dpi);
+    // The tabs are the stack's, not this window's. Every window in the stack draws the same row
+    // with the same one selected, which is what makes switching look like a strip standing still
+    // while the page behind it changes. Off a stack this is simply one tab: our own document.
+    HWND frames[MAX_STRIPS];
+    int  activeIndex = 0;
+    int  count = StackTabs(state->frame, frames, MAX_STRIPS, &activeIndex);
 
-    if (tab.right > tab.left)
+    HGDIOBJ oldFont = SelectObject(dc, state->font ? (HGDIOBJ)state->font
+                                                   : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(dc, TRANSPARENT);
+
+    for (int i = 0; i < count; i++)
     {
-        FillRect(dc, &tab, g_tabBrush);
+        RECT tab;
+        TabRect(state, i, count, &client, &tab);
+        if (tab.right <= tab.left || tab.left >= client.right)
+            break;
+        if (tab.right > client.right)
+            tab.right = client.right;
+
+        BOOL selected = (i == activeIndex);
+        FillRect(dc, &tab, selected ? g_tabBrush : g_tabIdleBrush);
 
         HGDIOBJ oldPen   = SelectObject(dc, g_edgePen);
         HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -482,18 +565,18 @@ static void PaintStrip(StripState* state, HWND hwnd)
         SelectObject(dc, oldBrush);
         SelectObject(dc, oldPen);
 
+        wchar_t title[256];
+        WordTabFrameTitle(frames[i], title, 256);
+
         RECT text = tab;
         text.left  += Scaled(10, state->dpi);
         text.right -= Scaled(8, state->dpi);
-
-        HGDIOBJ oldFont = SelectObject(dc, state->font ? (HGDIOBJ)state->font
-                                                       : GetStockObject(DEFAULT_GUI_FONT));
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, g_textColor);
-        DrawTextW(dc, state->title, -1, &text,
+        SetTextColor(dc, selected ? g_textColor : g_idleTextColor);
+        DrawTextW(dc, title, -1, &text,
                   DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
-        SelectObject(dc, oldFont);
     }
+
+    SelectObject(dc, oldFont);
 
     // A hairline along the bottom, so the strip reads as part of Word's chrome rather than as a
     // rectangle dropped on top of it.
@@ -526,10 +609,33 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         break;
 
-    case WM_NCHITTEST:
-        // Nothing here is clickable yet, and a child that swallows clicks in a host we do not own
-        // is worse than one that ignores them. Tab hit-testing arrives with the tab strip proper.
-        return HTTRANSPARENT;
+    case WM_LBUTTONDOWN:
+        if (state)
+        {
+            RECT client;
+            GetClientRect(hwnd, &client);
+
+            POINT point;
+            point.x = (short)LOWORD(lParam);
+            point.y = (short)HIWORD(lParam);
+
+            HWND frames[MAX_STRIPS];
+            int count = StackTabs(state->frame, frames, MAX_STRIPS, NULL);
+            for (int i = 0; i < count; i++)
+            {
+                RECT tab;
+                TabRect(state, i, count, &client, &tab);
+                if (PtInRect(&tab, point))
+                {
+                    LogWrite(L"strip  hwnd=0x%p  tab %d clicked -> 0x%p",
+                             (void*)state->frame, i, (void*)frames[i]);
+                    StackActivate(frames[i]);
+                    break;
+                }
+            }
+            return 0;
+        }
+        break;
 
     default:
         break;
@@ -591,25 +697,38 @@ static HWND FindChildOfClass(HWND parent, const wchar_t* cls)
     return args.found;
 }
 
-static void ReadTitle(StripState* state)
+// The name to put on a tab. Word's frame title is "<document> - Word", and the suffix is identical
+// on every tab, so it would only eat the width the document name needs.
+void WordTabFrameTitle(HWND frame, wchar_t* out, int chars)
 {
-    wchar_t title[256] = L"";
-    GetWindowTextW(state->frame, title, 256);
+    if (!out || chars <= 0)
+        return;
+    out[0] = L'\0';
+    if (!frame || !IsWindow(frame))
+        return;
 
-    // Word's frame title is "<document> - Word"; the suffix is the same on every tab and would only
-    // eat the width the document name needs.
-    wchar_t* suffix = wcsstr(title, L" - Word");
+    GetWindowTextW(frame, out, chars);
+    out[chars - 1] = L'\0';
+
+    wchar_t* suffix = wcsstr(out, L" - Word");
     if (suffix)
         *suffix = L'\0';
-    if (title[0] == L'\0')
-        wcscpy(title, L"Word");
+    if (out[0] == L'\0')
+        wcscpy(out, L"Word");
+}
+
+static void ReadTitle(StripState* state)
+{
+    wchar_t title[256];
+    WordTabFrameTitle(state->frame, title, 256);
 
     if (wcscmp(title, state->title) != 0)
     {
         wcsncpy(state->title, title, 255);
         state->title[255] = L'\0';
-        if (state->strip)
-            InvalidateRect(state->strip, NULL, FALSE);
+
+        // Every strip shows every tab, so one window's title changing has to repaint all of them.
+        StripRefreshTabs();
     }
 }
 
@@ -621,6 +740,17 @@ static void ApplyInitial(StripState* state)
     RECT current;
     if (!ChildRect(state->frame, state->wwf, &current))
         return;
+
+    // Idempotent, like everything else here. If the document frame is already exactly where we put
+    // it then nothing has happened that needs re-deriving, and treating what we see as a fresh
+    // natural rect would shift it a second time - the strip lands 32px lower and the document with
+    // it. That is the accumulating-shift failure the whole design exists to avoid, and it does not
+    // stop being possible just because this path is called "initial".
+    if (state->hasApplied && SameRect(&current, &state->applied))
+    {
+        PlaceStrip(state);
+        return;
+    }
 
     RECT applied = current;
     applied.top = current.top + state->stripH;
@@ -643,8 +773,106 @@ static void ApplyInitial(StripState* state)
                  applied.right - applied.left, applied.bottom - applied.top,
                  SWP_NOZORDER | SWP_NOACTIVATE);
 
+    RememberClient(state);
     LogRelayout(state, L"initial");
     PlaceStrip(state);
+    StackOnActiveLayout(state->frame, &state->natural);
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the stack needs from us.
+//
+// These exist because of the layout-oracle rule: Word lays out only the focused window, so the
+// stack has to take that window's interior and hand it to the others itself. See stack.cpp.
+// ---------------------------------------------------------------------------------------------
+
+BOOL StripHasDocumentFrame(HWND frame)
+{
+    StripState* state = FindByFrame(frame);
+    if (state && state->wwf && IsWindow(state->wwf))
+        return TRUE;
+
+    // Not bound yet - the janitor may not have come round. Ask the window itself rather than
+    // reporting "no document" for what is really "not looked at yet".
+    return FindChildOfClass(frame, kWwfClass) != NULL;
+}
+
+BOOL StripGetNatural(HWND frame, RECT* natural)
+{
+    StripState* state = FindByFrame(frame);
+    if (!state || !state->hasApplied || !natural)
+        return FALSE;
+    *natural = state->natural;
+    return TRUE;
+}
+
+// Give a window the document-frame rect that Word gave the focused one. Sound only because the
+// stack has already made them the same size.
+void StripSetNatural(HWND frame, const RECT* natural)
+{
+    StripState* state = FindByFrame(frame);
+    if (!state || !state->enabled || !natural || !state->wwf || !IsWindow(state->wwf))
+        return;
+
+    RECT applied = *natural;
+    applied.top = natural->top + state->stripH;
+    if ((applied.bottom - applied.top) < (2 * state->stripH))
+        return;
+
+    if (state->hasApplied && SameRect(natural, &state->natural) && SameRect(&applied, &state->applied))
+        return;
+
+    // State first, then move: the WM_WINDOWPOSCHANGING this triggers then sees its own proposal as
+    // already ours and leaves it alone, instead of shifting it a second time.
+    state->natural    = *natural;
+    state->applied    = applied;
+    state->hasApplied = TRUE;
+    RememberClient(state);
+
+    SetWindowPos(state->wwf, NULL,
+                 applied.left, applied.top,
+                 applied.right - applied.left, applied.bottom - applied.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+
+    PlaceStrip(state);
+}
+
+// Refit a window's document frame to the window's *own* current size. Needed when a window leaves
+// the stack and goes back to the size it had before: Word will not lay out a window it is not
+// focused on, so the insets it had are re-applied to the new client area by hand.
+void StripRefit(HWND frame)
+{
+    StripState* state = FindByFrame(frame);
+    if (!state || !state->enabled || !state->hasApplied)
+        return;
+
+    RECT client;
+    if (!GetClientRect(state->frame, &client))
+        return;
+    if (state->clientAtNatural.cx <= 0 || state->clientAtNatural.cy <= 0)
+        return;
+
+    RECT natural;
+    natural.left   = state->natural.left;
+    natural.top    = state->natural.top;
+    natural.right  = (client.right - client.left) - (state->clientAtNatural.cx - state->natural.right);
+    natural.bottom = (client.bottom - client.top) - (state->clientAtNatural.cy - state->natural.bottom);
+
+    if (natural.right <= natural.left || natural.bottom <= natural.top)
+        return;
+
+    StripSetNatural(frame, &natural);
+}
+
+// One window's tab row is every window's tab row, so anything that changes it repaints them all.
+void StripRefreshTabs(void)
+{
+    for (int i = 0; i < g_stripCount; i++)
+    {
+        StripState* state = &g_strips[i];
+        if (state->strip && IsWindow(state->strip))
+            InvalidateRect(state->strip, NULL, FALSE);
+    }
 }
 
 static void TryBind(StripState* state)
@@ -662,6 +890,11 @@ static void TryBind(StripState* state)
 
     state->wwf = wwf;
     state->hasApplied = FALSE;
+
+    // Seeded from what is true now, not left at zero: otherwise the first janitor tick reads a
+    // window that has been visible all along as having just appeared, and re-derives a layout that
+    // did not need re-deriving.
+    state->wasVisible = IsWindowVisible(state->frame) ? TRUE : FALSE;
     state->dpi    = DpiOf(state->frame);
     state->stripH = Scaled(STRIP_LOGICAL_H, state->dpi);
     if (!state->font)
@@ -757,7 +990,27 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
             continue;
         }
 
+        // Hidden -> shown. Everything Word did to this window's layout while it was hidden was
+        // ignored on purpose (see AdjustProposed), so what is there now is Word's own idea of the
+        // layout and is exactly what "natural" means. Re-derive from it rather than carrying
+        // forward a rect from before the window went away.
+        BOOL visible = IsWindowVisible(state->frame) ? TRUE : FALSE;
+        if (visible && !state->wasVisible)
+        {
+            // ApplyInitial does nothing if the document frame is still where we put it, which is
+            // the common case - Word usually hides and shows a window without touching its layout.
+            // It only re-derives when Word actually did rearrange things while we were not looking.
+            state->stripPlaced = FALSE;
+            ApplyInitial(state);
+        }
+        state->wasVisible = visible;
+
         ReadTitle(state);
+
+        // Cheap when nothing has moved - it compares against the strip's real rect and returns.
+        // This is what makes any drift heal within half a second rather than staying wrong.
+        if (visible)
+            PlaceStrip(state);
 
         // The strip belongs with the document frame: shown when it is shown, hidden when Backstage
         // or a minimise takes it away.
@@ -769,6 +1022,11 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
                 ShowWindow(state->strip, wantVisible ? SW_SHOWNA : SW_HIDE);
         }
     }
+
+    // Membership is decided from what is true right now - visible, has a document frame - so it is
+    // re-decided on the same cadence rather than tracked through events that Word does not always
+    // send.
+    StackJanitor();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -801,17 +1059,21 @@ void StripStart(void)
     g_darkTheme = DarkThemeInUse();
     if (g_darkTheme)
     {
-        g_edgeColor = RGB(77, 77, 77);
-        g_textColor = RGB(255, 255, 255);
-        if (!g_backBrush) g_backBrush = CreateSolidBrush(RGB(38, 38, 38));
-        if (!g_tabBrush)  g_tabBrush  = CreateSolidBrush(RGB(66, 66, 66));
+        g_edgeColor     = RGB(77, 77, 77);
+        g_textColor     = RGB(255, 255, 255);
+        g_idleTextColor = RGB(186, 186, 186);
+        if (!g_backBrush)    g_backBrush    = CreateSolidBrush(RGB(38, 38, 38));
+        if (!g_tabBrush)     g_tabBrush     = CreateSolidBrush(RGB(66, 66, 66));
+        if (!g_tabIdleBrush) g_tabIdleBrush = CreateSolidBrush(RGB(45, 45, 45));
     }
     else
     {
-        g_edgeColor = RGB(200, 198, 196);
-        g_textColor = RGB(50, 49, 48);
-        if (!g_backBrush) g_backBrush = CreateSolidBrush(RGB(237, 235, 233));
-        if (!g_tabBrush)  g_tabBrush  = CreateSolidBrush(RGB(255, 255, 255));
+        g_edgeColor     = RGB(200, 198, 196);
+        g_textColor     = RGB(50, 49, 48);
+        g_idleTextColor = RGB(96, 94, 92);
+        if (!g_backBrush)    g_backBrush    = CreateSolidBrush(RGB(237, 235, 233));
+        if (!g_tabBrush)     g_tabBrush     = CreateSolidBrush(RGB(255, 255, 255));
+        if (!g_tabIdleBrush) g_tabIdleBrush = CreateSolidBrush(RGB(225, 223, 221));
     }
     if (!g_edgePen) g_edgePen = CreatePen(PS_SOLID, 1, g_edgeColor);
 

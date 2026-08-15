@@ -200,6 +200,19 @@ function Save-FrameShot($frame, $name) {
 }
 
 # ---- baseline --------------------------------------------------------------------------------
+#
+# Wait for the layout to settle before asserting anything about it. Word spends a second or two
+# after a window appears rearranging its own chrome, and the add-in corrects itself on a
+# half-second cadence, so a measurement taken the instant a `_WwF` exists is measuring the settle
+# rather than the result. The wait is bounded: if it never settles, the assertions run anyway and
+# report what they found.
+
+$settle = (Get-Date).AddSeconds(12)
+while ((Get-Date) -lt $settle) {
+    $layout = Get-Layout $target
+    if ($layout.Strip -and $layout.Wwf -and $layout.Strip.Bottom -eq $layout.Wwf.Top) { break }
+    Start-Sleep -Milliseconds 500
+}
 
 Test-Layout 'Baseline'
 

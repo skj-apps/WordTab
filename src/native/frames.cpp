@@ -61,10 +61,8 @@ static ATOM   g_coordClass  = 0;
 static HWND   g_frames[MAX_FRAMES];
 static int    g_frameCount  = 0;
 
-// The lockstep demonstration's state - see FollowDrag below. Declared up here because the move
-// trace reports on it, and the trace comes first.
-static BOOL   g_followDrag  = TRUE;
-static BOOL   g_inFollow    = FALSE; // re-entry guard: our own SetWindowPos calls come back to us
+// How much of the drag the stack kept up with. Declared here because the move trace reports on it
+// and the trace comes first; fed by the return value of StackOnFramePosChanging.
 static int    g_followCount = 0;     // frames of the drag on which we moved the other windows
 static int    g_followMax   = 0;     // most followers moved in a single frame
 
@@ -246,9 +244,8 @@ static void TraceFlush(void)
 
     // The other half of the point: not only did we see every frame, we acted on every frame.
     LogWrite(L"drag  lockstep: moved %d other frame(s) on %d of %d updates, in the same "
-             L"WM_WINDOWPOSCHANGING%s",
-             g_followMax, g_followCount, updates,
-             g_followDrag ? L"" : L"  (FollowDrag is off)");
+             L"WM_WINDOWPOSCHANGING",
+             g_followMax, g_followCount, updates);
 
     // A short sample of the raw frames, as evidence that the numbers above came from somewhere.
     int show = g_traceCount < 8 ? g_traceCount : 8;
@@ -266,18 +263,6 @@ static void TraceFlush(void)
 }
 
 // ---------------------------------------------------------------------------------------------
-// The lockstep demonstration.
-//
-// Not the stacking engine - that is a later slice. This is the smallest thing that makes the
-// in-process win visible without reading a log: while one frame is dragged, every other frame
-// moves by the same delta, in the same frame, before either is painted. Two Word windows side by
-// side move as one. The out-of-process spike could not do this at all; its workaround was to hide
-// the other windows for the duration of the drag.
-//
-// Switchable at HKCU\Software\WordTab\FollowDrag (default on), so it can be turned off without a
-// rebuild - same shape as ShowLoadBanner.
-// ---------------------------------------------------------------------------------------------
-
 // Declared in wordtab.h and shared with strip.cpp: every switch WordTab has is a DWORD under the
 // same key, and one reader for all of them is one place for the "absent means default" rule.
 BOOL WordTabReadFlag(const wchar_t* name, BOOL defaultValue)
@@ -290,89 +275,6 @@ BOOL WordTabReadFlag(const wchar_t* name, BOOL defaultValue)
         return defaultValue;
     }
     return value != 0;
-}
-
-static void FollowDrag(HWND dragged, const WINDOWPOS* pos)
-{
-    if (!g_followDrag || g_inFollow || !pos)
-        return;
-    if (pos->flags & SWP_NOMOVE)
-        return;
-
-    RECT current;
-    if (!GetWindowRect(dragged, &current))
-        return;
-
-    // Word does not set SWP_NOSIZE while a window is dragged by its caption, even though the size
-    // never changes - measured: every frame of a move drag arrives with flags 0x00080214 and a cx
-    // and cy identical to the window's own. So the flag cannot be trusted to separate a move from
-    // a resize, and the numbers have to be compared instead. Getting this wrong is silent: the
-    // followers simply never move.
-    if (!(pos->flags & SWP_NOSIZE))
-    {
-        LONG width  = current.right - current.left;
-        LONG height = current.bottom - current.top;
-        if (pos->cx != width || pos->cy != height)
-            return;                     // a genuine resize - out of scope for the demonstration
-    }
-
-    LONG dx = pos->x - current.left;
-    LONG dy = pos->y - current.top;
-    if (dx == 0 && dy == 0)
-        return;
-
-    // Snapshot the table: SetWindowPos below re-enters this file, and holding the lock across it
-    // would be a deadlock waiting to happen.
-    HWND followers[MAX_FRAMES];
-    int  count = 0;
-
-    EnsureLock();
-    EnterCriticalSection(&g_lock);
-    for (int i = 0; i < g_frameCount; i++)
-    {
-        HWND candidate = g_frames[i];
-        if (candidate == dragged || !IsWindow(candidate))
-            continue;
-        if (!IsWindowVisible(candidate) || IsIconic(candidate))
-            continue;
-        followers[count++] = candidate;
-    }
-    LeaveCriticalSection(&g_lock);
-
-    if (count == 0)
-        return;
-
-    g_inFollow = TRUE;
-
-    // DeferWindowPos so every window moves in one atomic pass rather than one repaint each. This
-    // is the primitive the stacking engine will want, so it is worth using here.
-    HDWP batch = BeginDeferWindowPos(count);
-    for (int i = 0; i < count; i++)
-    {
-        RECT rect;
-        if (!GetWindowRect(followers[i], &rect))
-            continue;
-
-        if (batch)
-        {
-            batch = DeferWindowPos(batch, followers[i], NULL,
-                                   rect.left + dx, rect.top + dy, 0, 0,
-                                   SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
-        }
-        else
-        {
-            SetWindowPos(followers[i], NULL, rect.left + dx, rect.top + dy, 0, 0,
-                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
-        }
-    }
-    if (batch)
-        EndDeferWindowPos(batch);
-
-    g_followCount++;
-    if (count > g_followMax)
-        g_followMax = count;
-
-    g_inFollow = FALSE;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -416,20 +318,34 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
 
     case WM_WINDOWPOSCHANGING:
         // The hook point that matters. We are handed the *proposed* position, before the move
-        // happens, and may read or change it. This is where the stacking engine will keep every
-        // window together.
-        if (!g_inFollow)
+        // happens, and may read or change it. This is where the stack keeps every window together:
+        // the followers are moved to where this window is *about* to be, in this same message, so
+        // they never lag behind it by even one frame.
+        if (!StackIsSyncing())
         {
             const WINDOWPOS* pos = (const WINDOWPOS*)lParam;
             TraceRecord(msg, pos);
-            if (g_inModalLoop && hwnd == g_modalWindow)
-                FollowDrag(hwnd, pos);
+
+            int moved = StackOnFramePosChanging(hwnd, pos);
+            if (moved > 0)
+            {
+                g_followCount++;
+                if (moved > g_followMax)
+                    g_followMax = moved;
+            }
         }
         break;
 
     case WM_WINDOWPOSCHANGED:
-        if (!g_inFollow)
+        if (!StackIsSyncing())
             TraceRecord(msg, (const WINDOWPOS*)lParam);
+        break;
+
+    case WM_ACTIVATE:
+        // Which window is on top is which tab is selected, and the active window is also the only
+        // one Word will lay out - so this is where the stack's layout oracle changes hands.
+        if (LOWORD(wParam) != WA_INACTIVE)
+            StackOnFrameActivate(hwnd);
         break;
 
     case WM_SIZE:
@@ -467,6 +383,7 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         // not creation and destruction, or it will show tabs for documents that do not exist and
         // miss ones that do.
         LogWrite(L"WM_SHOWWINDOW  hwnd=0x%p  %s", (void*)hwnd, wParam ? L"shown" : L"hidden");
+        StackJanitor();          // membership is decided by what is visible, so re-decide it now
         break;
 
     case WM_DPICHANGED:
@@ -569,15 +486,18 @@ static void AttachFrame(HWND hwnd, const wchar_t* why)
              rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
              total);
 
-    // Give the frame its strip. Done after the log line above so the two read in the order they
-    // happened, and after the subclass so a strip can never exist on a frame we are not watching.
+    // Give the frame its strip, then offer it to the stack. Strip first: the stack decides
+    // membership by asking whether the window has a document frame, which is the strip's business.
     StripAttachFrame(hwnd);
+    StackAttachFrame(hwnd);
 }
 
 static void DetachFrame(HWND hwnd, const wchar_t* why)
 {
-    // First, because it puts Word's layout back and destroys our child window, and both need the
-    // frame to still be in a state where its children can be touched.
+    // Stack first, so the window is out of the tab row before its strip is destroyed. Both need the
+    // frame to still be in a state where its children can be touched, which is why this happens
+    // here rather than after the subclass is removed.
+    StackDetachFrame(hwnd);
     StripDetachFrame(hwnd);
 
     EnsureLock();
@@ -665,12 +585,12 @@ void FramesStart(void)
     LARGE_INTEGER freq;
     g_qpcFreq = QueryPerformanceFrequency(&freq) ? freq.QuadPart : 0;
 
-    g_uiThread   = GetCurrentThreadId();
-    g_followDrag = WordTabReadFlag(L"FollowDrag", TRUE);
+    g_uiThread = GetCurrentThreadId();
 
-    // Before any frame is attached: AttachFrame hands each one to the strip code, which has to be
+    // Before any frame is attached: AttachFrame hands each one to both of these, which have to be
     // ready to receive it.
     StripStart();
+    StackStart();
 
     // A message-only window: no pixels, no taskbar, no z-order. It exists to give the CBT hook
     // somewhere to post to, and it is where the coordinator's timers and state will live later.
@@ -702,9 +622,9 @@ void FramesStart(void)
     // FramesStop; kept separate from the pin above, which never comes back.
     InterlockedIncrement(&g_lockCount);
 
-    LogWrite(L"FramesStart  uiThread=%lu  coordinator=0x%p  cbtHook=%s  followDrag=%d  qpc=%lldHz",
+    LogWrite(L"FramesStart  uiThread=%lu  coordinator=0x%p  cbtHook=%s  qpc=%lldHz",
              g_uiThread, (void*)g_coordinator,
-             g_cbtHook ? L"installed" : L"FAILED", (int)g_followDrag, g_qpcFreq);
+             g_cbtHook ? L"installed" : L"FAILED", g_qpcFreq);
 
     // Whatever already exists. At OnStartupComplete the first frame is created but not yet
     // visible - measured, every run - so this must not filter on IsWindowVisible.
@@ -739,9 +659,11 @@ void FramesStop(void)
         g_cbtHook = NULL;
     }
 
-    // Puts Word's layout back on every frame while the frames are all still alive. After this the
-    // per-frame DetachFrame calls below find nothing left to restore, which is what we want: by
-    // then Word may already be tearing windows down.
+    // Both put Word back the way it was while every frame is still alive: the stack returns each
+    // window to the position it had before it was stacked, then the strip gives back the band it
+    // took. Order matters - the strip refits the document frame to whatever size the window ends
+    // up at, so the windows have to be moved first.
+    StackStop();
     StripStop();
 
     // Detach back-to-front: DetachFrame compacts the table as it goes.
