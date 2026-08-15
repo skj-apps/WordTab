@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- .NET Framework, not modern .NET, and deliberately so: the work rig has no .NET (Core)
+         runtime at all, only Framework 4.8.1. See the project memory for the full reasoning.
+         This builds without Visual Studio via the reference-assemblies package below. -->
+    <TargetFramework>net481</TargetFramework>
+    <OutputType>Library</OutputType>
+    <LangVersion>latest</LangVersion>
+
+    <AssemblyName>WordTab.Connect</AssemblyName>
+    <RootNamespace>WordTab</RootNamespace>
+
+    <!-- Pinned. The COM registration records the assembly's full name, so a version bump here
+         silently breaks activation until install.ps1 is re-run. install.ps1 reads the real name
+         off the built DLL rather than hardcoding it, but keep this fixed regardless. -->
+    <Version>1.0.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+
+    <!-- AnyCPU on purpose. mscoree loads a managed COM server into whatever bitness the host
+         process is, so one binary serves x64 Word; what has to be right is the *registry view*
+         we register into, and install.ps1 handles that. -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
+
+    <!-- Nothing is COM-visible unless it says so explicitly. Only Connect opts in. -->
+    <ComVisible>false</ComVisible>
+    <Deterministic>true</Deterministic>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>
