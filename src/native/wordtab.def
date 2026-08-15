@@ -1,0 +1,9 @@
+; WordTab - the only two entry points COM needs from an in-process server.
+; An explicit .def keeps everything else out of the export table, so the DLL's public surface is
+; exactly what it claims to be. x64 has no stdcall name decoration, so these export verbatim.
+
+LIBRARY WordTab.dll
+
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE

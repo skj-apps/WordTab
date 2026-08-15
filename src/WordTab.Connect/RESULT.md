@@ -1,5 +1,11 @@
 # Slice: get a COM add-in to load into Word
 
+> **SUPERSEDED — this .NET add-in is dead code, kept on purpose.** The working add-in is the
+> native one in `src\native\` (see `src\native\RESULT.md`), which loads into Word and passes.
+> This project is retained because it is the *evidence* for the finding below: anyone inclined to
+> re-litigate "are you sure a .NET add-in cannot work?" can build and install it in about thirty
+> seconds and watch it fail. Do not develop against it.
+
 **Date:** 2026-08-14
 **Outcome:** the add-in does not load, and the reason is architectural rather than a bug.
 **Headline: a managed (.NET) COM server cannot be activated from a per-user HKCU registration.

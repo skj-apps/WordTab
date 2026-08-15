@@ -3,5 +3,8 @@ obj/
 *.user
 *.log
 
+# native build output
+src/native/build/
+
 # per-machine Claude Code settings
 .claude/settings.local.json

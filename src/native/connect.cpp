@@ -1,0 +1,416 @@
+// WordTab - the COM object Word instantiates. This is the entry point for everything WordTab
+// will ever do inside WINWORD.
+//
+// At this stage it only proves it loaded: it logs every callback and shows a one-shot banner.
+// The window work (subclassing OpusApp, shrinking _WwF, painting the strip) comes next and hangs
+// off OnStartupComplete / OnDisconnection.
+//
+// Rule for every callback below: nothing escapes and nothing throws. An error returned or an
+// exception raised across the COM boundary during load makes Word add us to its
+// Resiliency\DisabledItems list, which is silent, sticky, and miserable to diagnose later.
+
+#include "wordtab.h"
+#include <new>
+#include <stdio.h>
+#include <string.h>
+
+static LONG g_bannerShown = 0;
+
+// ---------------------------------------------------------------------------------------------
+// Late-bound helpers for talking to Word's Application object.
+// ---------------------------------------------------------------------------------------------
+
+// Read a property by name off an IDispatch. Returns NULL on any failure - Word declining to
+// answer is information, not an error, and callers print "(?)".
+// Caller frees with SysFreeString.
+static BSTR GetStringProperty(IDispatch* disp, const wchar_t* name)
+{
+    if (!disp)
+        return NULL;
+
+    DISPID dispid = 0;
+    LPOLESTR nameCopy = (LPOLESTR)name;
+    if (FAILED(disp->GetIDsOfNames(IID_NULL, &nameCopy, 1, LOCALE_USER_DEFAULT, &dispid)))
+        return NULL;
+
+    DISPPARAMS noArgs = { NULL, NULL, 0, 0 };
+    VARIANT result;
+    VariantInit(&result);
+
+    HRESULT hr = disp->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT,
+                              DISPATCH_PROPERTYGET, &noArgs, &result, NULL, NULL);
+    if (FAILED(hr))
+    {
+        VariantClear(&result);
+        return NULL;
+    }
+
+    BSTR text = NULL;
+    VARIANT asString;
+    VariantInit(&asString);
+    if (SUCCEEDED(VariantChangeType(&asString, &result, 0, VT_BSTR)))
+        text = SysAllocString(asString.bstrVal ? asString.bstrVal : L"");
+
+    VariantClear(&asString);
+    VariantClear(&result);
+    return text;
+}
+
+// Read Documents.Count. Separate from the above because it is a property on a property.
+static BSTR GetDocumentCount(IDispatch* app)
+{
+    if (!app)
+        return NULL;
+
+    DISPID dispid = 0;
+    LPOLESTR name = (LPOLESTR)L"Documents";
+    if (FAILED(app->GetIDsOfNames(IID_NULL, &name, 1, LOCALE_USER_DEFAULT, &dispid)))
+        return NULL;
+
+    DISPPARAMS noArgs = { NULL, NULL, 0, 0 };
+    VARIANT documents;
+    VariantInit(&documents);
+    if (FAILED(app->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT,
+                           DISPATCH_PROPERTYGET, &noArgs, &documents, NULL, NULL)))
+    {
+        VariantClear(&documents);
+        return NULL;
+    }
+
+    BSTR count = NULL;
+    if (documents.vt == VT_DISPATCH && documents.pdispVal)
+        count = GetStringProperty(documents.pdispVal, L"Count");
+
+    VariantClear(&documents);
+    return count;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The load banner - the visible proof that we are inside Word.
+//
+// Shown on a background thread on purpose. A modal dialog on Word's UI thread during startup
+// would block Word until it is dismissed, and an add-in that can hang its host while proving
+// itself is not proving much. Switch it off with install.ps1 -NoBanner once it has served its
+// purpose; that flips a registry value, so it needs no rebuild.
+// ---------------------------------------------------------------------------------------------
+
+static DWORD WINAPI BannerThread(LPVOID parameter)
+{
+    wchar_t* text = (wchar_t*)parameter;
+    LogWrite(L"banner: thread running, calling MessageBoxW");
+
+    int result = MessageBoxW(NULL, text, L"WordTab",
+                             MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
+
+    LogWrite(L"banner: MessageBoxW returned %d (lastError=%lu)", result, GetLastError());
+    HeapFree(GetProcessHeap(), 0, text);
+    return 0;
+}
+
+static BOOL BannerEnabled(void)
+{
+    DWORD value = 1;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\WordTab", L"ShowLoadBanner",
+                     RRF_RT_REG_DWORD, NULL, &value, &size) != ERROR_SUCCESS)
+    {
+        return TRUE;   // absent means on: a fresh install should announce itself
+    }
+    return value != 0;
+}
+
+static void ShowBannerOnce(enum ext_ConnectMode connectMode)
+{
+    BOOL enabled = BannerEnabled();
+    LogWrite(L"banner: enabled=%d alreadyShown=%d", (int)enabled, (int)g_bannerShown);
+
+    if (!enabled)
+        return;
+    if (InterlockedExchange(&g_bannerShown, 1) != 0)
+        return;
+
+    const SIZE_T kChars = 1024;
+    wchar_t* text = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, kChars * sizeof(wchar_t));
+    if (!text)
+    {
+        LogWrite(L"banner: HeapAlloc failed");
+        return;
+    }
+
+    wchar_t modulePath[MAX_PATH] = L"(unknown)";
+    GetModuleFileNameW(g_module, modulePath, MAX_PATH);
+
+    _snwprintf(text, kChars,
+               L"WordTab is loaded inside Word.\r\n\r\n"
+               L"native build, no .NET runtime in this process\r\n"
+               L"connect mode: %d\r\n"
+               L"module: %s\r\n"
+               L"log: %s",
+               (int)connectMode, modulePath, LogFilePath());
+    text[kChars - 1] = L'\0';
+
+    HANDLE thread = CreateThread(NULL, 0, BannerThread, text, 0, NULL);
+    if (thread)
+    {
+        LogWrite(L"banner: thread created");
+        CloseHandle(thread);
+    }
+    else
+    {
+        LogWrite(L"banner: CreateThread failed (lastError=%lu)", GetLastError());
+        HeapFree(GetProcessHeap(), 0, text);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The object itself.
+// ---------------------------------------------------------------------------------------------
+
+class Connect : public IDTExtensibility2
+{
+public:
+    Connect() : m_refCount(1), m_application(NULL), m_addInInst(NULL)
+    {
+        InterlockedIncrement(&g_objectCount);
+    }
+
+    virtual ~Connect()
+    {
+        ReleaseHostObjects();
+        InterlockedDecrement(&g_objectCount);
+    }
+
+    // -- IUnknown ------------------------------------------------------------------------------
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv)
+    {
+        if (!ppv)
+            return E_POINTER;
+        *ppv = NULL;
+
+        // One vtable serves all three. IDTExtensibility2 derives from IDispatch, so a caller that
+        // asks for either gets something it can use, whichever way it decides to call us.
+        if (IsEqualIID(riid, IID_IUnknown) ||
+            IsEqualIID(riid, IID_IDispatch) ||
+            IsEqualIID(riid, IID_IDTExtensibility2))
+        {
+            *ppv = static_cast<IDTExtensibility2*>(this);
+            AddRef();
+            return S_OK;
+        }
+
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef()
+    {
+        return (ULONG)InterlockedIncrement(&m_refCount);
+    }
+
+    ULONG STDMETHODCALLTYPE Release()
+    {
+        LONG remaining = InterlockedDecrement(&m_refCount);
+        if (remaining == 0)
+        {
+            this->~Connect();
+            HeapFree(GetProcessHeap(), 0, this);
+        }
+        return (ULONG)remaining;
+    }
+
+    // -- IDispatch -----------------------------------------------------------------------------
+    //
+    // No type library, so no type info. Word does not need it: it knows IDTExtensibility2's
+    // DISPIDs, and GetIDsOfNames below covers a caller that works by name instead.
+
+    HRESULT STDMETHODCALLTYPE GetTypeInfoCount(UINT* count)
+    {
+        if (!count)
+            return E_POINTER;
+        *count = 0;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetTypeInfo(UINT, LCID, ITypeInfo** typeInfo)
+    {
+        if (typeInfo)
+            *typeInfo = NULL;
+        return E_NOTIMPL;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetIDsOfNames(REFIID, LPOLESTR* names, UINT nameCount,
+                                            LCID, DISPID* dispIds)
+    {
+        if (!names || !dispIds)
+            return E_POINTER;
+
+        HRESULT result = S_OK;
+        for (UINT i = 0; i < nameCount; i++)
+        {
+            dispIds[i] = DISPID_UNKNOWN;
+            if      (_wcsicmp(names[i], L"OnConnection")      == 0) dispIds[i] = DISPID_OnConnection;
+            else if (_wcsicmp(names[i], L"OnDisconnection")   == 0) dispIds[i] = DISPID_OnDisconnection;
+            else if (_wcsicmp(names[i], L"OnAddInsUpdate")    == 0) dispIds[i] = DISPID_OnAddInsUpdate;
+            else if (_wcsicmp(names[i], L"OnStartupComplete") == 0) dispIds[i] = DISPID_OnStartupComplete;
+            else if (_wcsicmp(names[i], L"OnBeginShutdown")   == 0) dispIds[i] = DISPID_OnBeginShutdown;
+            else result = DISP_E_UNKNOWNNAME;
+        }
+        return result;
+    }
+
+    // Route a by-DISPID call to the same methods the vtable path uses, so it cannot matter which
+    // way Word chooses to call us. Arguments arrive in DISPPARAMS in reverse order.
+    HRESULT STDMETHODCALLTYPE Invoke(DISPID dispId, REFIID, LCID, WORD flags,
+                                     DISPPARAMS* params, VARIANT*, EXCEPINFO*, UINT*)
+    {
+        if (!(flags & DISPATCH_METHOD))
+            return DISP_E_MEMBERNOTFOUND;
+
+        UINT argCount = params ? params->cArgs : 0;
+        VARIANT* args = params ? params->rgvarg : NULL;
+
+        LogWrite(L"Invoke  dispid=%d argc=%u  (Word is calling us by DISPID, not vtable)",
+                 (int)dispId, argCount);
+
+        switch (dispId)
+        {
+        case DISPID_OnConnection:
+        {
+            // (application, connectMode, addInInst, custom) reversed => [3],[2],[1],[0]
+            IDispatch* application = (argCount >= 4 && args[3].vt == VT_DISPATCH) ? args[3].pdispVal : NULL;
+            long mode = (argCount >= 3 && args[2].vt == VT_I4) ? args[2].lVal : 0;
+            IDispatch* addInInst = (argCount >= 2 && args[1].vt == VT_DISPATCH) ? args[1].pdispVal : NULL;
+            return OnConnection(application, (enum ext_ConnectMode)mode, addInInst, NULL);
+        }
+        case DISPID_OnDisconnection:
+        {
+            long mode = (argCount >= 2 && args[1].vt == VT_I4) ? args[1].lVal : 0;
+            return OnDisconnection((enum ext_DisconnectMode)mode, NULL);
+        }
+        case DISPID_OnAddInsUpdate:    return OnAddInsUpdate(NULL);
+        case DISPID_OnStartupComplete: return OnStartupComplete(NULL);
+        case DISPID_OnBeginShutdown:   return OnBeginShutdown(NULL);
+        default:                       return DISP_E_MEMBERNOTFOUND;
+        }
+    }
+
+    // -- IDTExtensibility2 ---------------------------------------------------------------------
+
+    HRESULT STDMETHODCALLTYPE OnConnection(IDispatch* application, enum ext_ConnectMode connectMode,
+                                           IDispatch* addInInst, SAFEARRAY**)
+    {
+        ReleaseHostObjects();
+
+        m_application = application;
+        if (m_application) m_application->AddRef();
+        m_addInInst = addInInst;
+        if (m_addInInst) m_addInInst->AddRef();
+
+        // Interrogating the Application object is the proof we are talking to the real Word
+        // rather than merely having been instantiated. The build number should match the one
+        // recorded for this rig.
+        BSTR name    = GetStringProperty(application, L"Name");
+        BSTR version = GetStringProperty(application, L"Version");
+        BSTR build   = GetStringProperty(application, L"Build");
+        BSTR docs    = GetDocumentCount(application);
+
+        LogWrite(L"OnConnection  mode=%d  app=%s version=%s build=%s documents=%s",
+                 (int)connectMode,
+                 name    ? name    : L"(?)",
+                 version ? version : L"(?)",
+                 build   ? build   : L"(?)",
+                 docs    ? docs    : L"(?)");
+
+        SysFreeString(name);
+        SysFreeString(version);
+        SysFreeString(build);
+        SysFreeString(docs);
+
+        ShowBannerOnce(connectMode);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnStartupComplete(SAFEARRAY**)
+    {
+        // Word's UI exists by now - or nearly. This is where the window work will start, so log
+        // what we can see: the OpusApp windows this process owns, and whether they are visible
+        // yet. Visibility matters because "the window exists but is still hidden at
+        // OnStartupComplete" and "the window does not exist" need different handling, and the
+        // next slice has to know which one it is dealing with.
+        int total = 0;
+        int visible = 0;
+        HWND first = NULL;
+        HWND window = NULL;
+
+        while ((window = FindWindowExW(NULL, window, L"OpusApp", NULL)) != NULL)
+        {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(window, &pid);
+            if (pid != GetCurrentProcessId())
+                continue;
+
+            total++;
+            if (!first)
+                first = window;
+            if (IsWindowVisible(window))
+                visible++;
+        }
+
+        LogWrite(L"OnStartupComplete  OpusApp windows: total=%d visible=%d first=0x%p",
+                 total, visible, (void*)first);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnAddInsUpdate(SAFEARRAY**)
+    {
+        LogWrite(L"OnAddInsUpdate");
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnBeginShutdown(SAFEARRAY**)
+    {
+        LogWrite(L"OnBeginShutdown");
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDisconnection(enum ext_DisconnectMode removeMode, SAFEARRAY**)
+    {
+        LogWrite(L"OnDisconnection  mode=%d", (int)removeMode);
+
+        // ext_dm_UserClosed means Word keeps running without us, so teardown has to be real.
+        // Once this class owns window state, undoing it belongs here and must not rely on the
+        // process exiting.
+        ReleaseHostObjects();
+        return S_OK;
+    }
+
+private:
+    void ReleaseHostObjects()
+    {
+        if (m_addInInst)   { m_addInInst->Release();   m_addInInst = NULL; }
+        if (m_application) { m_application->Release(); m_application = NULL; }
+    }
+
+    LONG m_refCount;
+    IDispatch* m_application;
+    IDispatch* m_addInInst;
+};
+
+// Allocated from the process heap with placement new rather than the CRT's operator new: no
+// exceptions to leak across the COM boundary and no C++ runtime dependency in the DLL.
+HRESULT WordTabCreateConnect(REFIID riid, void** ppv)
+{
+    if (!ppv)
+        return E_POINTER;
+    *ppv = NULL;
+
+    void* storage = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(Connect));
+    if (!storage)
+        return E_OUTOFMEMORY;
+
+    Connect* object = new (storage) Connect();
+
+    HRESULT hr = object->QueryInterface(riid, ppv);
+    object->Release();          // drop the construction reference; QI took its own on success
+    return hr;
+}
