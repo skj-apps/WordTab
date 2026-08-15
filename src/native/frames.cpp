@@ -348,6 +348,18 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             StackOnFrameActivate(hwnd);
         break;
 
+    case WM_ENABLE:
+        // A modal dialog disables the window that owns it, and EnableWindow sends this. So this is
+        // Word putting a question to the user about this document, and taking it away again -
+        // delivered as an event rather than something to be noticed by looking.
+        //
+        // That distinction is the whole reason this case exists. The batch close first tried to
+        // spot the save prompt by testing IsWindowEnabled on the janitor's half-second tick, and a
+        // prompt that came and went inside one tick was invisible to it - which a script does
+        // routinely and an impatient user will do eventually. A message cannot be missed.
+        StackOnFrameEnable(hwnd, wParam ? TRUE : FALSE);
+        break;
+
     case WM_SIZE:
         // Logged unconditionally *outside* a drag only: inside one it floods, and the trace has it
         // covered anyway. The maximize/restore state carried here is the thing spike 2 could not

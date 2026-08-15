@@ -112,6 +112,14 @@ HRESULT WordTabCreateConnect(REFIID riid, void** ppv);
 // Returns FALSE if Word declined or there is no Application - it never throws and never blocks.
 BOOL WordTabNewDocument(void);
 
+// Save the document behind a tab, through Word's own Document.Save - so an unchanged document is
+// untouched and one that has never been saved gets Word's Save As dialog, exactly as Ctrl+S would.
+//
+// `frame` must already be the window Word considers active. This does not activate it: it *checks*
+// that Word agrees, and saves nothing if it does not. Saving the wrong document is the one failure
+// in this add-in that reaches the user's data, so it is made impossible rather than unlikely.
+BOOL WordTabSaveDocument(HWND frame);
+
 // ---------------------------------------------------------------------------------------------
 // Frame windows - the in-process subclass of Word's OpusApp frames. See frames.cpp.
 //
@@ -156,6 +164,11 @@ void StackAttachFrame(HWND frame);
 void StackDetachFrame(HWND frame);
 void StackOnFrameActivate(HWND frame);
 void StackOnFrameSize(HWND frame, WPARAM sizeType);
+
+// A frame has been disabled or re-enabled, which is what a modal dialog does to the window that
+// owns it. The batch close needs this as an *event*: a save prompt can come and go inside one
+// janitor tick, and one that is never seen is one that is never waited for.
+void StackOnFrameEnable(HWND frame, BOOL enabled);
 void StackJanitor(void);
 void StackStop(void);
 
@@ -187,6 +200,16 @@ void StackActivate(HWND frame);
 // about where a modal save prompt ends up in the z-order - and returns the user to the tab they were
 // on if it was not the one they closed.
 void StackCloseTab(HWND frame);
+
+// Close every tab but one, or every tab. Deliberately not a loop over StackCloseTab: any of those
+// closes can raise Word's own save prompt, and six prompts stacked on top of each other for
+// documents the user cannot see is not a feature. The batch runs one close at a time, stepped by
+// the janitor, and a prompt the user cancels abandons the rest of it. See the definitions.
+//
+// `anyTab` is the frame the command came from, and is only used when there is no stack to enumerate
+// - stacking switched off, or a lone window - where "close all" means that one document.
+void StackCloseOthers(HWND keep);
+void StackCloseAll(HWND anyTab);
 
 // Read a DWORD switch from HKCU\Software\WordTab as a boolean. Absent means the default, so a
 // fresh install behaves like a configured one. Used for the switches that must be flippable

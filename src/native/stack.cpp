@@ -44,6 +44,8 @@ struct Member
 };
 
 static void Reconcile(void);
+static void CloseBatchStep(void);
+static void CloseBatchEnd(const wchar_t* why);
 
 static Member g_members[MAX_MEMBERS];
 static int    g_memberCount = 0;      // frames we know about, joined or not
@@ -664,6 +666,10 @@ void StackJanitor(void)
             StackOnFrameActivate(foreground);
     }
 
+    // After the membership pass above, deliberately: whether the tab we asked Word to close has
+    // actually gone is a membership question, and this reads the answer that loop just wrote.
+    CloseBatchStep();
+
     Reconcile();
 }
 
@@ -740,6 +746,10 @@ void StackStop(void)
     if (!g_started)
         return;
     g_started = FALSE;
+
+    // Before anything is put back: a queue of tabs still to close is a queue of WM_CLOSEs about to
+    // be posted to windows we are in the middle of letting go of.
+    CloseBatchEnd(L"abandoned - the add-in is shutting down");
 
     for (int i = 0; i < g_memberCount; i++)
         Leave(&g_members[i], L"shutdown", TRUE);
@@ -853,4 +863,237 @@ void StackCloseTab(HWND frame)
              g_returnTo ? L" (a background one - will return to where the user was)" : L"");
 
     PostMessageW(frame, WM_CLOSE, 0, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Closing several tabs at once.
+//
+// "Close Others" and "Close All" are not a loop over StackCloseTab, and the reason is the save
+// prompt. Every close may raise one; it is modal, it runs its own message loop, and it is the user's
+// question to answer. Post WM_CLOSE to six windows at once and the second prompt arrives on top of
+// the first, for a document the user cannot see behind it - and "Cancel" on the first one closes the
+// other five anyway, which is the opposite of what cancel means.
+//
+// So a batch is a queue with exactly one close in flight, stepped by the janitor. Each tick sorts
+// the in-flight tab into one of these states:
+//
+//   - it is out of the tab row      -> it closed; start the next one
+//   - Word is asking about it       -> wait, for as long as it takes. Someone typing a filename into
+//                                      Save As is not a hang, so this state has no timeout at all
+//   - it was asked about, the
+//     question has gone, and the
+//     document is still here        -> the user answered and said no. Abandon the rest of the batch
+//   - nothing has happened yet      -> wait, but not forever
+//
+// **The third state requires having seen the question**, and seeing it is the subtle part. The
+// first version concluded "declined" from "still open two ticks after WM_CLOSE", and the log caught
+// it doing so one second after posting the close, before the prompt had even appeared: Word is
+// slower than that, so "still open" on its own is evidence of nothing. The second version required
+// the question but looked for it on the janitor's tick - and a prompt that went up and came down
+// inside half a second was never seen at all, so the batch decided nothing had happened. Both
+// passed every assertion that watched from outside.
+//
+// So the question is heard as an **event**: a modal dialog disables the window that owns it, and
+// EnableWindow sends WM_ENABLE, which the frame subclass hands to StackOnFrameEnable below. A
+// message cannot be missed by being quick. The poll is kept as well, for a dialog that is modal
+// without disabling anything, but nothing depends on it alone.
+//
+// The grace after the question disappears is for the other direction: "Save" dismisses the dialog
+// and *then* writes the file and closes the document, and concluding "declined" in that gap would
+// stop a batch the user had just agreed to. Waiting costs nothing - a document that does close is
+// caught by the first state on an earlier tick.
+// ---------------------------------------------------------------------------------------------
+
+#define CLOSE_TICKS_AFTER_ANSWER  6     // ~3s for Word to write the file and close the document
+#define CLOSE_TICKS_NO_ANSWER    24     // ~12s of nothing at all before giving up on a tab
+
+static HWND g_closeQueue[MAX_MEMBERS];
+static int  g_closeCount  = 0;      // how many were queued
+static int  g_closeNext   = 0;      // where the queue has got to
+static HWND g_closeFlight = NULL;   // the one WM_CLOSE is out for
+static BOOL g_closeAsked  = FALSE;  // Word has put a question up about it at some point
+static int  g_closeIdle   = 0;      // consecutive ticks with no question and no progress
+
+// The event half of "Word is asking about this one", and the half that can be relied on. A modal
+// dialog disables the window that owns it, and EnableWindow sends WM_ENABLE - so the frame's
+// subclass hears about the prompt going up whether or not anything happens to be looking at that
+// moment. See the poll below for why that matters.
+void StackOnFrameEnable(HWND frame, BOOL enabled)
+{
+    if (!g_closeFlight || frame != g_closeFlight || enabled)
+        return;
+
+    if (!g_closeAsked)
+    {
+        g_closeAsked = TRUE;
+        g_closeIdle  = 0;
+        LogWrite(L"stack  hwnd=0x%p  Word is asking the user about this document (the window was "
+                 L"disabled) - the batch waits", (void*)frame);
+    }
+}
+
+// The poll half, kept as well as the event and not instead of it. A dialog that is modal by some
+// other means than disabling its owner would produce no WM_ENABLE, and this catches it: Word's
+// prompts are top-level windows of this process that are not `OpusApp` frames. Neither signal alone
+// covers the ground, and the cost of both is two API calls twice a second.
+static BOOL WordIsAsking(HWND target)
+{
+    if (target && IsWindow(target) && !IsWindowEnabled(target))
+        return TRUE;
+
+    HWND foreground = GetForegroundWindow();
+    if (!foreground)
+        return FALSE;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(foreground, &pid);
+    if (pid != GetCurrentProcessId())
+        return FALSE;               // another application entirely - not ours to interpret
+
+    wchar_t cls[64] = L"";
+    GetClassNameW(foreground, cls, 64);
+    return _wcsicmp(cls, L"OpusApp") != 0;
+}
+
+static void CloseBatchEnd(const wchar_t* why)
+{
+    if (g_closeCount == 0 && !g_closeFlight)
+        return;
+
+    int left = g_closeCount - g_closeNext;
+    LogWrite(L"stack  close batch %s (%d tab(s) left unclosed)", why, left > 0 ? left : 0);
+
+    g_closeCount  = 0;
+    g_closeNext   = 0;
+    g_closeFlight = NULL;
+    g_closeAsked  = FALSE;
+    g_closeIdle   = 0;
+}
+
+static void CloseBatchStep(void)
+{
+    if (g_closeFlight)
+    {
+        Member* member = Find(g_closeFlight);
+        BOOL stillATab = (member && member->joined && EligibleToStay(g_closeFlight)) ? TRUE : FALSE;
+
+        if (!stillATab)
+        {
+            g_closeFlight = NULL;
+            g_closeAsked  = FALSE;
+            g_closeIdle   = 0;
+        }
+        else if (WordIsAsking(g_closeFlight))
+        {
+            if (!g_closeAsked)
+            {
+                g_closeAsked = TRUE;
+                LogWrite(L"stack  hwnd=0x%p  Word is asking the user about this document "
+                         L"(seen by the janitor) - the batch waits", (void*)g_closeFlight);
+            }
+            g_closeIdle = 0;
+            return;
+        }
+        else if (++g_closeIdle < (g_closeAsked ? CLOSE_TICKS_AFTER_ANSWER : CLOSE_TICKS_NO_ANSWER))
+        {
+            return;
+        }
+        else if (g_closeAsked)
+        {
+            CloseBatchEnd(L"stopped - the question was answered and the document is still open, "
+                          L"so the user declined");
+            return;
+        }
+        else
+        {
+            CloseBatchEnd(L"stopped - WM_CLOSE produced neither a closed document nor a question");
+            return;
+        }
+    }
+
+    while (g_closeNext < g_closeCount)
+    {
+        HWND next = g_closeQueue[g_closeNext++];
+        Member* member = Find(next);
+
+        // It may have closed on its own while it waited its turn - the user's own close button, or
+        // Word recycling the frame. Membership now is the only thing that decides.
+        if (!member || !member->joined || !IsWindow(next))
+            continue;
+
+        g_closeFlight = next;
+        g_closeAsked  = FALSE;
+        g_closeIdle   = 0;
+        StackCloseTab(next);
+        return;
+    }
+
+    if (g_closeCount > 0)
+        CloseBatchEnd(L"finished");
+}
+
+// Queue every joined tab except `keep`, **with the active one last**. The user keeps looking at the
+// document they were on for as long as the batch allows, and the last prompt they answer is about
+// the document they were actually reading rather than one they have never seen.
+static void CloseBatchStart(HWND keep, const wchar_t* what)
+{
+    CloseBatchEnd(L"replaced");
+
+    for (int i = 0; i < g_memberCount; i++)
+    {
+        HWND frame = g_members[i].frame;
+        if (!g_members[i].joined || frame == keep || frame == g_active)
+            continue;
+        if (g_closeCount < MAX_MEMBERS)
+            g_closeQueue[g_closeCount++] = frame;
+    }
+
+    if (g_active && g_active != keep && g_closeCount < MAX_MEMBERS)
+    {
+        Member* member = Find(g_active);
+        if (member && member->joined)
+            g_closeQueue[g_closeCount++] = g_active;
+    }
+
+    LogWrite(L"stack  %s: %d tab(s) queued, one at a time", what, g_closeCount);
+    CloseBatchStep();
+}
+
+void StackCloseOthers(HWND keep)
+{
+    Member* member = Find(keep);
+    if (!g_enabled || !member || !member->joined)
+    {
+        LogWrite(L"stack  hwnd=0x%p  close others: not a tab in a stack - nothing to close",
+                 (void*)keep);
+        return;
+    }
+
+    if (JoinedCount() < 2)
+    {
+        LogWrite(L"stack  hwnd=0x%p  close others: it is the only tab", (void*)keep);
+        return;
+    }
+
+    // The kept tab first, so it is where the user is left standing between one close and the next -
+    // g_returnTo is set from whatever is active when each close begins, and that should be the tab
+    // they chose to keep rather than whichever document happened to be closing before it.
+    StackActivate(keep);
+    CloseBatchStart(keep, L"close others");
+}
+
+void StackCloseAll(HWND anyTab)
+{
+    Member* member = Find(anyTab);
+    if (!g_enabled || !member || !member->joined)
+    {
+        // No stack to enumerate - stacking switched off, or a window that never joined. Its strip
+        // shows exactly one tab, so "close all" means that one document and there is no batch.
+        LogWrite(L"stack  hwnd=0x%p  close all: not in a stack, so this is its one document",
+                 (void*)anyTab);
+        StackCloseTab(anyTab);
+        return;
+    }
+
+    CloseBatchStart(NULL, L"close all");
 }

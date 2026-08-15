@@ -46,6 +46,7 @@ public static class WordLayout
     const uint INPUT_MOUSE = 0, INPUT_KEYBOARD = 1, KEYEVENTF_KEYUP = 2;
     const uint MOUSEEVENTF_MOVE = 0x0001, MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004;
     const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020, MOUSEEVENTF_MIDDLEUP = 0x0040;
+    const uint MOUSEEVENTF_RIGHTDOWN = 0x0008, MOUSEEVENTF_RIGHTUP = 0x0010;
     const uint MOUSEEVENTF_ABSOLUTE = 0x8000, MOUSEEVENTF_VIRTUALDESK = 0x4000;
     public const int SW_MAXIMIZE = 3, SW_RESTORE = 9;
     const uint SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010, SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001;
@@ -450,6 +451,125 @@ public static class WordLayout
         Thread.Sleep(120);
         Move(x2, y2, MOUSEEVENTF_LEFTUP);
         Thread.Sleep(250);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Popup menus, read from outside the process that owns them.
+    //
+    // A menu is not a window with children that can be enumerated - the items live in an HMENU, and
+    // the window on screen (class #32768) only draws them. MN_GETHMENU is the documented way across:
+    // send it to that window and it answers with the HMENU, and menu handles live in the shared user
+    // handle table, so GetMenuString and friends read them from any process. This is how a menu can
+    // be asserted item by item rather than photographed and eyeballed.
+    // ---------------------------------------------------------------------------------------------
+
+    [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
+    [DllImport("user32.dll")] static extern int GetMenuItemCount(IntPtr menu);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetMenuString(IntPtr menu, uint item, StringBuilder text, int max, uint flags);
+    [DllImport("user32.dll")] static extern uint GetMenuState(IntPtr menu, uint item, uint flags);
+    [DllImport("user32.dll")] static extern bool GetMenuItemRect(IntPtr hwnd, IntPtr menu, uint item, out RECT rect);
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
+
+    const uint MN_GETHMENU = 0x01E1, SMTO_ABORTIFHUNG = 0x0002;
+    const uint MF_BYPOSITION = 0x0400, MF_GRAYED = 0x0001, MF_DISABLED = 0x0002, MF_SEPARATOR = 0x0800;
+
+    public class MenuItem
+    {
+        public int Index;
+        public uint Id;
+        public string Text;          // "-" for a separator
+        public bool Enabled;
+        public bool Separator;
+        public RECT Rect;            // screen coordinates, empty if the menu is not on screen
+        public bool HasRect;
+    }
+
+    // The popup menu currently on screen for a process, or IntPtr.Zero. Visible-only: Windows keeps
+    // menu windows around after they close, and a hidden one is a menu that is not being shown.
+    public static IntPtr PopupMenuWindow(int pid)
+    {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr hwnd, IntPtr param)
+        {
+            uint owner;
+            GetWindowThreadProcessId(hwnd, out owner);
+            if (pid != 0 && owner != (uint)pid) return true;
+
+            StringBuilder cls = new StringBuilder(64);
+            GetClassName(hwnd, cls, 64);
+            if (cls.ToString() == "#32768" && IsWindowVisible(hwnd)) { found = hwnd; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+
+    public static IntPtr MenuOf(IntPtr menuWindow)
+    {
+        IntPtr result;
+        if (SendMessageTimeout(menuWindow, MN_GETHMENU, IntPtr.Zero, IntPtr.Zero,
+                               SMTO_ABORTIFHUNG, 2000, out result) == IntPtr.Zero)
+            return IntPtr.Zero;
+        return result;
+    }
+
+    // Every item, in order, with the separators kept in: a menu is as much about how it is grouped
+    // as about what is on it, and a check that silently dropped the separators could not tell the
+    // difference between "Close All" next to "New Document" and a rule between them.
+    public static List<MenuItem> MenuItems(IntPtr menuWindow, IntPtr owner)
+    {
+        List<MenuItem> items = new List<MenuItem>();
+        IntPtr menu = MenuOf(menuWindow);
+        if (menu == IntPtr.Zero) return items;
+
+        int count = GetMenuItemCount(menu);
+        for (int i = 0; i < count; i++)
+        {
+            uint state = GetMenuState(menu, (uint)i, MF_BYPOSITION);
+            MenuItem item = new MenuItem();
+            item.Index = i;
+            item.Separator = (state & MF_SEPARATOR) != 0;
+            item.Enabled = (state & (MF_GRAYED | MF_DISABLED)) == 0;
+
+            StringBuilder text = new StringBuilder(128);
+            GetMenuString(menu, (uint)i, text, 128, MF_BYPOSITION);
+            item.Text = item.Separator ? "-" : text.ToString();
+            item.Id = item.Separator ? 0 : (uint)GetMenuItemID(menu, i);
+
+            RECT r;
+            item.HasRect = GetMenuItemRect(owner, menu, (uint)i, out r);
+            item.Rect = r;
+            items.Add(item);
+        }
+        return items;
+    }
+
+    [DllImport("user32.dll")] static extern uint GetMenuItemID(IntPtr menu, int pos);
+
+    // Whether a window is accepting input. A modal dialog disables the window that owns it, which is
+    // how the add-in tells "Word is asking the user something" from "the user said no".
+    public static bool Enabled(IntPtr hwnd) { return IsWindowEnabled(hwnd); }
+
+    public static void RightClick(int x, int y)
+    {
+        Move(x, y, 0);
+        Thread.Sleep(150);
+        Move(x, y, MOUSEEVENTF_RIGHTDOWN);
+        Thread.Sleep(80);
+        Move(x, y, MOUSEEVENTF_RIGHTUP);
+        Thread.Sleep(400);
+    }
+
+    // Right-press on one point and release on another - the gesture that must produce no menu.
+    public static void RightPressAndSlideOff(int x1, int y1, int x2, int y2)
+    {
+        Move(x1, y1, 0);
+        Thread.Sleep(150);
+        Move(x1, y1, MOUSEEVENTF_RIGHTDOWN);
+        Thread.Sleep(120);
+        Move(x2, y2, 0);
+        Thread.Sleep(120);
+        Move(x2, y2, MOUSEEVENTF_RIGHTUP);
+        Thread.Sleep(350);
     }
 
     // PW_RENDERFULLCONTENT (2) so a window that is partly off-screen or occluded still prints.

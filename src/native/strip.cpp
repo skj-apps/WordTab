@@ -58,10 +58,19 @@
 // and never waits for a release.
 enum { HIT_NONE = 0, HIT_TAB, HIT_CLOSE, HIT_PLUS };
 
-// Posted to a strip so that a new document is made after the click handler has returned. Calling
+// Posted to a strip so that a command runs after the handler that raised it has returned. Calling
 // into Word's object model from inside our own window procedure would re-enter it: Documents.Add
-// creates a window and pumps messages, and some of those messages are ours.
-#define WM_WORDTAB_NEWDOC  (WM_APP + 10)
+// creates a window and pumps messages, Document.Save can put up a dialog that runs its own message
+// loop, and some of those messages are ours.
+//
+//   WM_WORDTAB_CMD   wParam = CMD_*, lParam = the tab it is about (NULL for the ones that are not)
+//   WM_WORDTAB_SAVE  lParam = the tab, once it has been activated and Word has processed that
+#define WM_WORDTAB_CMD   (WM_APP + 10)
+#define WM_WORDTAB_SAVE  (WM_APP + 11)
+
+// The menu's command ids, which are also the ids TrackPopupMenu hands back. They start at 1 because
+// TPM_RETURNCMD answers 0 for "the user dismissed it without choosing".
+enum { CMD_NEW = 1, CMD_SAVE, CMD_CLOSE, CMD_CLOSE_OTHERS, CMD_CLOSE_ALL };
 
 static const wchar_t* const kWwfClass    = L"_WwF";
 static const wchar_t* const kStripClass  = L"WordTabStrip";
@@ -121,6 +130,9 @@ struct StripState
     int   pressKind;      // a left press on a close or new button, waiting for its release
     HWND  pressFrame;
     HWND  middleFrame;    // a middle press on a tab, likewise
+    BOOL  rightDown;      // a right press, waiting to become a context menu on release
+    HWND  rightFrame;     // ...and the tab it landed on, NULL for the empty part of the strip
+    HWND  menuFrame;      // the tab a context menu is open for, kept lit while it is up
     BOOL  tracking;       // TrackMouseEvent armed, so WM_MOUSELEAVE will arrive
 
     wchar_t title[256];
@@ -149,6 +161,7 @@ static StripState g_strips[MAX_STRIPS];
 static int  g_stripCount = 0;
 static BOOL g_stripEnabled = TRUE;
 static BOOL g_buttonsEnabled = TRUE;     // HKCU\Software\WordTab\TabButtons
+static BOOL g_menuEnabled = TRUE;        // HKCU\Software\WordTab\TabMenu
 static ATOM g_stripClass = 0;
 static UINT_PTR g_janitor = 0;
 
@@ -836,8 +849,12 @@ static void DrawStrip(StripState* state, HDC dc, const RECT* client)
             tab.right = client->right;
 
         BOOL selected = (i == activeIndex);
-        BOOL hotTab   = (state->hotFrame == frames[i]) &&
-                        (state->hotKind == HIT_TAB || state->hotKind == HIT_CLOSE);
+
+        // A tab with its context menu open is drawn hot for as long as the menu is up, which is
+        // the only thing on screen saying which document those commands are about.
+        BOOL hotTab   = ((state->hotFrame == frames[i]) &&
+                         (state->hotKind == HIT_TAB || state->hotKind == HIT_CLOSE)) ||
+                        (state->menuFrame && state->menuFrame == frames[i]);
 
         HBRUSH fill = selected ? g_tabBrush : (hotTab ? g_tabHotBrush : g_tabIdleBrush);
         FillRect(dc, &tab, fill);
@@ -933,6 +950,99 @@ static void PaintStrip(StripState* state, HWND hwnd)
     if (mem) DeleteDC(mem);
 
     EndPaint(hwnd, &ps);
+}
+
+// The context menu.
+//
+// A plain Win32 popup, built and thrown away each time it is shown, because everything on it depends
+// on what is true at that instant: how many tabs there are, and whether the pointer was over one.
+// There is no menu to keep in sync with the tab row if there is no menu between right-clicks.
+//
+// TPM_RETURNCMD is what makes this small. The chosen id comes back as the return value, so there is
+// no WM_COMMAND to route, no id space to keep clear of Word's own thousands of command ids, and no
+// window that has to still exist by the time a command arrives.
+//
+// **Nothing is done from inside here.** TrackPopupMenu runs a modal loop - Word's timers fire, the
+// janitor runs, documents can open and close - so by the time it returns, the state this function
+// started with may be gone, including `state` itself and the strip window. The command is posted and
+// acted on in a fresh message, where everything is looked up again.
+static void ShowTabMenu(HWND hwnd, POINT client, HWND target)
+{
+    StripState* state = (StripState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!state)
+        return;
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu)
+        return;
+
+    int count = StackTabs(state->frame, NULL, MAX_TABS, NULL);
+
+    if (target)
+    {
+        AppendMenuW(menu, MF_STRING, CMD_SAVE, L"&Save");
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(menu, MF_STRING, CMD_CLOSE, L"&Close");
+        AppendMenuW(menu, MF_STRING | (count > 1 ? MF_ENABLED : MF_GRAYED),
+                    CMD_CLOSE_OTHERS, L"Close &Others");
+        AppendMenuW(menu, MF_STRING, CMD_CLOSE_ALL, L"Close &All");
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    }
+
+    // On the empty part of the strip this is the whole menu. A right-click that produces nothing at
+    // all reads as a dead area rather than as a deliberate one, and this is the command that has
+    // nothing to do with any particular tab.
+    AppendMenuW(menu, MF_STRING, CMD_NEW, L"&New Document");
+
+    // The tab stays lit for as long as the menu is up. A tab can be narrow enough that its name is
+    // an ellipsis, and "Close All" arriving from a menu the user is no longer sure they aimed
+    // correctly is not a comfortable thing to click.
+    state->menuFrame = target;
+    InvalidateRect(hwnd, NULL, FALSE);
+    UpdateWindow(hwnd);                 // painted before the modal loop, not after it
+
+    POINT screen = client;
+    ClientToScreen(hwnd, &screen);
+
+    // The owner is Word's frame, not the strip: the strip is WS_EX_NOACTIVATE and can never be the
+    // foreground window, and a popup menu whose owner is not foreground does not dismiss when the
+    // user clicks away from it. The WM_NULL afterwards is the other half of that rule.
+    SetForegroundWindow(state->frame);
+
+    int chosen = (int)TrackPopupMenu(menu,
+                                     TPM_RETURNCMD | TPM_NONOTIFY | TPM_LEFTALIGN | TPM_TOPALIGN |
+                                     TPM_RIGHTBUTTON,
+                                     screen.x, screen.y, 0, state->frame, NULL);
+    DestroyMenu(menu);
+
+    // Everything from before the modal loop is re-derived: the strip may have been detached and
+    // destroyed while the menu was open, and the state array may have been compacted under us.
+    if (!IsWindow(hwnd))
+        return;
+    state = (StripState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (state)
+    {
+        state->menuFrame = NULL;
+        state->hotKind   = HIT_NONE;    // the pointer spent the last few seconds over a menu
+        state->hotFrame  = NULL;
+        InvalidateRect(hwnd, NULL, FALSE);
+        PostMessageW(state->frame, WM_NULL, 0, 0);
+    }
+
+    LogWrite(L"strip  hwnd=0x%p  menu on 0x%p -> command %d", (void*)hwnd, (void*)target, chosen);
+
+    if (chosen != 0)
+        PostMessageW(hwnd, WM_WORDTAB_CMD, (WPARAM)chosen, (LPARAM)target);
+}
+
+// What a right-click is about: the tab under it, or nothing. A close button counts as its own tab -
+// the two overlap, and a right-click is not aimed at a button.
+static HWND MenuTargetAt(StripState* state, HWND hwnd, POINT point)
+{
+    StripHit hit = HitTestStrip(state, hwnd, point);
+    if (hit.kind == HIT_TAB || hit.kind == HIT_CLOSE)
+        return hit.frame;
+    return NULL;
 }
 
 static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1035,7 +1145,7 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 {
                     LogWrite(L"strip  hwnd=0x%p  new-document button clicked",
                              (void*)state->frame);
-                    PostMessageW(hwnd, WM_WORDTAB_NEWDOC, 0, 0);
+                    PostMessageW(hwnd, WM_WORDTAB_CMD, CMD_NEW, 0);
                 }
             }
             else
@@ -1082,24 +1192,101 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         break;
 
+    // A right press claims a target the same way the other two buttons do, and the menu appears on
+    // the release. Consistent with them on purpose: a press that lands on the wrong tab is still
+    // taken back by sliding off it before letting go.
+    case WM_RBUTTONDOWN:
+        if (state && g_menuEnabled)
+        {
+            state->rightDown  = TRUE;
+            state->rightFrame = MenuTargetAt(state, hwnd, PointOf(lParam));
+            SetCapture(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_RBUTTONUP:
+        if (state && state->rightDown)
+        {
+            POINT point  = PointOf(lParam);
+            HWND  target = state->rightFrame;
+
+            // Capture goes back *before* the menu opens: TrackPopupMenu takes capture itself, and
+            // two owners of the mouse is one too many.
+            state->rightDown  = FALSE;
+            state->rightFrame = NULL;
+            if (GetCapture() == hwnd)
+                ReleaseCapture();
+
+            if (MenuTargetAt(state, hwnd, point) == target)
+                ShowTabMenu(hwnd, point, target);
+            else
+                LogWrite(L"strip  hwnd=0x%p  right button released off target - no menu",
+                         (void*)state->frame);
+            return 0;
+        }
+        break;
+
     // Capture can be taken away without a button release - a dialog appearing, Alt+Tab, Word
     // starting a modal loop. Anything half-pressed at that point is cancelled, not completed.
     case WM_CAPTURECHANGED:
-        if (state && (state->pressKind != HIT_NONE || state->middleFrame))
+        if (state && (state->pressKind != HIT_NONE || state->middleFrame || state->rightDown))
         {
             state->pressKind   = HIT_NONE;
             state->pressFrame  = NULL;
             state->middleFrame = NULL;
+            state->rightDown   = FALSE;
+            state->rightFrame  = NULL;
             InvalidateRect(hwnd, NULL, FALSE);
         }
         break;
 
-    case WM_WORDTAB_NEWDOC:
-        // Deliberately out here rather than in the click handler: Documents.Add makes a window and
-        // pumps messages while it does, and some of those messages come back to this procedure.
-        if (!WordTabNewDocument())
-            LogWrite(L"strip  hwnd=0x%p  new document declined by Word", (void*)hwnd);
+    // Every command the strip can raise, run here rather than where it was chosen: Documents.Add
+    // makes a window and pumps messages while it does, Document.Save can put a dialog up, and a
+    // close destroys the window whose procedure we would still be inside. All of them come back
+    // round to this procedure, so all of them wait for it to have returned.
+    case WM_WORDTAB_CMD:
+    {
+        HWND target = (HWND)lParam;
+        if (target && !IsWindow(target))
+        {
+            LogWrite(L"strip  hwnd=0x%p  command %d dropped - that tab has gone",
+                     (void*)hwnd, (int)wParam);
+            return 0;
+        }
+
+        switch ((int)wParam)
+        {
+        case CMD_NEW:
+            if (!WordTabNewDocument())
+                LogWrite(L"strip  hwnd=0x%p  new document declined by Word", (void*)hwnd);
+            break;
+
+        case CMD_SAVE:
+            // Activate here, save in the next message. Word updates which window is active while it
+            // processes the activation, so asking it in this one would be asking before it knows -
+            // and the check in WordTabSaveDocument would then refuse a save that was perfectly
+            // legitimate. The activation is not optional either way: a Save As dialog owned by a
+            // window underneath another at the same rectangle cannot be seen.
+            StackActivate(target);
+            PostMessageW(hwnd, WM_WORDTAB_SAVE, 0, (LPARAM)target);
+            break;
+
+        case CMD_CLOSE:        StackCloseTab(target);    break;
+        case CMD_CLOSE_OTHERS: StackCloseOthers(target); break;
+        case CMD_CLOSE_ALL:    StackCloseAll(target);    break;
+        default: break;
+        }
         return 0;
+    }
+
+    case WM_WORDTAB_SAVE:
+    {
+        HWND target = (HWND)lParam;
+        if (target && IsWindow(target))
+            WordTabSaveDocument(target);
+        return 0;
+    }
 
     default:
         break;
@@ -1514,6 +1701,10 @@ void StripStart(void)
     // about them ever misbehaves.
     g_buttonsEnabled = WordTabReadFlag(L"TabButtons", TRUE);
 
+    // The context menu, on its own switch. Off, a right-click on the strip does nothing at all -
+    // which is what it did before this slice.
+    g_menuEnabled = WordTabReadFlag(L"TabMenu", TRUE);
+
     if (!g_stripClass)
     {
         WNDCLASSEXW wc;
@@ -1563,11 +1754,13 @@ void StripStart(void)
     if (!g_janitor)
         g_janitor = SetTimer(NULL, 0, 500, JanitorProc);
 
-    LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s",
+    LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s  "
+             L"tab menu=%s",
              g_stripClass ? L"registered" : L"FAILED",
              g_janitor ? L"running" : L"FAILED", STRIP_LOGICAL_H,
              g_darkTheme ? L"dark" : L"light",
-             g_buttonsEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabButtons=0)");
+             g_buttonsEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabButtons=0)",
+             g_menuEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabMenu=0)");
 }
 
 void StripAttachFrame(HWND frame)

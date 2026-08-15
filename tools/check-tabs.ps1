@@ -85,6 +85,11 @@ function Get-Frames {
     return @($found)
 }
 
+# Always ask for the count through this. A PowerShell function that returns an empty array returns
+# *nothing*, and `(Get-Frames).Count` on nothing is a hard error rather than 0 - which bites exactly
+# when the last document closes. Re-wrapping at the call site is what makes 0 come back as 0.
+function Get-FrameCount { return @(Get-Frames).Count }
+
 function Get-Parts($frame) {
     $kids = [WordLayout]::Children($frame)
     [pscustomobject]@{
@@ -99,7 +104,7 @@ function Get-Parts($frame) {
 # The strip the user is actually looking at: the one belonging to the window on top. Every window in
 # the stack has a strip and they all draw the same row, but only one of them is on screen.
 function Get-TopStrip {
-    $frames = Get-Frames
+    $frames = @(Get-Frames)
     if ($frames.Count -eq 0) { throw 'No Word windows.' }
     $top = [WordLayout]::GetForeground()
     if (-not ($frames -contains $top)) { $top = $frames[0] }
@@ -115,7 +120,7 @@ function Get-TopStrip {
 #   'plus'  - the new-document button
 function Get-Spot($kind, $index) {
     $top = Get-TopStrip
-    $count = (Get-Frames).Count
+    $count = (Get-FrameCount)
     $layout = [WordLayout]::Tabs($top.Strip.Hwnd, $count)
 
     if ($kind -eq 'plus') {
@@ -153,9 +158,9 @@ function Format-Rect($r) { "({0},{1} {2}x{3})" -f $r.Left, $r.Top, ($r.Right - $
 function Wait-Frames($expected, $seconds = 20) {
     $deadline = (Get-Date).AddSeconds($seconds)
     while ((Get-Date) -lt $deadline) {
-        if ((Get-Frames).Count -eq $expected) {
+        if ((Get-FrameCount) -eq $expected) {
             Start-Sleep -Milliseconds 1200      # let the janitor join or drop it and repaint
-            if ((Get-Frames).Count -eq $expected) { return $true }
+            if ((Get-FrameCount) -eq $expected) { return $true }
         }
         Start-Sleep -Milliseconds 400
     }
@@ -224,9 +229,9 @@ for ($i = 1; $i -le $Documents; $i++) {
 }
 
 $deadline = (Get-Date).AddSeconds(45)
-while ((Get-Date) -lt $deadline -and (Get-Frames).Count -lt $Documents) { Start-Sleep -Milliseconds 500 }
+while ((Get-Date) -lt $deadline -and (Get-FrameCount) -lt $Documents) { Start-Sleep -Milliseconds 500 }
 
-$frames = Get-Frames
+$frames = @(Get-Frames)
 Write-Note "$($frames.Count) visible Word frame(s)"
 if ($frames.Count -lt 2) { throw "Need at least 2 Word frames to check tabs; found $($frames.Count)." }
 
@@ -242,7 +247,7 @@ while ((Get-Date) -lt $settle) {
 
 Write-Step 'The tab row'
 $top = Get-TopStrip
-$count = (Get-Frames).Count
+$count = (Get-FrameCount)
 $layout = [WordLayout]::Tabs($top.Strip.Hwnd, $count)
 
 foreach ($i in 0..($count - 1)) {
@@ -319,11 +324,11 @@ $cold.Bitmap.Dispose(); $hot.Bitmap.Dispose()
 # ---- the new-document button ---------------------------------------------------------------------
 
 Write-Step 'The new-document button'
-$before = (Get-Frames).Count
+$before = (Get-FrameCount)
 Invoke-Spot 'plus' 0 | Out-Null
 
 $arrived = Wait-Frames ($before + 1) 25
-$now = (Get-Frames).Count
+$now = (Get-FrameCount)
 Assert $arrived "clicking + made a document: $now window(s), expected $($before + 1)"
 
 if ($arrived) {
@@ -341,18 +346,18 @@ if ($arrived) {
 # mind actually changes it.
 
 Write-Step 'Pressing a close button and sliding off'
-$count = (Get-Frames).Count
+$count = (Get-FrameCount)
 $button = Get-Spot 'close' 0
 $away = Get-Spot 'label' 0
 [WordLayout]::PressAndSlideOff($button.X, $button.Y, $away.X, $away.Y)
 Start-Sleep -Seconds 3
 
-Assert ((Get-Frames).Count -eq $count) "nothing closed ($((Get-Frames).Count) window(s), still $count)"
+Assert ((Get-FrameCount) -eq $count) "nothing closed ($((Get-FrameCount)) window(s), still $count)"
 
 # ---- closing the active tab ------------------------------------------------------------------------
 
 Write-Step 'Closing the active tab with its close button'
-$count = (Get-Frames).Count
+$count = (Get-FrameCount)
 $victim = $count - 1
 
 # Select that tab first, so "the active tab" is a known index rather than something to deduce -
@@ -364,13 +369,13 @@ Write-Note ("closing tab {0}, `"{1}`"" -f $victim, [WordLayout]::TitleOf($active
 
 Invoke-Spot 'close' $victim | Out-Null
 $closed = Wait-Frames ($count - 1) 20
-Assert $closed "the close button closed that document ($((Get-Frames).Count) window(s), expected $($count - 1))"
+Assert $closed "the close button closed that document ($((Get-FrameCount)) window(s), expected $($count - 1))"
 
 # Gone from the tab row, which is the claim. Not "the window handle is destroyed": frame lifetime is
 # not document lifetime in Word, and closing a document was measured to hide one frame and destroy a
 # different one. The user's document is gone either way; which HWND Word recycled is its business.
 Assert (-not ((Get-Frames) -contains $activeFrame)) 'that document is out of the tab row'
-if ((Get-Frames).Count -gt 1) { Test-OneRectangle 'After closing the active tab' }
+if ((Get-FrameCount) -gt 1) { Test-OneRectangle 'After closing the active tab' }
 
 # ---- closing a background tab, and staying where you were --------------------------------------------
 #
@@ -379,7 +384,7 @@ if ((Get-Frames).Count -gt 1) { Test-OneRectangle 'After closing the active tab'
 # price of that is being moved off the document you were reading, and this is the refund.
 
 Write-Step 'Closing a background tab'
-$count = (Get-Frames).Count
+$count = (Get-FrameCount)
 if ($count -ge 3) {
     Invoke-Spot 'label' 0 | Out-Null
     Start-Sleep -Milliseconds 1000
@@ -388,13 +393,13 @@ if ($count -ge 3) {
 
     Invoke-Spot 'close' 2 | Out-Null
     $closed = Wait-Frames ($count - 1) 20
-    Assert $closed "the background tab's document closed ($((Get-Frames).Count) window(s), expected $($count - 1))"
+    Assert $closed "the background tab's document closed ($((Get-FrameCount)) window(s), expected $($count - 1))"
 
     Start-Sleep -Milliseconds 1500
     $endedOn = [WordLayout]::GetForeground()
     Write-Note ("ended up on `"{0}`"" -f [WordLayout]::TitleOf($endedOn))
     Assert ($endedOn -eq $wasOn) 'still on the document the user was reading, not the one that closed'
-    if ((Get-Frames).Count -gt 1) { Test-OneRectangle 'After closing a background tab' }
+    if ((Get-FrameCount) -gt 1) { Test-OneRectangle 'After closing a background tab' }
 } else {
     Write-Note "only $count window(s) left - skipping the background-tab check"
 }
@@ -402,12 +407,12 @@ if ($count -ge 3) {
 # ---- middle-click ------------------------------------------------------------------------------------
 
 Write-Step 'Middle-clicking a tab'
-$count = (Get-Frames).Count
+$count = (Get-FrameCount)
 if ($count -ge 2) {
     $spot = Get-Spot 'label' ($count - 1)
     [WordLayout]::MiddleClick($spot.X, $spot.Y)
     $closed = Wait-Frames ($count - 1) 20
-    Assert $closed "middle-click closed it ($((Get-Frames).Count) window(s), expected $($count - 1))"
+    Assert $closed "middle-click closed it ($((Get-FrameCount)) window(s), expected $($count - 1))"
 } else {
     Write-Note "only $count window(s) left - skipping the middle-click check"
 }

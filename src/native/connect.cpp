@@ -89,10 +89,10 @@ static BSTR GetDocumentCount(IDispatch* app)
 // Word's Application object, held for the life of the connection.
 //
 // WordTab is a window program: it subclasses Word's frames, moves them and paints on them, and the
-// object model knows nothing about any of it. There is exactly one thing windows cannot do, which
-// is make a document - so the Application object is kept for that and for nothing else. Keeping it
-// in a file static rather than passing it around is deliberate: it is set once, on Word's UI thread,
-// and read from one place.
+// object model knows nothing about any of it. Two things are not reachable that way - making a
+// document and saving one - so the Application object is kept for those two and nothing else.
+// Keeping it in a file static rather than passing it around is deliberate: it is set once, on
+// Word's UI thread, and read from one place.
 // ---------------------------------------------------------------------------------------------
 
 static IDispatch* g_application = NULL;
@@ -120,6 +120,178 @@ static void ClearExceptionInfo(EXCEPINFO* error)
     if (error->bstrSource)      { SysFreeString(error->bstrSource);      error->bstrSource = NULL; }
     if (error->bstrDescription) { SysFreeString(error->bstrDescription); error->bstrDescription = NULL; }
     if (error->bstrHelpFile)    { SysFreeString(error->bstrHelpFile);    error->bstrHelpFile = NULL; }
+}
+
+// Read a property that answers with an object - Application.ActiveWindow, Window.Document. Returns
+// NULL on any failure; the caller logs, because only the caller knows what it was asking for.
+// Caller Releases.
+static IDispatch* GetObjectProperty(IDispatch* disp, const wchar_t* name)
+{
+    if (!disp)
+        return NULL;
+
+    DISPID dispid = 0;
+    LPOLESTR nameCopy = (LPOLESTR)name;
+    if (FAILED(disp->GetIDsOfNames(IID_NULL, &nameCopy, 1, LOCALE_USER_DEFAULT, &dispid)))
+        return NULL;
+
+    DISPPARAMS noArgs = { NULL, NULL, 0, 0 };
+    VARIANT result;
+    VariantInit(&result);
+    EXCEPINFO error;
+    memset(&error, 0, sizeof(error));
+
+    HRESULT hr = disp->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT,
+                              DISPATCH_PROPERTYGET, &noArgs, &result, &error, NULL);
+    ClearExceptionInfo(&error);
+
+    IDispatch* object = NULL;
+    if (SUCCEEDED(hr) && result.vt == VT_DISPATCH && result.pdispVal)
+    {
+        object = result.pdispVal;
+        object->AddRef();
+    }
+
+    VariantClear(&result);
+    return object;
+}
+
+// Read a numeric property. FALSE means absent or not a number, which for Window.Hwnd below is
+// information rather than an error: it is a property an object model may simply not have, and the
+// caller has a weaker but still sound answer to fall back on.
+static BOOL GetLongProperty(IDispatch* disp, const wchar_t* name, LONG* value)
+{
+    if (!disp || !value)
+        return FALSE;
+
+    DISPID dispid = 0;
+    LPOLESTR nameCopy = (LPOLESTR)name;
+    if (FAILED(disp->GetIDsOfNames(IID_NULL, &nameCopy, 1, LOCALE_USER_DEFAULT, &dispid)))
+        return FALSE;
+
+    DISPPARAMS noArgs = { NULL, NULL, 0, 0 };
+    VARIANT result;
+    VariantInit(&result);
+    EXCEPINFO error;
+    memset(&error, 0, sizeof(error));
+
+    HRESULT hr = disp->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT,
+                              DISPATCH_PROPERTYGET, &noArgs, &result, &error, NULL);
+    ClearExceptionInfo(&error);
+    if (FAILED(hr))
+    {
+        VariantClear(&result);
+        return FALSE;
+    }
+
+    VARIANT asLong;
+    VariantInit(&asLong);
+    BOOL ok = SUCCEEDED(VariantChangeType(&asLong, &result, 0, VT_I4)) ? TRUE : FALSE;
+    if (ok)
+        *value = asLong.lVal;
+
+    VariantClear(&asLong);
+    VariantClear(&result);
+    return ok;
+}
+
+// Call a method that takes no arguments, and say what Word said if it objects.
+static BOOL CallMethodNoArgs(IDispatch* disp, const wchar_t* name)
+{
+    if (!disp)
+        return FALSE;
+
+    DISPID dispid = 0;
+    LPOLESTR nameCopy = (LPOLESTR)name;
+    HRESULT hr = disp->GetIDsOfNames(IID_NULL, &nameCopy, 1, LOCALE_USER_DEFAULT, &dispid);
+    if (FAILED(hr))
+    {
+        LogWrite(L"save: no %s method on that object (hr=0x%08lX)", name, (unsigned long)hr);
+        return FALSE;
+    }
+
+    DISPPARAMS noArgs = { NULL, NULL, 0, 0 };
+    VARIANT result;
+    VariantInit(&result);
+    EXCEPINFO error;
+    memset(&error, 0, sizeof(error));
+
+    hr = disp->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD,
+                      &noArgs, &result, &error, NULL);
+
+    if (hr == DISP_E_EXCEPTION)
+    {
+        // Expected, routinely: Word raises "Command failed" when the user presses Cancel in the
+        // Save As dialog. That is an answer, not a fault, and the only right response is to log it
+        // and leave the document exactly as it is.
+        LogWrite(L"save: Word raised an error on %s - %s", name,
+                 error.bstrDescription ? error.bstrDescription : L"(no description)");
+    }
+    ClearExceptionInfo(&error);
+    VariantClear(&result);
+
+    if (FAILED(hr))
+        return FALSE;
+    return TRUE;
+}
+
+// Save the document behind a tab.
+//
+// Word's own Document.Save, so everything about saving is Word's: an unchanged document is not
+// written, one that has never been saved gets the Save As dialog, and AutoRecover, macros and the
+// read-only cases all behave exactly as they do from Ctrl+S. None of it is reimplemented here.
+//
+// **Through the active window, and only after checking that Word agrees which one that is.** The
+// caller activates the tab first - it has to, for the same reason closing one does: a Save As dialog
+// belonging to a window underneath another at the same rectangle is invisible, and an invisible
+// modal dialog is Word beeping with nothing on screen. Having activated it, Application.ActiveWindow
+// *is* the tab, and Window.Hwnd is one property read that turns "should be" into "is". If they
+// disagree, nothing is saved: this is the only path in the add-in that touches the user's data, and
+// saving the wrong document silently is not a failure mode worth leaving open.
+BOOL WordTabSaveDocument(HWND frame)
+{
+    if (!g_application)
+    {
+        LogWrite(L"save: no Application object - was OnConnection ever called?");
+        return FALSE;
+    }
+    if (!frame || !IsWindow(frame))
+        return FALSE;
+
+    IDispatch* window = GetObjectProperty(g_application, L"ActiveWindow");
+    if (!window)
+    {
+        LogWrite(L"save: Word has no ActiveWindow - nothing saved");
+        return FALSE;
+    }
+
+    LONG reported = 0;
+    BOOL known = GetLongProperty(window, L"Hwnd", &reported);
+    if (known && reported != (LONG)(LONG_PTR)frame)
+    {
+        LogWrite(L"save: Word's active window is 0x%08lX but the tab is 0x%p - not saving",
+                 (unsigned long)reported, (void*)frame);
+        window->Release();
+        return FALSE;
+    }
+
+    IDispatch* document = GetObjectProperty(window, L"Document");
+    window->Release();
+
+    if (!document)
+    {
+        LogWrite(L"save: the active window has no Document - nothing saved");
+        return FALSE;
+    }
+
+    BOOL saved = CallMethodNoArgs(document, L"Save");
+    document->Release();
+
+    LogWrite(L"save: hwnd=0x%p  Document.Save %s%s", (void*)frame,
+             saved ? L"returned" : L"did not complete",
+             known ? L"  (Word confirmed the window handle)"
+                   : L"  (Word does not report Window.Hwnd - went on the activation alone)");
+    return saved;
 }
 
 // Application.Documents.Add(), late-bound like everything else here so the build needs nothing from
