@@ -162,7 +162,13 @@ New-ItemProperty -Path $AddinKey -Name 'LoadBehavior'    -Value 3 -PropertyType 
 New-ItemProperty -Path $AddinKey -Name 'CommandLineSafe' -Value 0 -PropertyType DWord -Force | Out-Null
 Write-Ok "$AddinKey  LoadBehavior=3"
 
-New-Item -Path $SettingsKey -Force | Out-Null
+# **Not `New-Item -Force`.** On a key that already exists, -Force recreates it and every value under
+# it is gone - the registry twin of `New-Item -ItemType File -Force` truncating a file. This key is
+# the user's, not the installer's: TabScroll, TabStyle, TabThemeSample, TabDrag, TabTitleTrim and
+# the rest all live here, and re-installing over an existing copy silently reset every one of them
+# to its default. The add-in registration above is recreated on purpose - every value in it is
+# rewritten on the next two lines - but nothing here rewrites a switch the user set.
+if (-not (Test-Path $SettingsKey)) { New-Item -Path $SettingsKey | Out-Null }
 New-ItemProperty -Path $SettingsKey -Name 'ShowLoadBanner' -Value ([int](-not $NoBanner)) -PropertyType DWord -Force | Out-Null
 Write-Ok ("Load banner: {0}" -f $(if ($NoBanner) { 'off' } else { 'on' }))
 

@@ -110,7 +110,7 @@ enum { HIT_NONE = 0, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_PREV, HIT_NEXT };
 
 // The menu's command ids, which are also the ids TrackPopupMenu hands back. They start at 1 because
 // TPM_RETURNCMD answers 0 for "the user dismissed it without choosing".
-enum { CMD_NEW = 1, CMD_SAVE, CMD_CLOSE, CMD_CLOSE_OTHERS, CMD_CLOSE_ALL };
+enum { CMD_NEW = 1, CMD_SAVE, CMD_CLOSE, CMD_CLOSE_OTHERS, CMD_CLOSE_ALL, CMD_CLOSE_RIGHT };
 
 static const wchar_t* const kWwfClass    = L"_WwF";
 static const wchar_t* const kStripClass  = L"WordTabStrip";
@@ -234,6 +234,7 @@ static BOOL g_dragEnabled = TRUE;        // HKCU\Software\WordTab\TabDrag
 static BOOL g_lookEnabled = TRUE;        // HKCU\Software\WordTab\TabStyle
 static BOOL g_sampleEnabled = TRUE;      // HKCU\Software\WordTab\TabThemeSample
 static BOOL g_scrollEnabled = TRUE;      // HKCU\Software\WordTab\TabScroll
+static BOOL g_titleTrimEnabled = TRUE;   // HKCU\Software\WordTab\TabTitleTrim
 
 // ---------------------------------------------------------------------------------------------
 // How far the row is scrolled.
@@ -2731,6 +2732,13 @@ static void ShowTabMenu(HWND hwnd, POINT client, HWND target)
         MenuAddSeparator(menu);
         MenuAddItem(menu, CMD_CLOSE, L"&Close", TRUE);
         MenuAddItem(menu, CMD_CLOSE_OTHERS, L"Close &Others", count > 1);
+
+        // Greyed on the last tab rather than hidden. An item that comes and goes depending on which
+        // tab was right-clicked makes the menu a different shape each time and moves everything
+        // below it - and "Close All" moving under the pointer is the one thing on here worth being
+        // careful about.
+        MenuAddItem(menu, CMD_CLOSE_RIGHT, L"Close Tabs to the &Right", StackTabsRightOf(target) > 0);
+
         MenuAddItem(menu, CMD_CLOSE_ALL, L"Close &All", TRUE);
         MenuAddSeparator(menu);
     }
@@ -3391,9 +3399,10 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             PostMessageW(hwnd, WM_WORDTAB_SAVE, 0, (LPARAM)target);
             break;
 
-        case CMD_CLOSE:        StackCloseTab(target);    break;
-        case CMD_CLOSE_OTHERS: StackCloseOthers(target); break;
-        case CMD_CLOSE_ALL:    StackCloseAll(target);    break;
+        case CMD_CLOSE:        StackCloseTab(target);     break;
+        case CMD_CLOSE_OTHERS: StackCloseOthers(target);  break;
+        case CMD_CLOSE_RIGHT:  StackCloseToRight(target); break;
+        case CMD_CLOSE_ALL:    StackCloseAll(target);     break;
         default: break;
         }
         return 0;
@@ -3467,8 +3476,45 @@ static HWND FindChildOfClass(HWND parent, const wchar_t* cls)
     return args.found;
 }
 
-// The name to put on a tab. Word's frame title is "<document> - Word", and the suffix is identical
-// on every tab, so it would only eat the width the document name needs.
+static BOOL TitleEndsWith(const wchar_t* text, int len, const wchar_t* tail)
+{
+    int n = (int)wcslen(tail);
+    return len >= n && wcscmp(text + len - n, tail) == 0;
+}
+
+// The name to put on a tab.
+//
+// Word's frame title is the document, then any state annotations, then the application. Measured on
+// this build by tools\probe-titles.ps1, which prints codepoints as well as text because a separator
+// that is an en dash or a non-breaking space is invisible in the second form and fatal to a match:
+//
+//     Quarterly report.docx                            - Word
+//     Quarterly report.doc  -  Compatibility Mode      - Word
+//     Locked report.docx  -  Read-Only                 - Word
+//     Downloaded report.docx  -  Protected View        - Word
+//     Document1                                        - Word
+//
+// Two measured facts do all the work here:
+//
+//  1. **The application suffix is single-spaced (" - Word"); the annotations are double-spaced
+//     ("  -  X").** Two separators of different shapes, so the annotations can be recognised
+//     without a table of English strings - which matters, because "Compatibility Mode" and
+//     "Read-Only" are localised, and whatever Word adds next is in no list that could be written
+//     today. All plain ASCII: no en dashes, no non-breaking spaces.
+//  2. **Both sit at the end**, so both are removed from the end. The old rule cut at the *first*
+//     " - Word" and a document named `Meeting - Wordsmith notes.docx` therefore drew as `Meeting`.
+//     That was a real defect and it lost more of the name than the annotations ever did.
+//
+// **The extension is left exactly as Word gives it, and that is a measurement rather than a taste.**
+// Word follows Explorer's "hide extensions for known file types": the same document reads
+// `Quarterly report.docx - Word` with HideFileExt=0 and `Quarterly report - Word` with it set to 1.
+// The user has already told Windows whether they want to see extensions and Word already listens, so
+// stripping one here would override an answer they have given - and on a machine with them hidden
+// there would be nothing to strip anyway.
+//
+// The bracketed form some older Word builds use ("[Read-Only]") is deliberately *not* handled: it
+// could not be provoked on this build, so any code for it would be unmeasured, and a trailing
+// "[...]" rule would eat the tail of a document genuinely named `Report [final].docx`.
 void WordTabFrameTitle(HWND frame, wchar_t* out, int chars)
 {
     if (!out || chars <= 0)
@@ -3480,9 +3526,45 @@ void WordTabFrameTitle(HWND frame, wchar_t* out, int chars)
     GetWindowTextW(frame, out, chars);
     out[chars - 1] = L'\0';
 
-    wchar_t* suffix = wcsstr(out, L" - Word");
-    if (suffix)
-        *suffix = L'\0';
+    int len = (int)wcslen(out);
+
+    // The application suffix, from the end. " - Microsoft Word" is what Word 2010 and earlier wrote;
+    // this build writes " - Word". Longest first, or the short one matches inside the long one.
+    static const wchar_t* const kApp[] = { L" - Microsoft Word", L" - Word" };
+    for (int i = 0; i < 2; i++)
+    {
+        if (TitleEndsWith(out, len, kApp[i]))
+        {
+            len -= (int)wcslen(kApp[i]);
+            out[len] = L'\0';
+            break;
+        }
+    }
+
+    // Then the state annotations, also from the end, keyed on the double-spaced separator.
+    //
+    // Bounded rather than while(TRUE): `a  -  b  -  c.docx` is a legal filename, and an unbounded
+    // rule would leave such a document with a one-word tab. Three is more than Word has been seen to
+    // append at once, and the guard is what keeps a filename that looks like an annotation from
+    // being consumed to nothing.
+    if (g_titleTrimEnabled)
+    {
+        for (int guard = 0; guard < 3; guard++)
+        {
+            wchar_t* at = NULL;
+            for (wchar_t* p = out; *p; p++)
+            {
+                // Short-circuit &&, so nothing past the terminator is ever read: p[1] is only
+                // examined once p[0] is a space, and so on down the run.
+                if (p[0] == L' ' && p[1] == L' ' && p[2] == L'-' && p[3] == L' ' && p[4] == L' ')
+                    at = p;      // the *last* one - the tail is what gets removed, not the head
+            }
+            if (!at || at == out)
+                break;
+            *at = L'\0';
+        }
+    }
+
     if (out[0] == L'\0')
         wcscpy(out, L"Word");
 }
@@ -3496,6 +3578,16 @@ static void ReadTitle(StripState* state)
     {
         wcsncpy(state->title, title, 255);
         state->title[255] = L'\0';
+
+        // A tab name is drawn and never stored in a control, so there is no way to read one from
+        // outside the process. This line is that way. check-title.ps1 asserts the exact string
+        // against it and then photographs the painted text as well, because a log line about what
+        // was computed is not on its own evidence of what was drawn.
+        wchar_t raw[256];
+        GetWindowTextW(state->frame, raw, 256);
+        raw[255] = L'\0';
+        LogWrite(L"strip  hwnd=0x%p  tab name |%s|  from window title |%s|",
+                 (void*)state->frame, state->title, raw);
 
         // Every strip shows every tab, so one window's title changing has to repaint all of them.
         StripRefreshTabs();
@@ -3924,7 +4016,13 @@ void StripStart(void)
     // a window belonging to Word. Off, the palette comes from the Office theme registry value the
     // way it always did - which is the setting to try first if the strip is ever the wrong colour on
     // a machine this has not been run on.
-    g_sampleEnabled = g_lookEnabled ? WordTabReadFlag(L"TabThemeSample", TRUE) : FALSE;
+    // Trimming Word's state annotations off the tab name. Off, the tab reads exactly what Word's
+    // title bar reads, minus the application suffix. This is a switch rather than nothing because it
+    // is the one part of the title rule that is a *policy* - somebody may want to see "Read-Only" on
+    // the tab, and a document genuinely named `a  -  b.docx` is the case where the rule is wrong.
+    // Removing the suffix from the end rather than the first match is not on the switch: that was a
+    // defect, and a setting that restored it would exist only to put the bug back.
+    g_titleTrimEnabled = WordTabReadFlag(L"TabTitleTrim", TRUE);
 
     if (!g_stripClass)
     {
@@ -3951,7 +4049,8 @@ void StripStart(void)
         g_janitor = SetTimer(NULL, 0, 500, JanitorProc);
 
     LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s  "
-             L"tab menu=%s  tab drag=%s  tab scroll=%s  tab style=%s  theme sample=%s",
+             L"tab menu=%s  tab drag=%s  tab scroll=%s  tab style=%s  theme sample=%s  "
+             L"title trim=%s",
              g_stripClass ? L"registered" : L"FAILED",
              g_janitor ? L"running" : L"FAILED", STRIP_LOGICAL_H,
              g_palette.dark ? L"dark" : L"light",
@@ -3960,7 +4059,8 @@ void StripStart(void)
              g_dragEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabDrag=0)",
              g_scrollEnabled ? L"on" : L"squeeze (HKCU\\Software\\WordTab\\TabScroll=0)",
              g_lookEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabStyle=0)",
-             g_sampleEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabThemeSample=0)");
+             g_sampleEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabThemeSample=0)",
+             g_titleTrimEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTitleTrim=0)");
 }
 
 void StripAttachFrame(HWND frame)

@@ -776,4 +776,16 @@ public static class WordLayout
     // The bitmap is built on the PowerShell side: System.Drawing's types are loadable at runtime
     // but dragging them through Add-Type's reference resolution is a chase with no end.
     public static bool Print(IntPtr hwnd, IntPtr dc) { return PrintWindow(hwnd, dc, 2); }
+
+    [DllImport("shell32.dll")] static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1, IntPtr item2);
+    const int SHCNE_ASSOCCHANGED = 0x08000000;
+
+    // Tell the shell a file-association setting changed. Needed by probe-titles.ps1 when it flips
+    // HideFileExt: shell32 caches that per process, so a registry write alone is not something a
+    // running program can be expected to see. Processes started afterwards read it fresh either way,
+    // which is why this is belt and braces rather than the mechanism.
+    public static void BroadcastSettingChange()
+    {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, 0, IntPtr.Zero, IntPtr.Zero);
+    }
 }

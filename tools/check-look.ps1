@@ -473,9 +473,31 @@ $shot.Bitmap.Dispose()
 # The same shape as check-tabs.ps1:286 - the point of repeating it here is that the restyle changed
 # what hover looks like, and a hover that bled onto a neighbour would be a new defect.
 
+# Move the pointer, and prove it arrived before anything is concluded from a photograph.
+#
+# `SendInput`'s absolute move is not guaranteed to take: it is refused while another process holds a
+# capture or has just taken the foreground, and it is simply overridden by a hand on the mouse. When
+# it does not take, the cold and hot photographs are of the *same* pointer position, every hover
+# assertion fails with "0 pixels", and that reads exactly like a hover that was never drawn.
+#
+# Measured, twice: a run asked for (258,540) and left the pointer at (1894,459), over the desktop.
+# Two suites' worth of diagnosis went into a hover highlight that was working perfectly.
+function Set-Pointer($x, $y, $what) {
+    for ($try = 1; $try -le 5; $try++) {
+        [WordLayout]::MouseTo($x, $y)
+        Start-Sleep -Milliseconds 250
+        $at = [WordLayout]::Cursor()
+        if (([Math]::Abs($at.X - $x) -le 2) -and ([Math]::Abs($at.Y - $y) -le 2)) { return $true }
+        Write-Note ("{0}: asked for ({1},{2}), the pointer is at ({3},{4}) - trying again" -f
+                    $what, $x, $y, $at.X, $at.Y)
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
 Write-Step 'Hover'
 
-[WordLayout]::MouseTo(4, 4)
+Assert (Set-Pointer 4 4 'parking the pointer') 'the pointer could be parked clear of the strip'
 Start-Sleep -Milliseconds 900
 $cold = Get-StripShot $strip
 
@@ -488,9 +510,20 @@ $controlThird.Right  = $control.Left + [int](($control.Right - $control.Left) / 
 $controlThird.Top    = $control.Top
 $controlThird.Bottom = $control.Bottom
 
-[WordLayout]::MouseTo(($target.Left + [int](($target.Right - $target.Left) / 3)),
-                      [int](($target.Top + $target.Bottom) / 2))
+$hoverX = $target.Left + [int](($target.Right - $target.Left) / 3)
+$hoverY = [int](($target.Top + $target.Bottom) / 2)
+Assert (Set-Pointer $hoverX $hoverY 'hovering tab 0') 'the pointer could be put on tab 0'
 Start-Sleep -Milliseconds 900
+
+# Say where the pointer actually ended up and what is under it. "0 pixels changed" has two very
+# different causes - the hover is not drawn, or the pointer is not there - and the assertion alone
+# cannot tell them apart. Both have happened in this project; the second one wasted a diagnosis.
+$at = [WordLayout]::Cursor()
+$under = [WordLayout]::ClassOf([WordLayout]::WindowAt($at.X, $at.Y))
+Write-Note ("aimed at ({0},{1}); pointer is at ({2},{3}) over `"{4}`"; tab 0 is ({5},{6} {7}x{8})" -f
+            $hoverX, $hoverY, $at.X, $at.Y, $under,
+            $target.Left, $target.Top, ($target.Right - $target.Left), ($target.Bottom - $target.Top))
+
 $hot = Get-StripShot $strip
 
 Assert (($cold.Origin.Left -eq $hot.Origin.Left) -and ($cold.Origin.Top -eq $hot.Origin.Top)) `
@@ -619,8 +652,9 @@ if ($menuWindow -ne [IntPtr]::Zero) {
     $items = @([WordLayout]::MenuItems($menuWindow, $frame))
     $texts = @($items | ForEach-Object { if ($_.Separator) { '-' } else { $_.Text } })
     Write-Note ("items: {0}" -f ($texts -join ', '))
-    Assert ($items.Count -eq 7) "the menu still has seven entries ($($items.Count))"
-    Assert (($texts -join '|') -eq '&Save|-|&Close|Close &Others|Close &All|-|&New Document') `
+    Assert ($items.Count -eq 8) "the menu still has eight entries ($($items.Count))"
+    Assert (($texts -join '|') -eq
+            '&Save|-|&Close|Close &Others|Close Tabs to the &Right|Close &All|-|&New Document') `
         'and every label still reads back through GetMenuString, owner-drawn or not'
 
     $menuShot.Bitmap.Dispose()

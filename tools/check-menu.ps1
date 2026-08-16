@@ -518,7 +518,8 @@ Write-Step 'Right-clicking a tab'
 $menu = Open-TabMenu 'label' 1
 Assert ($menu.Window -ne [IntPtr]::Zero) 'a context menu appeared'
 
-$expected = @('&Save', '-', '&Close', 'Close &Others', 'Close &All', '-', '&New Document')
+$expected = @('&Save', '-', '&Close', 'Close &Others', 'Close Tabs to the &Right', 'Close &All',
+              '-', '&New Document')
 $actual = @($menu.Items | ForEach-Object { $_.Text })
 foreach ($item in $menu.Items) {
     Write-Note ("[{0}] id={1} enabled={2} {3} `"{4}`"" -f $item.Index, $item.Id, $item.Enabled,

@@ -223,6 +223,10 @@ void StackActivate(HWND frame);
 int  StackTabIndex(HWND frame);
 BOOL StackMoveTab(HWND frame, int toIndex);
 
+// How many tabs are to the right of this one. 0 both for the last tab and for a window that is not
+// a tab in a stack, because to the caller those mean the same thing: nothing to close to the right.
+int  StackTabsRightOf(HWND frame);
+
 // Close the document behind a tab. Activates it first - see the comment on the definition, which is
 // about where a modal save prompt ends up in the z-order - and returns the user to the tab they were
 // on if it was not the one they closed.
@@ -237,6 +241,10 @@ void StackCloseTab(HWND frame);
 // - stacking switched off, or a lone window - where "close all" means that one document.
 void StackCloseOthers(HWND keep);
 void StackCloseAll(HWND anyTab);
+
+// The same queue, narrowed to the tabs after this one in the row. Refused when there are none, so
+// the caller does not have to check before asking.
+void StackCloseToRight(HWND from);
 
 // Read a DWORD switch from HKCU\Software\WordTab as a boolean. Absent means the default, so a
 // fresh install behaves like a configured one. Used for the switches that must be flippable

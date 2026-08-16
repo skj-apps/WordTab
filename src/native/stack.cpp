@@ -884,6 +884,19 @@ int StackTabIndex(HWND frame)
     return -1;
 }
 
+// How many tabs sit to the right of this one. 0 for the last tab, and 0 for a window that is not a
+// tab in a stack - both of which mean the same thing to the caller: there is nothing for "Close Tabs
+// to the Right" to close, so the menu item is greyed and the command is refused. Counted rather than
+// answered as a boolean because the log line says how many, and a batch that says "3 tab(s) queued"
+// against a menu item the user believed applied to two is how a miscount gets noticed.
+int StackTabsRightOf(HWND frame)
+{
+    int index = StackTabIndex(frame);
+    if (index < 0)
+        return 0;
+    return JoinedCount() - index - 1;
+}
+
 // Move a tab to a position in the row.
 //
 // The move is expressed in tab positions and performed in array positions, and the two are not the
@@ -1195,11 +1208,40 @@ static void CloseBatchStep(void)
 // Queue every joined tab except `keep`, **with the active one last**. The user keeps looking at the
 // document they were on for as long as the batch allows, and the last prompt they answer is about
 // the document they were actually reading rather than one they have never seen.
-static void CloseBatchStart(HWND keep, const wchar_t* what)
+//
+// `after` narrows the range to the tabs that sit after it in `g_members`, which is what "Close Tabs
+// to the Right" needs. **`g_members` order is the tab order** - that is the order model, chosen so
+// nothing can disagree with the array - so "later in the array" *is* "further right on the row",
+// with no index to compute and none to keep consistent. NULL means the whole row, and with NULL
+// this function does exactly what it did before, statement for statement.
+static void CloseBatchStart(HWND keep, HWND after, const wchar_t* what)
 {
     CloseBatchEnd(L"replaced");
 
-    for (int i = 0; i < g_memberCount; i++)
+    int from = 0;
+    if (after)
+    {
+        from = -1;
+        for (int i = 0; i < g_memberCount; i++)
+        {
+            if (g_members[i].frame == after)
+            {
+                from = i + 1;
+                break;
+            }
+        }
+        if (from < 0)
+        {
+            // The tab the command was aimed at has left the stack between the menu closing and the
+            // command arriving. Nothing here is a safe guess at what the user meant, so nothing is
+            // closed - the same rule the stale-context-menu fix follows.
+            LogWrite(L"stack  %s: the tab it was invoked on is no longer in the row - nothing closed",
+                     what);
+            return;
+        }
+    }
+
+    for (int i = from; i < g_memberCount; i++)
     {
         HWND frame = g_members[i].frame;
         if (!g_members[i].joined || frame == keep || frame == g_active)
@@ -1211,7 +1253,16 @@ static void CloseBatchStart(HWND keep, const wchar_t* what)
     if (g_active && g_active != keep && g_closeCount < MAX_MEMBERS)
     {
         Member* member = Find(g_active);
-        if (member && member->joined)
+
+        // ...but only if the active tab is inside the range at all. Close Others and Close All pass
+        // `after` as NULL and so always are; Close Tabs to the Right must not drag the document the
+        // user is looking at into a batch that was never about it.
+        BOOL inRange = FALSE;
+        for (int i = from; i < g_memberCount && !inRange; i++)
+            if (g_members[i].frame == g_active)
+                inRange = TRUE;
+
+        if (member && member->joined && inRange)
             g_closeQueue[g_closeCount++] = g_active;
     }
 
@@ -1239,7 +1290,35 @@ void StackCloseOthers(HWND keep)
     // g_returnTo is set from whatever is active when each close begins, and that should be the tab
     // they chose to keep rather than whichever document happened to be closing before it.
     StackActivate(keep);
-    CloseBatchStart(keep, L"close others");
+    CloseBatchStart(keep, NULL, L"close others");
+}
+
+// Close every tab to the right of this one. The cheap sibling of Close Others: same queue, same
+// prompt handling, same left-to-right order - the only new thing is where the range starts.
+void StackCloseToRight(HWND from)
+{
+    Member* member = Find(from);
+    if (!g_enabled || !member || !member->joined)
+    {
+        LogWrite(L"stack  hwnd=0x%p  close to the right: not a tab in a stack - nothing to close",
+                 (void*)from);
+        return;
+    }
+
+    if (StackTabsRightOf(from) == 0)
+    {
+        LogWrite(L"stack  hwnd=0x%p  close to the right: it is the last tab", (void*)from);
+        return;
+    }
+
+    // Stand the user on the tab they kept, for the same reason Close Others does: g_returnTo is
+    // taken from whatever is active when each close begins.
+    StackActivate(from);
+
+    // `from` is passed as both the kept tab and the start of the range. The range alone already
+    // excludes it; passing it as `keep` too means a wrong answer from the range lookup still cannot
+    // close the tab the user pointed at.
+    CloseBatchStart(from, from, L"close to the right");
 }
 
 void StackCloseAll(HWND anyTab)
@@ -1258,5 +1337,5 @@ void StackCloseAll(HWND anyTab)
         return;
     }
 
-    CloseBatchStart(NULL, L"close all");
+    CloseBatchStart(NULL, NULL, L"close all");
 }
