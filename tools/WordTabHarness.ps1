@@ -290,6 +290,100 @@ function Wait-WordDialog($present, $seconds = 10) {
     return (Get-WordDialog)
 }
 
+# ---- where a strip is allowed to sit ----------------------------------------------------------
+
+<#
+  Every strip sits between the chrome above it and the document below it, checked per window in
+  absolute terms.
+
+  **Consistency is not correctness, and that is the whole reason this exists.** check-stack already
+  asserts that every window in the stack agrees on one document-frame rectangle - and every window
+  agreeing on a WRONG layout passes that. It has happened twice. Once, closing a document put the
+  strip at y=0 on top of the ribbon in all of them, identically. And once, a Protected View window's
+  chrome - which is 38px shorter than a normal window's, measured - was broadcast onto every other
+  window in the stack, so each one carved its band 38px too high, inside the ribbon's NetUIHWND.
+
+  **This assertion lived in check-stack only, and check-stack is the one suite with no mixed-chrome
+  fixture.** The two suites that DO open a Protected View document, check-title and check-dot, never
+  ran it. So the 38px bug reported itself as "the + click did nothing" - three steps from the cause,
+  twice, in two different slices. Hoisting it here is the whole point: the suites that can reach the
+  bug are now the suites that test for it.
+
+  Returns a result object rather than asserting, like everything else in this file - and an OBJECT
+  rather than an array of faults, deliberately: a PowerShell function that returns an empty array
+  returns *nothing*, so `(Get-...Faults $f).Count` would be a hard error under StrictMode at exactly
+  the moment there is nothing wrong. That trap has cost this project two runs under two other names.
+  A pscustomobject is a scalar and survives the pipeline whatever is in it.
+
+  `Measured` is part of the answer for the same reason the previous slice made a test say when it did
+  not measure anything: a window with no strip or no document frame is skipped, not failed - whether
+  it should HAVE a strip is check-stack's separate question - so `Ok` on its own cannot tell "every
+  strip is placed correctly" apart from "there were no strips". Assert both.
+#>
+function Get-StripPlacement($frames) {
+    $faults   = @()
+    $measured = 0
+
+    foreach ($frame in @($frames)) {
+        # **An empty pipeline arrives here as a literal $null, and @($null) iterates ONCE.** Measured,
+        # because the obvious test gets it wrong: in the CALLER's scope an empty pipeline is
+        # AutomationNull and @(it) is empty, but parameter binding converts that to $null on the way
+        # in, so `@($frames)` inside the function is a one-element array holding $null and
+        # [WordLayout]::Children($null) throws "Cannot convert null to type System.IntPtr".
+        #
+        # check-stack calls this as `Get-StripPlacement (@($parts) | ForEach-Object { $_.Frame })`,
+        # and $parts is empty exactly when a restore did not take - which is the moment the assertion
+        # above it exists to report. Without this guard the suite would die with a conversion error
+        # instead of reporting that failure. Fourth shape of this project's empty-collection trap.
+        if ($null -eq $frame -or $frame -eq [IntPtr]::Zero) { continue }
+
+        $kids  = [WordLayout]::Children($frame)
+        $strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' }) | Select-Object -First 1
+        $wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' })         | Select-Object -First 1
+        if (-not $strip -or -not $wwf) { continue }
+        $measured++
+
+        # What is directly above the strip: the lowest visible child that ends at or above our top
+        # edge and is most of the window wide. In a normal window that is the ribbon's NetUIHWND
+        # chain; in a Protected View window it is the message bar's. Either is correct - what is
+        # never correct is a gap or an overlap between it and us.
+        $client = [WordLayout]::ClientOf($frame)
+        $above = $kids |
+                 Where-Object { $_.Visible -and $_.Hwnd -ne $strip.Hwnd -and $_.Hwnd -ne $wwf.Hwnd -and
+                                $_.Bottom -le $strip.Top -and $_.Width -gt ($client.Right * 0.6) } |
+                 Sort-Object Bottom -Descending | Select-Object -First 1
+
+        $tag = "0x$('{0:X}' -f [int64]$frame)"
+        if ($strip.Bottom -ne $wwf.Top) {
+            $faults += "$tag strip bottom $($strip.Bottom) != document top $($wwf.Top)"
+        } elseif (-not $above) {
+            # **This is the shape the 38px bug makes, so it must not be described as something else.**
+            # A strip placed 38px too high sits INSIDE the ribbon's NetUIHWND: the whole chrome chain
+            # reports 0..356 while the strip claims 318, so nothing ends at or above the strip's top
+            # and $above is empty. "It is sitting at the top of the window" would be a wrong story
+            # about the right failure. Name the numbers and the chrome that overlaps instead.
+            $nearest = $kids |
+                       Where-Object { $_.Visible -and $_.Hwnd -ne $strip.Hwnd -and $_.Hwnd -ne $wwf.Hwnd -and
+                                      $_.Width -gt ($client.Right * 0.6) } |
+                       Sort-Object Top | Select-Object -First 1
+            $what = 'there is no full-width chrome in the window at all'
+            if ($nearest) { $what = "nearest full-width chrome is $($nearest.Class) y $($nearest.Top)..$($nearest.Bottom)" }
+            $faults += "$tag nothing ends at or above the strip's top ($($strip.Top)) - $what"
+        } elseif ($above.Bottom -ne $strip.Top) {
+            $faults += "$tag $($above.Class) ends at $($above.Bottom), strip starts at $($strip.Top)"
+        }
+    }
+
+    return [pscustomobject]@{
+        Ok       = ($faults.Count -eq 0)
+        Faults   = @($faults)
+        Count    = $faults.Count
+        Measured = $measured
+        # The message too, so the call sites cannot word the same failure differently.
+        Text     = $(if ($faults.Count) { ': ' + ($faults -join '; ') } else { '' })
+    }
+}
+
 # ---- the foreground ---------------------------------------------------------------------------
 
 <#

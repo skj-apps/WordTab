@@ -560,15 +560,39 @@ static void DerivePalette(COLORREF chrome, Palette* out)
 // button often enough to matter, and a band that is genuinely flat says so by agreeing with itself.
 static BOOL ChildRect(HWND parent, HWND child, RECT* out);   // defined with the geometry helpers
 
-// Finding the ribbon among the frame's descendants: the widest visible NetUIHWND whose bottom edge
-// is the strip's top edge. By position rather than by order, because a Word frame has three of them
-// - the ribbon, the vertical scrollbar and the status bar - and their order is not ours to rely on.
+// Finding the ribbon among the frame's descendants: the widest visible NetUIHWND that runs from the
+// top of the window down to the strip's top edge. By position rather than by order, because a Word
+// frame has three of them - the ribbon, the vertical scrollbar and the status bar - and their order
+// is not ours to rely on.
+//
+// **Both edges are checked, and the top one is not decoration.** This rule used to be "whose bottom
+// edge is the strip's top edge", which reads as "the thing directly above us" and is a different
+// claim from "the ribbon". Measured on a Protected View window: its MsoCommandBarDock holds TWO
+// MsoCommandBar chains, the ribbon at y 0..156 and the yellow message bar at y 156..318, and the
+// strip goes under the *second* one. So the old rule sampled the message bar - RGB(109,87,0) on a
+// rig whose Word is RGB(41,41,41) - and because the palette is one stack-wide object, one downloaded
+// document turned every tab in every window yellow.
+//
+// The window is then unable to answer, which is the honest outcome and not a fallback: the same
+// measurement scanned that window's whole chrome band and found no ribbon colour anywhere in it
+// (RGB(9,9,9) for all 64 rows above the message bar). There is nothing there to sample. Saying so
+// lets the poll move on to a window that can answer, and lets the palette keep what it has if none
+// can. Nothing here is specific to Protected View: any bar Word puts between its ribbon and the
+// document has the same shape and gets the same answer.
+
+// The one message that names this structural case. A literal with a name rather than an inline
+// string, because the poll compares reasons by POINTER to decide which one to report - see the
+// precedence in the janitor - and because check-dot matches on it.
+static const wchar_t kBandDoesNotReachTop[] =
+    L"something is docked between Word's ribbon and this window's strip - the ribbon cannot be sampled here";
+
 struct RibbonHunt
 {
     HWND frame;
     int  clientW;
     LONG stripTop;
-    HWND found;
+    HWND found;         // the ribbon: directly above the strip AND starting at the top of the window
+    HWND intruder;      // directly above the strip but starting further down - a bar of some kind
 };
 
 static BOOL CALLBACK RibbonHuntProc(HWND child, LPARAM param)
@@ -590,6 +614,14 @@ static BOOL CALLBACK RibbonHuntProc(HWND child, LPARAM param)
     LONG gap = at.bottom - hunt->stripTop;
     if (gap < -4 || gap > 4)
         return TRUE;                                    // not the thing directly above us
+
+    // Word draws its own title bar inside the client area, so the ribbon's chain starts at y=0.
+    // Anything directly above the strip that does *not* is something Word has put in between.
+    if (at.top > 4)
+    {
+        hunt->intruder = child;
+        return TRUE;
+    }
 
     hunt->found = child;
     return FALSE;
@@ -634,10 +666,11 @@ static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
     // where our top edge is. The frame has three NetUIHWNDs - the ribbon, the vertical scrollbar and
     // the status bar - and this picks the ribbon out of them by position rather than by order.
     RibbonHunt hunt;
-    hunt.frame    = state->frame;
-    hunt.clientW  = clientW;
-    hunt.stripTop = stripAt.top;
-    hunt.found    = NULL;
+    hunt.frame       = state->frame;
+    hunt.clientW     = clientW;
+    hunt.stripTop    = stripAt.top;
+    hunt.found       = NULL;
+    hunt.intruder    = NULL;
 
     // EnumChildWindows, not a walk of GetWindow(GW_CHILD)/GW_HWNDNEXT, and that distinction cost a
     // build to find. **The ribbon is not a child of the frame.** It is the innermost of a chain -
@@ -655,7 +688,17 @@ static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
     HWND ribbon = hunt.found;
     if (!ribbon)
     {
-        *why = L"no NetUIHWND of the right width sits directly above the strip";
+        // The two reasons are different and must not share a message. Something docked between the
+        // ribbon and the strip is a normal, correct state that this window simply cannot answer
+        // from; "nothing of the right width is above the strip" means the geometry is not what this
+        // code believes and somebody should look.
+        //
+        // The first message says what was MEASURED - a full-width band above the strip that does not
+        // reach the top of the window - rather than naming it a message bar. Protected View is the
+        // case it was measured on, but the same shape is anything Word docks in there, and a message
+        // that asserts a cause the evidence does not carry is how a wrong diagnosis gets started.
+        *why = hunt.intruder ? kBandDoesNotReachTop
+                             : L"no NetUIHWND of the right width sits directly above the strip";
         return FALSE;
     }
 
@@ -4226,6 +4269,15 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
     // Every fourth tick, once, off the first strip that can answer - not once per window. Cost is a
     // GetDC and twenty-four GetPixels every two seconds, and it stops at the first strip that gives
     // a usable answer.
+    //
+    // **The window in front is asked first, and its answer is the one reported.** Two reasons, and
+    // neither is a preference. It is the only window whose pixels can be read at all - the stack
+    // holds every window at one rectangle, so every other strip's ribbon is behind this one and
+    // reads back as "something is covering Word's ribbon". And when nothing can be sampled, the
+    // reason that reaches the log used to be whichever window happened to be last in an array, so
+    // "the front window is showing a message bar" could be reported as "something is covering the
+    // ribbon" - a true statement about a different window, which is exactly the three-steps-from-
+    // the-cause shape that has cost this subsystem two diagnoses.
     if (g_sampleEnabled)
     {
         static int countdown = 0;
@@ -4237,22 +4289,67 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
             // the ribbon looks exactly like a sampler that agrees with the fallback, because on this
             // rig the two answers are the same number - so silence here costs a whole diagnosis.
             static wchar_t lastWhy[192] = L"";
-            const wchar_t* why = L"no strip was ready to be asked";
+            const wchar_t* why      = L"no strip was ready to be asked";
+            const wchar_t* frontWhy = NULL;
+            const wchar_t* barWhy   = NULL;
 
-            for (int i = 0; i < g_stripCount; i++)
+            HWND front   = GetForegroundWindow();
+            BOOL applied = FALSE;
+
+            for (int pass = 0; pass < 2 && !applied; pass++)
             {
-                StripState* state = &g_strips[i];
-                if (!state->enabled || !state->strip || !IsWindow(state->frame))
-                    continue;
-                if (!IsWindowVisible(state->frame) || IsIconic(state->frame))
-                    continue;
-
-                COLORREF chrome;
-                if (SampleChrome(state, &chrome, &why))
+                for (int i = 0; i < g_stripCount; i++)
                 {
-                    ApplyPalette(chrome, L"sampled from Word's ribbon");
-                    break;
+                    StripState* state = &g_strips[i];
+
+                    BOOL isFront = (state->frame == front);
+                    if (pass == 0 ? !isFront : isFront)
+                        continue;                       // pass 0 is the front window, pass 1 the rest
+
+                    if (!state->enabled || !state->strip || !IsWindow(state->frame))
+                        continue;
+                    if (!IsWindowVisible(state->frame) || IsIconic(state->frame))
+                        continue;
+
+                    COLORREF chrome;
+                    const wchar_t* mine = L"ok";
+                    if (SampleChrome(state, &chrome, &mine))
+                    {
+                        // Which window answered. The palette is one object shared by every strip, so
+                        // a line saying only "sampled from Word's ribbon" cannot distinguish the
+                        // healthy case from this subsystem's one real bug - a window that should not
+                        // have been asked speaking for all of them.
+                        wchar_t from[96];
+                        _snwprintf(from, 96, L"sampled from Word's ribbon in 0x%p", (void*)state->frame);
+                        from[95] = 0;
+                        ApplyPalette(chrome, from);
+                        why     = mine;
+                        applied = TRUE;
+                        break;
+                    }
+
+                    why = mine;
+                    if (isFront)
+                        frontWhy = mine;
+                    if (mine == kBandDoesNotReachTop)
+                        barWhy = mine;
                 }
+            }
+
+            // Precedence when nobody could answer: the window the user is looking at, then a
+            // structural reason from any window, then whatever was tried last.
+            //
+            // The middle one is not tidiness. `front` is GetForegroundWindow(), which is often NOT
+            // one of ours - another application, a Word dialog, a menu - and then frontWhy is never
+            // set and the reason falls back to array order, which is the non-determinism this
+            // rewrite exists to remove. "Something is docked above a strip" is a fact about this
+            // Word that stays true whoever owns the desktop; "something is covering Word's ribbon"
+            // is trivially true of every window whenever another application is in front, so it is
+            // the reason that says least.
+            if (!applied)
+            {
+                if (frontWhy)     why = frontWhy;
+                else if (barWhy)  why = barWhy;
             }
 
             if (wcscmp(why, lastWhy) != 0)

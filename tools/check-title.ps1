@@ -479,6 +479,33 @@ if ($plainFrames.Count -gt 0) {
     } else { Assert $false 'the plain .docx still reports a tab name' }
 } else { Assert $false 'the plain .docx window is still open' }
 
+# ---- every strip still sits in its own window's chrome -------------------------------------------
+#
+# **This suite has the fixture that reaches the bug and never had the assertion, and that is the
+# whole reason this block exists.** A Protected View window's chrome is 38px SHORTER than a normal
+# window's - its reduced ribbon and message bar put the document frame at 318 where a normal
+# window's is 356, measured - and the stack used to broadcast one window's whole interior onto every
+# other. So every other window carved its 32px band 38px too high, inside the ribbon's NetUIHWND.
+#
+# check-stack owns this check but has no mixed-chrome fixture; the two suites that do - this one and
+# check-dot - never ran it. The bug therefore surfaced HERE, twice, as "the + click did nothing":
+# three steps from the cause, because the + was being clicked at a computed centre that had landed
+# inside the ribbon. It is Get-StripPlacement in tools\WordTabHarness.ps1 now.
+#
+# Six windows are open at this point and one of them is in Protected View, which is exactly the mix
+# that used to break. `Measured` is asserted as well as `Ok`, because "every strip is placed
+# correctly" and "there were no strips to look at" are the same answer otherwise.
+
+Write-Step 'Every strip sits between its own window''s chrome and its own document'
+$openFrames = @(Get-Frames)
+$placement  = Get-StripPlacement $openFrames
+Write-Note "$($placement.Measured) of $($openFrames.Count) windows measured, $($placement.Count) fault(s)"
+Assert ($openFrames.Count -eq $fixtures.Count) "all $($fixtures.Count) fixtures still have a window ($($openFrames.Count))"
+Assert ($placement.Measured -eq $openFrames.Count) `
+    "every one of the $($openFrames.Count) windows could be measured (measured $($placement.Measured))"
+Assert $placement.Ok `
+    ('every strip sits between the chrome and the document, with a Protected View window in the row' + $placement.Text)
+
 # ---- a never-saved document ---------------------------------------------------------------------
 
 Write-Step 'A document that has never been saved'

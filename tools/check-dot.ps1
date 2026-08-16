@@ -121,12 +121,35 @@ function Set-LogMark {
     $script:LogMark = if (Test-Path $LogPath) { (Get-Item $LogPath).Length } else { 0 }
 }
 
+# **THE LOG ROLLS, AND THE OLD CLAMP HID IT.** src\native\log.cpp:42 deletes the file once it passes
+# 512KB, and a full battery generates enough to trip that about once - measured, it happened in the
+# middle of check-title during the run this guard was written for. The mark is a byte offset, so once
+# the file has been deleted and restarted the offset means nothing.
+#
+# The old line was `$offset = [Math]::Min($script:LogMark, $stream.Length)`, which silently reads from
+# the END of the fresh file. That gives EVERY log assertion in this suite a wrong answer, and the two
+# shapes fail in opposite directions: "the log says X since the mark" goes red for a reason that is
+# not the product, and "the log says nothing since the mark" goes GREEN having read nothing at all.
+# The second is the dangerous one, and section 6a's palette assertion is exactly that shape.
+#
+# So a shrunk file is reported, not clamped. Once the evidence has been deleted this suite cannot
+# answer any question about the add-in, and saying so is the only honest outcome.
+#
+# Residual hole, stated: if the log rolled AND grew back past the mark before this read, the length
+# test cannot see it. The mark is hundreds of KB by then and the read follows within seconds, so it
+# is not reachable in practice - but it is why the real fix is a marker line rather than an offset,
+# and why this belongs in the shared harness with the other five copies rather than here.
 function Get-LogSince($pattern) {
     if (-not (Test-Path $LogPath)) { return @() }
     $stream = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
     try {
-        $offset = [Math]::Min([int64]$script:LogMark, $stream.Length)
-        $stream.Seek([int64]$offset, 'Begin') | Out-Null
+        if ($stream.Length -lt [int64]$script:LogMark) {
+            throw ("The add-in log rolled during this run - the mark is at {0} bytes and the file is now {1}. " -f
+                   $script:LogMark, $stream.Length) +
+                  'Everything this suite proves from the log was deleted mid-run, so nothing here can be ' +
+                  'trusted. Re-run it. (src\native\log.cpp rolls at 512KB by deleting the file.)'
+        }
+        $stream.Seek([int64]$script:LogMark, 'Begin') | Out-Null
         $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
         $text = $reader.ReadToEnd()
     } finally { $stream.Dispose() }
@@ -683,12 +706,81 @@ Assert $savedBeta.IsCross 'and the x is back on the tab'
 # ---- 6. a Protected View document does not poison the pass -------------------------------------------
 
 Write-Step 'A Protected View document alongside them'
+
+# The palette assertions below are about what happens WHEN this window arrives, so the log is read
+# from here rather than from the suite's mark. Put back afterwards: everything downstream waits for
+# new lines, but a shared mark that a section quietly moved is the kind of thing that makes the next
+# failure inexplicable.
+$markBeforePv = $script:LogMark
+Set-LogMark
+
 $pvFrame = Open-Document $downloaded $false
 Assert ($pvFrame -ne [IntPtr]::Zero) 'the downloaded document opened a window'
 Assert ((Get-FrameCount) -eq 3) "three windows now (got $(Get-FrameCount))"
 
 $pvTitle = [WordLayout]::TitleOf($pvFrame)
 Assert ($pvTitle -like '*Protected View*') "Word really did open it in Protected View (|$pvTitle|)"
+
+# ---- 6a. it does not repaint every tab yellow ----------------------------------------------------
+#
+# The palette is ONE object shared by every strip, and the sampler used to find Word's ribbon by
+# asking for "the flat band directly above the strip". Above a Protected View strip that band is the
+# yellow message bar - measured at RGB(109,87,0) on a rig whose Word is RGB(41,41,41) - so one
+# downloaded document turned every tab in every window yellow. Same root cause as the 38px bug: a
+# per-window truth used as a stack-wide one.
+#
+# Two claims, and they are deliberately different. The negative one is the user-visible bug. The
+# positive one exists because "no yellow" is also exactly what a sampler that never ran produces -
+# and a poll that quietly stopped polling would pass the negative on its own.
+Write-Step 'The Protected View window is not used as the colour source'
+
+$sawDecline = Wait-Until { @(Get-LogSince 'something is docked between Word''s ribbon').Count -gt 0 } 20 500
+Assert $sawDecline 'the add-in recognised the Protected View window as one it cannot sample the ribbon from'
+$declines = @(Get-LogSince 'something is docked between Word''s ribbon')
+if ($declines.Count -gt 0) { Write-Note $declines[$declines.Count - 1].Trim() }
+
+# And the user-visible half: the palette did not move when the downloaded document arrived. Every
+# change to it is logged and ApplyPalette is its only writer, so no line means no change - and the
+# colours on screen are all derived from that one object, which check-look photographs.
+$moved = @(Get-LogSince 'strip  palette')
+Assert ($moved.Count -eq 0) `
+    ("the palette did not change when the Protected View window arrived" +
+     $(if ($moved.Count) { ' - it took: ' + (($moved | ForEach-Object { $_.Trim() }) -join ' | ') } else { '' }))
+
+# ---- 6b. and every strip is still in its own window's chrome -------------------------------------
+#
+# The mixed-chrome case in absolute terms, and the other half of the same root cause. A Protected
+# View window's chrome is 38px shorter than a normal window's, and the stack used to copy one
+# window's whole interior onto every other - so the others carved their band inside the ribbon.
+# This suite has the fixture that reaches that bug and never had the assertion; it lived in
+# check-stack, which has no mixed-chrome fixture. See Get-StripPlacement in tools\WordTabHarness.ps1.
+Write-Step 'Every strip sits between its own window''s chrome and its own document'
+$dotFrames = @(Get-Frames)
+$placement = Get-StripPlacement $dotFrames
+Write-Note "$($placement.Measured) of $($dotFrames.Count) windows measured, $($placement.Count) fault(s)"
+
+# Against THREE, not against $dotFrames.Count. Comparing Measured to the length of the list it was
+# computed from can only ever be true, so it would report PASS having measured nothing if Word had
+# died or every window had been minimised - and the nearest frame count is up to 20 seconds earlier,
+# on the other side of the wait above.
+Assert ($dotFrames.Count -eq 3) "all three windows are still open to be measured (got $($dotFrames.Count))"
+Assert ($placement.Measured -eq $dotFrames.Count) `
+    "every one of the $($dotFrames.Count) windows could be measured (measured $($placement.Measured))"
+Assert $placement.Ok `
+    ('every strip sits between the chrome and the document, with a Protected View window in the row' + $placement.Text)
+
+# ---- 6c. the control, without which 6a proves nothing -------------------------------------------
+#
+# **Both of 6a's claims are also exactly what a build whose new rule rejects EVERY ribbon would
+# produce**: some window reports the docked-band reason, and the palette never changes because
+# nothing can ever be sampled. The suite would go green over a sampler that had been switched off by
+# accident. So bring an ordinary window back to the front and require the sampler to succeed again.
+Write-Step 'And an ordinary window can still be sampled'
+Assert (Invoke-StripClick 'tab 0' { Get-Spot 0 }) 'tab 0 could be clicked to bring an ordinary window forward'
+$recovered = Wait-Until { @(Get-LogSince 'chrome sample: ok').Count -gt 0 } 20 500
+Assert $recovered 'the sampler reads Word''s ribbon again with an ordinary window in front - the rule did not reject every window'
+
+$script:LogMark = $markBeforePv
 
 # It is in neither Application.Windows nor Documents - measured - so it can never carry a dot. What
 # has to hold is that an unmatched window does not stop the pass answering for everything else.

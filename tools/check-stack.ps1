@@ -135,20 +135,14 @@ function Test-Stacked($label) {
     # Consistency is not correctness. Every window agreeing on a wrong layout passes every check
     # above - which is exactly what happened once: closing a document put the strip at y=0 on top
     # of the ribbon in all of them, identically. So each window is also checked in absolute terms.
-    $wrong = @()
-    foreach ($p in $parts) {
-        if (-not $p.Strip -or -not $p.Wwf) { continue }
-        $kids = [WordLayout]::Children($p.Frame)
-        $client = [WordLayout]::ClientOf($p.Frame)
-        $above = $kids |
-                 Where-Object { $_.Visible -and $_.Hwnd -ne $p.Strip.Hwnd -and $_.Hwnd -ne $p.Wwf.Hwnd -and
-                                $_.Bottom -le $p.Strip.Top -and $_.Width -gt ($client.Right * 0.6) } |
-                 Sort-Object Bottom -Descending | Select-Object -First 1
-        if ($p.Strip.Bottom -ne $p.Wwf.Top) { $wrong += "0x$('{0:X}' -f [int64]$p.Frame) strip bottom $($p.Strip.Bottom) != document top $($p.Wwf.Top)" }
-        elseif (-not $above)                { $wrong += "0x$('{0:X}' -f [int64]$p.Frame) nothing above the strip - it is sitting at the top of the window" }
-        elseif ($above.Bottom -ne $p.Strip.Top) { $wrong += "0x$('{0:X}' -f [int64]$p.Frame) $($above.Class) ends at $($above.Bottom), strip starts at $($p.Strip.Top)" }
-    }
-    Assert ($wrong.Count -eq 0) ("$label - every strip sits between the chrome and the document" + $(if ($wrong.Count) { ": " + ($wrong -join '; ') } else { '' }))
+    #
+    # This block used to live here and ONLY here, which is why the 38px Protected View bug reported
+    # itself three steps from its cause twice: this suite has no mixed-chrome fixture, and the two
+    # that do never ran the check. It is now Get-StripPlacement in tools\WordTabHarness.ps1 and
+    # check-title and check-dot run it against a real Protected View window.
+    $place = Get-StripPlacement (@($parts) | ForEach-Object { $_.Frame })
+    Assert ($place.Measured -eq $parts.Count) "$label - all $($parts.Count) windows could be measured for strip placement (measured $($place.Measured))"
+    Assert $place.Ok ("$label - every strip sits between the chrome and the document" + $place.Text)
 
     return $parts
 }
