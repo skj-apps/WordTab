@@ -108,9 +108,19 @@ const wchar_t* LogFilePath(void);
 HRESULT WordTabCreateConnect(REFIID riid, void** ppv);
 
 // Ask Word for a new blank document, through the Application object it handed us at OnConnection.
-// The one thing WordTab needs from Word's object model: everything else it does, it does to windows.
 // Returns FALSE if Word declined or there is no Application - it never throws and never blocks.
 BOOL WordTabNewDocument(void);
+
+// Which of these frames have a document with unsaved changes, by one pass over Application.Windows.
+// `frames` and `modified` are parallel arrays of `count` entries.
+//
+// TRUE means Word answered and every entry of `modified` was written - including FALSE for a frame
+// no Word window claims, which is a real answer rather than a missing one (a Protected View document
+// is in none of this Application's collections, and cannot be edited anyway).
+//
+// FALSE means Word would not answer at all, and `modified` was NOT touched: the caller keeps
+// whatever it had. A tick that failed to measure must not be able to pass for a measurement.
+BOOL WordTabReadModified(const HWND* frames, int count, BOOL* modified);
 
 // Save the document behind a tab, through Word's own Document.Save - so an unchanged document is
 // untouched and one that has never been saved gets Word's Save As dialog, exactly as Ctrl+S would.
@@ -191,6 +201,13 @@ void StackOnFrameSize(HWND frame, WPARAM sizeType);
 void StackOnFrameEnable(HWND frame, BOOL enabled);
 void StackJanitor(void);
 void StackStop(void);
+
+// Is a batch close - Close Others, Close All, Close Tabs to the Right - part-way through?
+//
+// Exported so that the janitor's other work can stand off while it runs. A batch is a sequence of
+// WM_CLOSEs with Word's save prompt appearing between them, which makes it the one stretch where
+// Word is repeatedly in the middle of something it was asked to do by us.
+BOOL StackCloseInFlight(void);
 
 // ---------------------------------------------------------------------------------------------
 // The taskbar - one button for the whole stack, following the active tab. See taskbar.cpp.

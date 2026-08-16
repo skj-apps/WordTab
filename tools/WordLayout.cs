@@ -600,6 +600,48 @@ public static class WordLayout
     public static IntPtr WindowAt(int x, int y) { POINT p; p.X = x; p.Y = y; return WindowFromPoint(p); }
     public static POINT Cursor() { POINT p; GetCursorPos(out p); return p; }
 
+    // Which process owns a window. Word puts a Protected View document in a sandboxed WINWORD of its
+    // own, and an add-in's Application object speaks only for the process it is loaded in - so "same
+    // process?" is the difference between a document the object model can see and one it cannot,
+    // however ordinary the window looks on screen.
+    public static int PidOf(IntPtr hwnd) { uint pid; GetWindowThreadProcessId(hwnd, out pid); return (int)pid; }
+
+    // The Word object model for ONE named window, rather than for whichever instance the running
+    // object table feels like handing out. A probe that does New-Object -ComObject Word.Application
+    // while Word is already up got an Application reporting Documents.Count = 0 and a Windows
+    // collection with no Count on it - measured - because the class object it bound to was not the
+    // Word the user is looking at. This asks a window directly instead: OBJID_NATIVEOM on Word's
+    // _WwG document pane returns that window's own Word.Window object, in that window's own process.
+    //
+    // The add-in never needs this - it is handed Application by Word in OnConnection and so is
+    // already inside the right process. This exists so a test script can be a SECOND oracle for what
+    // the add-in reports, and so a Protected View document, which lives in a sandboxed WINWORD of
+    // its own, can be asked the same questions as a normal one.
+    [DllImport("oleacc.dll")] static extern int AccessibleObjectFromWindow(
+        IntPtr hwnd, uint objectId, ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object obj);
+
+    const uint OBJID_NATIVEOM = 0xFFFFFFF0;
+
+    // The _WwG pane, which is the window that answers OBJID_NATIVEOM. IntPtr.Zero if the frame has
+    // no document pane - which is the Start screen and an emptied window, not a failure.
+    public static IntPtr DocumentPane(IntPtr frame)
+    {
+        foreach (Child c in Children(frame)) if (c.Class == "_WwG") return c.Hwnd;
+        return IntPtr.Zero;
+    }
+
+    // Null rather than an exception when the window will not answer, because "Word would not answer"
+    // is a result this measurement is looking for, not an error in taking it.
+    public static object NativeOm(IntPtr frame)
+    {
+        IntPtr pane = DocumentPane(frame);
+        if (pane == IntPtr.Zero) return null;
+        Guid iid = new Guid("00020400-0000-0000-C000-000000000046");   // IID_IDispatch
+        object obj;
+        int hr = AccessibleObjectFromWindow(pane, OBJID_NATIVEOM, ref iid, out obj);
+        return hr == 0 ? obj : null;
+    }
+
     // A keystroke, for making a document dirty so the save prompt can be provoked on purpose.
     public static void Press(ushort vk) { Key(vk, false); Thread.Sleep(40); Key(vk, true); Thread.Sleep(60); }
 

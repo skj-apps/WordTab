@@ -195,6 +195,53 @@ static BOOL GetLongProperty(IDispatch* disp, const wchar_t* name, LONG* value)
     return ok;
 }
 
+// One element of a collection: Application.Windows.Item(i), one-based like every Office collection.
+//
+// The first call in this add-in that passes an argument through IDispatch::Invoke, so the shape is
+// worth stating once. DISPPARAMS carries the arguments in an array that is *reversed* - last
+// parameter first - which does not show with one argument and is exactly the kind of thing that
+// works by accident until a second one is added. `Item` is asked for by name rather than through
+// DISPID_VALUE: a collection's default member is a convention, and a named lookup that fails says so
+// instead of invoking something else.
+//
+// NULL on any failure, and the caller Releases what it gets, like GetObjectProperty.
+static IDispatch* GetItemAt(IDispatch* collection, LONG index)
+{
+    if (!collection)
+        return NULL;
+
+    DISPID dispid = 0;
+    LPOLESTR nameCopy = (LPOLESTR)L"Item";
+    if (FAILED(collection->GetIDsOfNames(IID_NULL, &nameCopy, 1, LOCALE_USER_DEFAULT, &dispid)))
+        return NULL;
+
+    VARIANT arg;
+    VariantInit(&arg);
+    arg.vt   = VT_I4;
+    arg.lVal = index;
+
+    DISPPARAMS args = { &arg, NULL, 1, 0 };
+    VARIANT result;
+    VariantInit(&result);
+    EXCEPINFO error;
+    memset(&error, 0, sizeof(error));
+
+    HRESULT hr = collection->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT,
+                                    DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+                                    &args, &result, &error, NULL);
+    ClearExceptionInfo(&error);
+
+    IDispatch* item = NULL;
+    if (SUCCEEDED(hr) && result.vt == VT_DISPATCH && result.pdispVal)
+    {
+        item = result.pdispVal;
+        item->AddRef();
+    }
+
+    VariantClear(&result);
+    return item;
+}
+
 // Call a method that takes no arguments, and say what Word said if it objects.
 static BOOL CallMethodNoArgs(IDispatch* disp, const wchar_t* name)
 {
@@ -292,6 +339,119 @@ BOOL WordTabSaveDocument(HWND frame)
              known ? L"  (Word confirmed the window handle)"
                    : L"  (Word does not report Window.Hwnd - went on the activation alone)");
     return saved;
+}
+
+// Which of these tabs have a document with unsaved changes.
+//
+// One pass over Application.Windows for the whole row rather than a lookup per tab: the collection
+// has to be walked either way, and walking it once is the difference between four Invokes and four
+// Invokes *per document*. This runs twice a second on Word's own UI thread, so its cost is Word's
+// own responsiveness.
+//
+// **Window.Hwnd is the join, and it is the OpusApp frame handle.** Measured for every window at once
+// rather than only for the active one - tools\probe-saved.ps1 - which is what makes it possible to
+// find a document without activating anything, and therefore safe to do on a timer at all.
+//
+// Two failures, deliberately not merged into one:
+//   - **Word would not answer at all** (no Application, no Windows, no Count). Returns FALSE having
+//     touched nothing, so every flag keeps the value it already had. A tick that could not take a
+//     measurement must not be allowed to look like a measurement that came back "clean".
+//   - **Word answered and no window claims this frame.** That is determinate, and the answer is
+//     FALSE. It is the Protected View case: such a document lives in a sandboxed WINWORD of its own
+//     and is in neither Application.Windows nor Documents, only in ProtectedViewWindows - measured.
+//     It is also the right answer on its own merits, because a document in Protected View cannot be
+//     edited and so can never have unsaved changes.
+//
+// Document.Saved is TRUE when the document has NOT changed since it was last saved, so the dot is
+// its negation. Saved is also *settable*, and nothing here ever writes it.
+BOOL WordTabReadModified(const HWND* frames, int count, BOOL* modified)
+{
+    if (!frames || !modified || count <= 0 || !g_application)
+        return FALSE;
+
+    IDispatch* windows = GetObjectProperty(g_application, L"Windows");
+    if (!windows)
+        return FALSE;
+
+    LONG total = 0;
+    if (!GetLongProperty(windows, L"Count", &total))
+    {
+        windows->Release();
+        return FALSE;
+    }
+
+    // Past here every frame gets a determinate answer, and the answer for one no window claims is
+    // "clean" rather than "unknown".
+    for (int i = 0; i < count; i++)
+        modified[i] = FALSE;
+
+    int unreadable = 0;
+
+    for (LONG index = 1; index <= total; index++)
+    {
+        IDispatch* window = GetItemAt(windows, index);
+        if (!window)
+            continue;
+
+        LONG reported = 0;
+        if (!GetLongProperty(window, L"Hwnd", &reported))
+        {
+            window->Release();
+            continue;
+        }
+
+        // Which tab this is, if it is one at all. A search rather than an index: one document can
+        // own several windows - Word's own New Window - and Windows.Count is not the tab count.
+        // The same (LONG)(LONG_PTR) narrowing as WordTabSaveDocument, for the same reason: window
+        // handles are 32-bit values sign-extended into a pointer, and Word reports Hwnd as a long.
+        int slot = -1;
+        for (int i = 0; i < count; i++)
+            if ((LONG)(LONG_PTR)frames[i] == reported)
+                slot = i;
+
+        if (slot < 0)
+        {
+            window->Release();
+            continue;
+        }
+
+        IDispatch* document = GetObjectProperty(window, L"Document");
+        window->Release();
+        if (!document)
+        {
+            unreadable++;
+            continue;
+        }
+
+        LONG saved = 0;
+        if (GetLongProperty(document, L"Saved", &saved))
+            modified[slot] = saved ? FALSE : TRUE;   // VARIANT_TRUE is -1, so never compare against TRUE
+        else
+            unreadable++;
+
+        document->Release();
+    }
+
+    windows->Release();
+
+    // Said when it starts and when it stops, never per tick. A window that is in the collection but
+    // will not answer Document.Saved reads as clean above, and a tab silently stuck without its dot
+    // is precisely the failure this project keeps meeting: a plausible answer from a question that
+    // was never asked. Twice a second, so it is on change or it is noise.
+    static BOOL complaining = FALSE;
+    if (unreadable > 0 && !complaining)
+    {
+        complaining = TRUE;
+        LogWrite(L"dot: %d of %ld window(s) would not answer Document.Saved - those tabs read as "
+                 L"clean until they do", unreadable, total);
+    }
+    else if (unreadable == 0 && complaining)
+    {
+        complaining = FALSE;
+        LogWrite(L"dot: every window answers Document.Saved again");
+    }
+
+    return TRUE;
 }
 
 // Application.Documents.Add(), late-bound like everything else here so the build needs nothing from

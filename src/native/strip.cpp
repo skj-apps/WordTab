@@ -93,6 +93,14 @@
 // because 1 is too thin and 2 is a felt tip, and this number is ours alone - nothing mirrors it.
 #define GLYPH_LOGICAL_STROKE_TENTHS 12
 
+// The unsaved-changes dot, drawn in the close button's own square when the pointer is somewhere
+// else. Radius, not diameter. The x's arms reach 4 logical px from the centre in each direction, so
+// a radius of 3 puts the dot inside the same optical square and at about the same weight of ink -
+// tuned against a photograph rather than reasoned about, because a filled disc reads heavier than
+// two strokes at equal size. Nothing mirrors this number: the *rectangle* is the close button's, and
+// that is the one the check scripts know.
+#define DOT_LOGICAL_RADIUS 3
+
 // What the pointer is over, or what a button press is claiming. Used for both, which is why HIT_TAB
 // appears as a press kind: it means a *middle* press, since a left press on a tab acts immediately
 // and never waits for a release.
@@ -188,6 +196,18 @@ struct StripState
     BOOL  tracking;       // TrackMouseEvent armed, so WM_MOUSELEAVE will arrive
 
     wchar_t title[256];
+
+    // Does this window's document have unsaved changes? Read from Word's object model by the
+    // janitor, cached here and compared against last tick exactly as the title is.
+    //
+    // On the strip rather than on the stack's Member, and that is not arbitrary: StackTabs answers
+    // with the frame as its own single tab when stacking is off or a member has not joined, so a
+    // flag living on Member would be correct everywhere except with Stack=0, where it would simply
+    // never appear. StripState is the thing that exists whenever there is a tab to draw.
+    //
+    // FALSE until Word has been asked, which is what StripAttachFrame's memset gives for free, and
+    // the honest starting value: no dot is what a document that has not been measured looks like.
+    BOOL modified;
 };
 
 // Where every clickable thing in a strip is, in the strip's client coordinates. One structure
@@ -235,6 +255,7 @@ static BOOL g_lookEnabled = TRUE;        // HKCU\Software\WordTab\TabStyle
 static BOOL g_sampleEnabled = TRUE;      // HKCU\Software\WordTab\TabThemeSample
 static BOOL g_scrollEnabled = TRUE;      // HKCU\Software\WordTab\TabScroll
 static BOOL g_titleTrimEnabled = TRUE;   // HKCU\Software\WordTab\TabTitleTrim
+static BOOL g_dotEnabled = TRUE;         // HKCU\Software\WordTab\TabDot
 
 // ---------------------------------------------------------------------------------------------
 // How far the row is scrolled.
@@ -337,6 +358,18 @@ static StripState* FindByFrame(HWND frame)
         if (g_strips[i].frame == frame)
             return &g_strips[i];
     return NULL;
+}
+
+// Does the document behind this tab have unsaved changes? Every strip draws every tab, so the answer
+// belongs to the frame being drawn and not to the strip doing the drawing - which is why this is a
+// lookup rather than a field read. FALSE for a frame with no strip of its own, and for every frame
+// while the dot is switched off, so one test here turns the whole feature off in both renderers.
+static BOOL FrameModified(HWND frame)
+{
+    if (!g_dotEnabled)
+        return FALSE;
+    StripState* owner = FindByFrame(frame);
+    return (owner && owner->modified) ? TRUE : FALSE;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1739,6 +1772,38 @@ static void SurfRoundRect(Surface* s, const RECT* box, int rTop, int rBottom,
     }
 }
 
+// A filled circle, centred in a box. The same sixteen-sample coverage as the rounded corners above,
+// so the dot is anti-aliased by the same arithmetic as everything else in the strip and cannot end
+// up being the one shape with a staircase on it.
+//
+// Its own function rather than SurfRoundRect with the radius set to half the side: that would work,
+// the clamps at the top of SurfRoundRect allow it, but it would express "a circle" as "a rectangle
+// so rounded it stopped being one" and would round to an even diameter whatever radius it was given.
+static void SurfDisc(Surface* s, const RECT* box, int radius, COLORREF color)
+{
+    if (radius <= 0)
+        return;
+
+    int cx = (box->left + box->right) / 2;
+    int cy = (box->top + box->bottom) / 2;
+
+    int x0 = cx - radius - 1, x1 = cx + radius + 1;
+    int y0 = cy - radius - 1, y1 = cy + radius + 1;
+
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > s->w) x1 = s->w;
+    if (y1 > s->h) y1 = s->h;
+
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++)
+        {
+            int cov = CircleCoverage(x, y, cx, cy, radius);
+            if (cov > 0)
+                Blend(s, x, y, color, cov);
+        }
+}
+
 // The lift under a carried tab: the same shape, drawn a few times, each one larger and offset a
 // little further down, each one faint. The overlap is what makes the falloff - there is no blur
 // kernel here and none is needed at four pixels.
@@ -1864,7 +1929,8 @@ static void DrawChip(Surface* s, const RECT* box, BOOL hot, BOOL down, int dpi)
 // lift is a parameter for the same reason - it is an argument to this function, not a second
 // drawing path for dragged tabs.
 static void DrawOneTab(StripState* state, Surface* s, HWND frame,
-                       RECT tab, RECT close, BOOL selected, BOOL hot, BOOL lifted, BOOL first)
+                       RECT tab, RECT close, BOOL selected, BOOL hot, BOOL lifted, BOOL first,
+                       BOOL modified)
 {
     // The one ordering rule in this file. Tab names are drawn by GDI and GDI batches; everything
     // below reads the pixels back to blend against them, and a batch still in flight would be
@@ -1936,11 +2002,40 @@ static void DrawOneTab(StripState* state, Surface* s, HWND frame,
     if (hasClose)
     {
         GdiFlush();
+
+        // The dot is the close button, until the pointer arrives. VS Code's trick, and it is taken
+        // for a measured reason rather than a stylistic one: the row already scrolls at six
+        // documents in a Word window of Word's own default size, so a mark that took width of its
+        // own would make every row scroll sooner, permanently, to show something that is usually
+        // "no". This one takes none - the rectangle is the close button's, unchanged, which is also
+        // why ComputeLayout and tools\WordLayout.cs needed no edit for this slice.
+        //
+        // `hot` and not `hotClose`: hovering anywhere on the tab brings the x back, so the button is
+        // reached by moving towards the tab rather than by finding the dot first. A carried tab and
+        // a tab with its menu open are both hot, and so both show the x, which is the same answer as
+        // "the pointer is on it".
+        //
+        // `!downClose` as well, and it is not redundant. An armed press is NOT a subset of hot: a
+        // press on the close button takes capture and sets pressKind, then sliding the pointer off
+        // the tab while still holding clears hotFrame - only WM_CAPTURECHANGED clears pressKind - so
+        // the button is still armed with hot FALSE. Without this term a modified tab would drop its
+        // held chip and go back to looking at rest, while an unmodified tab under the identical
+        // gesture keeps it. The press is live either way: moving back onto the button and releasing
+        // still closes the document. One gesture must not be drawn two ways depending on whether the
+        // document happens to be saved.
         BOOL hotClose  = (state->hotKind == HIT_CLOSE && state->hotFrame == frame);
         BOOL downClose = (state->pressKind == HIT_CLOSE && state->pressFrame == frame);
-        DrawChip(s, &close, hotClose, downClose, dpi);
-        DrawGlyph(s, &close, hotClose || downClose ? g_palette.glyphHot : g_palette.glyph,
-                  dpi, GLYPH_CROSS);
+
+        if (modified && !hot && !downClose)
+        {
+            SurfDisc(s, &close, Scaled(DOT_LOGICAL_RADIUS, dpi), g_palette.glyph);
+        }
+        else
+        {
+            DrawChip(s, &close, hotClose, downClose, dpi);
+            DrawGlyph(s, &close, hotClose || downClose ? g_palette.glyphHot : g_palette.glyph,
+                      dpi, GLYPH_CROSS);
+        }
     }
 }
 
@@ -2009,7 +2104,7 @@ static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
         BOOL first = (i == 0) || (tab.left <= layout.track.left);
 
         DrawOneTab(state, s, frames[i], tab, layout.close[i],
-                   (i == activeIndex), hotTab, FALSE, first);
+                   (i == activeIndex), hotTab, FALSE, first, FrameModified(frames[i]));
 
         if (i == activeIndex)
         {
@@ -2039,7 +2134,7 @@ static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
         if (tab.left < layout.track.right && tab.right > tab.left)
         {
             DrawOneTab(state, s, g_dragFrame, tab, close,
-                       (carried == activeIndex), TRUE, TRUE, FALSE);
+                       (carried == activeIndex), TRUE, TRUE, FALSE, FrameModified(g_dragFrame));
 
             if (carried == activeIndex)
             {
@@ -2241,7 +2336,30 @@ static void DrawStripFlat(StripState* state, HDC dc, const RECT* client)
                       DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
 
-        if (hasClose)
+        if (hasClose && FrameModified(frames[i]) && !hotTab)
+        {
+            // The same swap as the composited renderer, in this one's idiom: a GDI ellipse from a
+            // brush, aliased like the x it replaces. The dot ships here rather than only on the
+            // styled path because TabStyle=0 exists so that a visual regression can be bisected -
+            // and a fallback that quietly drops a feature is a fallback that cannot be compared
+            // against.
+            HBRUSH ink = CreateSolidBrush(g_palette.glyph);
+            if (ink)
+            {
+                RECT box = layout.close[i];
+                int cx = (box.left + box.right) / 2;
+                int cy = (box.top + box.bottom) / 2;
+                int r  = Scaled(DOT_LOGICAL_RADIUS, state->dpi);
+
+                HGDIOBJ oldBrush = SelectObject(dc, ink);
+                HGDIOBJ oldPen   = SelectObject(dc, GetStockObject(NULL_PEN));
+                Ellipse(dc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+                SelectObject(dc, oldPen);
+                SelectObject(dc, oldBrush);
+                DeleteObject(ink);
+            }
+        }
+        else if (hasClose)
         {
             HPEN glyph = CreatePen(PS_SOLID, Scaled(1, state->dpi), g_palette.glyph);
             if (glyph)
@@ -3856,6 +3974,148 @@ static void Restore(StripState* state)
 // Half a second is slow enough to be free and fast enough that nothing is visibly late.
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// The unsaved-changes dot.
+//
+// This is the first thing the add-in reads about Word's *documents* rather than its windows, and it
+// is a poll. The standing rule is that transient state must be heard rather than sampled - got wrong
+// twice over Word's save prompt, at real cost - and it is worth being exact about why it does not
+// bite here. The rule is about state that can appear and disappear *inside* one tick, which no
+// sampler catches at any cadence. "This document has unsaved changes" is not that: it goes true on a
+// keystroke and stays true until a save. A sampler that is one tick late is one tick late.
+//
+// There is also no event to hear. Word's Application events cover documents opening, closing and
+// being saved; none of them is "the modified flag changed", and typing raises none of them. Hearing
+// this properly would mean an IConnectionPoint sink for events that still would not answer the
+// question. The honest mechanism is the one that can actually observe the state.
+//
+// The whole row in one pass rather than one lookup per tab - see WordTabReadModified.
+// ---------------------------------------------------------------------------------------------
+
+static void PollModified(void)
+{
+    if (!g_dotEnabled)
+        return;
+
+    // A batch close is a run of WM_CLOSEs with Word's save prompt in between them, driven by us. It
+    // is the one stretch where Word is repeatedly part-way through something we asked for, and the
+    // dot is not worth a call into the object model during it. Nothing is lost: the flags keep what
+    // they had, and the tabs they belong to are being closed.
+    if (StackCloseInFlight())
+        return;
+
+    HWND        frames[MAX_STRIPS];
+    StripState* owners[MAX_STRIPS];
+    int count = 0;
+
+    for (int i = 0; i < g_stripCount && count < MAX_STRIPS; i++)
+    {
+        StripState* state = &g_strips[i];
+        if (!state->enabled || !state->frame || !IsWindow(state->frame))
+            continue;
+        if (!state->wwf || !IsWindow(state->wwf))
+            continue;
+
+        // A disabled frame is a frame with a modal dialog on it - that is what EnableWindow means
+        // here, and it is the same signal the batch close listens for as an event. Word is asking
+        // the user something; it is not the moment to ask Word something. The whole pass stands
+        // down rather than skipping the one window, because the object model is Word's, not that
+        // window's, and a tick missed is a flag unchanged.
+        if (!IsWindowEnabled(state->frame))
+            return;
+
+        owners[count] = state;
+        frames[count] = state->frame;
+        count++;
+    }
+
+    if (count == 0)
+        return;
+
+    LARGE_INTEGER before, after, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&before);
+
+    BOOL modified[MAX_STRIPS];
+    BOOL answered = WordTabReadModified(frames, count, modified);
+
+    QueryPerformanceCounter(&after);
+
+    if (!answered)
+        return;                 // every flag keeps its last value - see WordTabReadModified
+
+    BOOL changed = FALSE;
+    for (int i = 0; i < count; i++)
+    {
+        if (owners[i]->modified == modified[i])
+            continue;
+
+        owners[i]->modified = modified[i];
+        changed = TRUE;
+
+        // A dot is drawn and never stored in a control, so there is no reading one from outside the
+        // process. This line is that way, and it is pipe-wrapped for the same reason the tab name's
+        // is: check-dot.ps1 asserts the state against it and then photographs the button, because a
+        // log line about what was computed is not evidence of what was drawn.
+        LogWrite(L"strip  hwnd=0x%p  dot |%s|  document |%s|",
+                 (void*)owners[i]->frame, owners[i]->modified ? L"on" : L"off", owners[i]->title);
+    }
+
+    if (changed)
+        StripRefreshTabs();
+
+    // What it costs. The out-of-process measurement in tools\probe-saved.ps1 put a two-window pass
+    // at ~2ms across a process boundary, and in-process on one STA thread this is a direct call with
+    // no marshalling at all - but that is a reason to expect a small number, not a substitute for
+    // having one. This runs inside Word's input loop; a claim about its cost should come off the rig
+    // it runs on.
+    //
+    // Reported two ways, because the first version of this reported only new records and that turned
+    // out to say almost nothing: the very first pass over a newly-arrived window cost 2727us against
+    // a steady state of about 200, so the record line described a cold start and then fell silent
+    // forever. A worst case with no typical case beside it is not a measurement of what something
+    // costs.
+    if (freq.QuadPart <= 0)
+        return;
+
+    LONGLONG us = (after.QuadPart - before.QuadPart) * 1000000 / freq.QuadPart;
+
+    static LONGLONG worstEver = -1;
+    if (us > worstEver)
+    {
+        worstEver = us;
+        LogWrite(L"strip  dot poll: %d window(s) in %lld us (the most it has ever taken)", count, us);
+    }
+
+    // ...and a summary: once ten seconds in, and every four minutes after that.
+    //
+    // The early one is the point. The record line above is dominated by the very first pass of a
+    // process - 27547us against a steady state three orders of magnitude below it, because the
+    // janitor is usually the first thing in the process ever to touch Word's object model and that
+    // first call is Word building its automation machinery. A cold outlier with nothing beside it
+    // says almost nothing about what this costs. The four-minute cadence afterwards is rare enough
+    // not to crowd a log that rolls at half a megabyte.
+    static int      passes    = 0;
+    static int      reportAt  = 20;
+    static LONGLONG total     = 0;
+    static LONGLONG worst     = 0;
+
+    passes++;
+    total += us;
+    if (us > worst)
+        worst = us;
+
+    if (passes >= reportAt)
+    {
+        LogWrite(L"strip  dot poll: %d window(s), %d passes, mean %lld us, worst %lld us",
+                 count, passes, total / passes, worst);
+        passes   = 0;
+        total    = 0;
+        worst    = 0;
+        reportAt = 480;
+    }
+}
+
 static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
 {
     (void)hwnd; (void)msg; (void)id; (void)tick;
@@ -3911,6 +4171,11 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
     // re-decided on the same cadence rather than tracked through events that Word does not always
     // send.
     StackJanitor();
+
+    // After StackJanitor, so that a window which has just left the stack is not asked about, and a
+    // window which has just joined it is. Before the chrome sample, which is the cheaper of the two
+    // and has waited two seconds already.
+    PollModified();
 
     // Has Word changed colour underneath us?
     //
@@ -4016,6 +4281,20 @@ void StripStart(void)
     // a window belonging to Word. Off, the palette comes from the Office theme registry value the
     // way it always did - which is the setting to try first if the strip is ever the wrong colour on
     // a machine this has not been run on.
+    //
+    // This line went missing when the tab-name slice inserted the block below it, and the switch was
+    // dead from then until the dot slice found it: g_sampleEnabled stayed TRUE whatever the registry
+    // said, and the summary line at the end of this function reported "on" every time - a log that
+    // named a setting it could not observe. The escape hatch the notes call "the first thing to try
+    // if the strip is ever the wrong colour on a machine this has not run on" did nothing at all.
+    //
+    // Restored exactly as it was, ternary included - `git show c6a0e11:src/native/strip.cpp` line
+    // 3295. The first attempt at putting it back dropped the `g_lookEnabled ?` and would have made
+    // TabStyle=0 sample where it used to fall back to the registry, which is a change of behaviour
+    // wearing the clothes of a repair. Whether the sampler should be tied to the look at all is a
+    // real question and it is not this slice's to answer.
+    g_sampleEnabled = g_lookEnabled ? WordTabReadFlag(L"TabThemeSample", TRUE) : FALSE;
+
     // Trimming Word's state annotations off the tab name. Off, the tab reads exactly what Word's
     // title bar reads, minus the application suffix. This is a switch rather than nothing because it
     // is the one part of the title rule that is a *policy* - somebody may want to see "Read-Only" on
@@ -4023,6 +4302,13 @@ void StripStart(void)
     // Removing the suffix from the end rather than the first match is not on the switch: that was a
     // defect, and a setting that restored it would exist only to put the bug back.
     g_titleTrimEnabled = WordTabReadFlag(L"TabTitleTrim", TRUE);
+
+    // The unsaved-changes dot. Off, a tab's close button is always an x and nothing reads Word's
+    // object model on the janitor - the poll returns before it asks, so the switch takes the whole
+    // mechanism out of the way rather than merely hiding what it draws. That is the point of it:
+    // this is the first sustained use of the object model in the add-in, and if a Word somewhere
+    // objects to being asked twice a second, this is the setting that stops the asking.
+    g_dotEnabled = WordTabReadFlag(L"TabDot", TRUE);
 
     if (!g_stripClass)
     {
@@ -4050,7 +4336,7 @@ void StripStart(void)
 
     LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s  "
              L"tab menu=%s  tab drag=%s  tab scroll=%s  tab style=%s  theme sample=%s  "
-             L"title trim=%s",
+             L"title trim=%s  dot=%s",
              g_stripClass ? L"registered" : L"FAILED",
              g_janitor ? L"running" : L"FAILED", STRIP_LOGICAL_H,
              g_palette.dark ? L"dark" : L"light",
@@ -4060,7 +4346,8 @@ void StripStart(void)
              g_scrollEnabled ? L"on" : L"squeeze (HKCU\\Software\\WordTab\\TabScroll=0)",
              g_lookEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabStyle=0)",
              g_sampleEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabThemeSample=0)",
-             g_titleTrimEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTitleTrim=0)");
+             g_titleTrimEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTitleTrim=0)",
+             g_dotEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabDot=0)");
 }
 
 void StripAttachFrame(HWND frame)

@@ -1128,6 +1128,13 @@ static BOOL WordIsAsking(HWND target)
     return _wcsicmp(cls, L"OpusApp") != 0;
 }
 
+// The same test CloseBatchEnd opens with, given a name and a declaration so that work outside this
+// file can stand off while a batch runs.
+BOOL StackCloseInFlight(void)
+{
+    return (g_closeCount > 0 || g_closeFlight != NULL) ? TRUE : FALSE;
+}
+
 static void CloseBatchEnd(const wchar_t* why)
 {
     if (g_closeCount == 0 && !g_closeFlight)
