@@ -169,6 +169,19 @@ and the last two defects in this subsystem both came from a plausible rule writt
 measurement. The symptom is the documented `TabThemeSample=0` behaviour, which has an escape hatch,
 and the queue carries "measure QAT-below-ribbon" as a small follow-up.
 
+> **MEASURED 2026-08-16, AND THE THREE PARAGRAPHS ABOVE ARE WRONG. Kept as written, because being
+> wrong in a stated, checkable way is the point of writing it down at all — see
+> `RESULT-qat.md` for the measurement.** Word does *not* dock the QAT as a second `MsoCommandBar`
+> chain: it grows the ribbon's own `NetUIHWND` from `y 0..356` to `y 0..426` and puts the row inside
+> it. So the new rule does not decline — `strip  chrome sample: ok` — nothing falls back, and the old
+> and new rules pick the same window here and always did. The row is also *not* the ribbon's colour:
+> `RGB(31,31,31)` against the ribbon body's `RGB(41,41,41)` in dark, `RGB(250,250,250)` against
+> `RGB(255,255,255)` in light. The strip samples the QAT row, which is the colour Word is painting
+> immediately above it, and the active card matches the band above it exactly — the same relationship
+> as everywhere else. **Nothing was changed.** The decision to leave it unmeasured rather than guess
+> at a rule was still the right one: a rule written to skip that "second chain" would have been code
+> for a structure that does not exist.
+
 ## The adversarial audit, and the two things it was right about
 
 Four lenses over the diff, every claim then put to three skeptics. Fourteen claims. The two that
