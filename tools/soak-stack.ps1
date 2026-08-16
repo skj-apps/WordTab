@@ -36,6 +36,10 @@ Add-Type -TypeDefinition (Get-Content -Raw -Path (Join-Path $PSScriptRoot 'WordL
     -Language CSharp -ReferencedAssemblies @('System.Runtime','System.Collections','System.Threading.Thread','netstandard')
 [WordLayout]::MakeDpiAware() | Out-Null
 
+# Confirmed input, one shared idea of what a Word dialog is, and the bounded waits. See the header of
+# tools\WordTabHarness.ps1 for why these are not per-suite copies any more.
+. (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
+
 $script:Failures = 0
 $script:Checks   = 0
 
@@ -47,21 +51,15 @@ function Assert($condition, $text) {
     else { $script:Failures++; Write-Host "    FAIL  $text" -ForegroundColor Red }
 }
 
-function Get-Frames {
-    $found = @()
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
-        $found += [WordLayout]::Frames($process.Id)
-    }
-    return @($found)
-}
+function Get-Frames { return Get-WordFrameList }
 
 function Get-Parts($frame) {
     $kids = [WordLayout]::Children($frame)
     [pscustomobject]@{
         Frame = $frame
         Rect  = [WordLayout]::RectOf($frame)
-        Strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' })[0]
-        Wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' })[0]
+        Strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' }) | Select-Object -First 1
+        Wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' }) | Select-Object -First 1
         Title = [WordLayout]::TitleOf($frame)
     }
 }
@@ -115,9 +113,12 @@ function Open-Document($index) {
 # ---- open six documents --------------------------------------------------------------------------
 
 Write-Step 'Opening six documents'
+# Waiting for each document to arrive with a strip on it rather than sleeping 14 seconds for the
+# first and 6 for each of the other five - 44 seconds of guessing on every run. This is the harness
+# getting into position; the assertions below are about geometry, not about how fast Word opens files.
 for ($i = 1; $i -le 6; $i++) {
     Open-Document $i
-    Start-Sleep -Seconds $(if ($i -eq 1) { 14 } else { 6 })
+    if (-not (Wait-WordReady $i 45)) { Write-Note "document $i did not arrive with a strip on it within 45s" }
 }
 Wait-Settled 6 30
 $parts = Test-Intact 'Six documents'
@@ -156,14 +157,25 @@ $active = [WordLayout]::GetForeground()
 if (-not ((Get-Frames) -contains $active)) { $active = (Get-Frames)[0] }
 [WordLayout]::Focus($active) | Out-Null
 
+# Aimed at the document frame's own SCREEN rectangle. The previous version added client-relative
+# child coordinates to the frame's window rectangle and dropped Wwf.Left, so it was off by the border
+# in x and by the caption in y - and a click that misses here makes Alt+F fail three lines later for
+# a reason that looks nothing like a mis-aimed click. Same defect, same fix, as check-strip.
 $parts = @(Get-Parts $active)
-$r = [WordLayout]::RectOf($active)
 if ($parts[0].Wwf) {
-    [WordLayout]::Click(($r.Left + [int]($parts[0].Wwf.Width / 2)), ($r.Top + $parts[0].Wwf.Top + [int]($parts[0].Wwf.Height / 2)))
+    $view = [WordLayout]::RectOf($parts[0].Wwf.Hwnd)
+    $cx = $view.Left + [int](($view.Right - $view.Left) / 2)
+    $cy = $view.Top  + [int](($view.Bottom - $view.Top) / 2)
+    $under = Get-ClassAt $cx $cy
+    if ($under -in @('_WwG', '_WwN', '_WwB')) { [WordLayout]::Click($cx, $cy) }
+    else { Write-Note "the click into the document would land on `"$under`" - skipping it" }
 }
 
 $opened = $false
 for ($attempt = 1; $attempt -le 3 -and -not $opened; $attempt++) {
+    # Confirmed before sending: a keystroke goes to whatever has the foreground, and a silently
+    # missed Alt+F is indistinguishable from Backstage refusing to open.
+    if (-not (Test-WordHasFocus)) { Set-WordForeground | Out-Null }
     [WordLayout]::CloseBackstage(); Start-Sleep -Milliseconds 300
     [WordLayout]::OpenBackstage(); Start-Sleep -Milliseconds 2000
     $opened = [WordLayout]::BackstageOpen($active)
@@ -270,21 +282,14 @@ if (-not $KeepOpen) {
     # `$startedWord` used to guard this and no longer does: the suite opened seven documents, and
     # leaving them behind is exactly what contaminates whatever runs next. Every other suite already
     # closes Word unconditionally before it starts, so this is the same rule at the other end.
+    #
+    # And it now says WHY when it cannot: this loop had no idea what a dialog was, so a save prompt
+    # and a wedged Word produced the same message.
     Write-Step 'Closing Word'
-    for ($guard = 0; $guard -lt 25; $guard++) {
-        $open = @(Get-Frames)
-        if ($open.Count -eq 0) { break }
-        [WordLayout]::Close($open[0])
-        Start-Sleep -Milliseconds 1500
-    }
-    $deadline = (Get-Date).AddSeconds(25)
-    while ((Get-Date) -lt $deadline -and
-           @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue).Count -gt 0) {
-        Start-Sleep -Milliseconds 500
-    }
-    $left = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue).Count
-    if ($left -gt 0) {
-        Write-Note "Word is still running ($left process(es)) - close it by hand before the next suite."
+    $end = Close-AllWord
+    if (-not $end.Closed) {
+        Write-Note ("Word is still running ({0}): {1}" -f $end.Reason, (Format-WordWindow $end.Dialog))
+        Write-Note 'Close it by hand before the next suite.'
     }
 }
 

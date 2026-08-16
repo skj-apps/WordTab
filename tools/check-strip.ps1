@@ -57,6 +57,10 @@ Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
 # Physical pixels. This rig is at 150%, and without this every rectangle below is silently scaled.
 [WordLayout]::MakeDpiAware() | Out-Null
 
+# Confirmed input, one shared idea of what a Word dialog is, and the bounded waits. See the header of
+# tools\WordTabHarness.ps1 for why these are not per-suite copies any more.
+. (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
+
 $script:Failures = 0
 $script:Checks   = 0
 
@@ -108,7 +112,8 @@ if ($frames.Count -eq 0) { throw 'No usable Word frame appeared within 60s.' }
 if ($SecondDocument) {
     Write-Step 'Opening a second document'
     Start-Process -FilePath 'winword.exe' -ArgumentList "`"$doc2`""
-    Start-Sleep -Seconds 6
+    # Waiting for Word to get into position, not for anything this suite claims about the product.
+    if (-not (Wait-WordReady 2 45)) { Write-Note 'the second document did not arrive with a strip on it within 45s' }
     $frames = @()
     foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
         $frames += [WordLayout]::Frames($process.Id)
@@ -128,8 +133,8 @@ Write-Note ("target frame 0x{0:X}  `"{1}`"  ({2} visible frame(s))" -f [int64]$t
 
 function Get-Layout($frame) {
     $kids = [WordLayout]::Children($frame)
-    $strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' })[0]
-    $wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' })[0]
+    $strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' }) | Select-Object -First 1
+    $wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' }) | Select-Object -First 1
     [pscustomobject]@{
         Frame    = $frame
         Children = $kids
@@ -301,16 +306,38 @@ if ([WordLayout]::Focus($target)) {
     # quietly, and a Backstage check that silently never opened Backstage is worse than no check.
     # One click into the document first. Word's ribbon ignores Alt+F when the window was activated
     # programmatically rather than clicked - measured, and it fails silently.
+    #
+    # Aimed at the document frame's own SCREEN rectangle. The previous version added client-relative
+    # child coordinates to the frame's window rectangle and dropped Wwf.Left entirely, so it was off
+    # by the window border in x and by the caption in y - which on a narrow window lands outside the
+    # document, and a click that misses here makes Alt+F fail three lines later for a reason that
+    # looks nothing like a mis-aimed click.
     $layout = Get-Layout $target
-    $frameRect = [WordLayout]::RectOf($target)
     if ($layout.Wwf) {
-        [WordLayout]::Click($frameRect.Left + [int]($layout.Wwf.Width / 2),
-                            $frameRect.Top + $layout.Wwf.Top + [int]($layout.Wwf.Height / 2))
+        $aim = {
+            $v = [WordLayout]::RectOf($layout.Wwf.Hwnd)
+            [pscustomobject]@{ X = $v.Left + [int](($v.Right - $v.Left) / 2)
+                               Y = $v.Top  + [int](($v.Bottom - $v.Top) / 2) }
+        }
+        $where = & $aim
+        $under = Get-ClassAt $where.X $where.Y
+        # _WwG is the document pane, _WwN the one inside a split view. Either is the document.
+        $expect = if ($under -eq '_WwN') { '_WwN' } else { '_WwG' }
+        if (-not (Invoke-ConfirmedClick -What 'clicking into the document before Alt+F' -Point $aim -Expect $expect)) {
+            Write-Note ("the click into the document did not land - ({0},{1}) is over `"{2}`"" -f $where.X, $where.Y, $under)
+        }
     }
 
     $opened = $false
     for ($attempt = 1; $attempt -le 3 -and -not $opened; $attempt++) {
         # A failed Alt+F can leave Word showing KeyTips, where the next one means something else.
+        # Confirmed before sending: a keystroke goes to whatever has the foreground, and a silently
+        # missed one is indistinguishable from Backstage refusing to open.
+        if (-not (Test-WordHasFocus)) {
+            Write-Note ("the foreground is `"{0}`", not Word - taking it back before Alt+F" -f
+                        [WordLayout]::TitleOf([WordLayout]::GetForeground()))
+            Set-WordForeground | Out-Null
+        }
         [WordLayout]::CloseBackstage()
         Start-Sleep -Milliseconds 300
         [WordLayout]::OpenBackstage()
@@ -362,16 +389,20 @@ if ($Screenshot) {
 
 # ---- done -------------------------------------------------------------------------------------
 
+# NEVER Kill. The comment this replaces argued that these are scratch files so a Kill is harmless -
+# and the harm is not to the file. A killed Word offers to RECOVER those documents on the next
+# launch, and the recovered windows then make the next suite measure more windows than it opened.
+# That exact failure cost a run in the scrolling-row slice, traced back to soak-stack's cleanup;
+# this was the second copy, and check-stack's was the third.
+#
+# Close-AllWord stops and reports if Word asks a question rather than pressing anything: a test
+# script may not answer a save prompt it did not raise.
 if (-not $KeepOpen -and $startedWord) {
     Write-Step 'Closing Word'
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
-        $process.CloseMainWindow() | Out-Null
-    }
-    Start-Sleep -Seconds 3
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
-        # A document Word thinks is unsaved would sit on a dialog forever otherwise. These are
-        # scratch files.
-        $process.Kill()
+    $end = Close-AllWord
+    if (-not $end.Closed) {
+        Write-Note ("Word is still up ({0}): {1}" -f $end.Reason, (Format-WordWindow $end.Dialog))
+        Write-Note 'Answer it by hand before running the next suite - a leftover Word poisons whatever runs next.'
     }
 }
 

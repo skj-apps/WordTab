@@ -67,6 +67,10 @@ Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
 )
 [WordLayout]::MakeDpiAware() | Out-Null
 
+# Confirmed input, one shared idea of what a Word dialog is, and the bounded waits. See the header of
+# tools\WordTabHarness.ps1 for why these are not per-suite copies any more.
+. (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
+
 # The wheel, which is the one piece of input WordLayout has no reason to carry: nothing else in this
 # add-in responds to it.
 Add-Type -Namespace WordTabCheck -Name Wheel -MemberDefinition @'
@@ -90,14 +94,10 @@ function Assert($condition, $text) {
 # Every one of these re-wraps in @() before asking for .Count: a PowerShell function that returns an
 # empty array returns *nothing*, and .Count on nothing is a hard error under Set-StrictMode. The same
 # trap costs a run on this project about once a slice.
-function Get-WordPids { @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }) }
-function Get-WordPidCount { return @(Get-WordPids).Count }
-function Get-Frames {
-    $found = @()
-    foreach ($id in @(Get-WordPids)) { $found += [WordLayout]::Frames($id) }
-    return @($found)
-}
-function Get-FrameCount { return @(Get-Frames).Count }
+function Get-WordPids { return Get-WordPidList }
+function Get-WordPidCount { return Get-WordPidTally }
+function Get-Frames { return Get-WordFrameList }
+function Get-FrameCount { return Get-WordFrameTally }
 
 function Get-Child($frame, $class) {
     foreach ($kid in [WordLayout]::Children($frame)) { if ($kid.Class -eq $class) { return $kid } }
@@ -112,24 +112,9 @@ function Name($hwnd) {
     return $t
 }
 
-# See check-reorder.ps1: SetForegroundWindow is refused from a process that is not already
-# foreground, and a click on a tab then raises that document *inside* Word without Word coming
-# forward - so a reading of the row comes back naming some other application.
-function Set-WordForeground($seconds = 6) {
-    $frames = @(Get-Frames)
-    if ($frames.Count -eq 0) { return [IntPtr]::Zero }
-    $now = [WordLayout]::GetForeground()
-    if ($frames -contains $now) { return $now }
-
-    [WordLayout]::Focus($frames[0]) | Out-Null
-    $deadline = (Get-Date).AddSeconds($seconds)
-    while ((Get-Date) -lt $deadline) {
-        $now = [WordLayout]::GetForeground()
-        if (@(Get-Frames) -contains $now) { return $now }
-        Start-Sleep -Milliseconds 250
-    }
-    return [IntPtr]::Zero
-}
+# Set-WordForeground comes from WordTabHarness.ps1 now. SetForegroundWindow is refused from a process
+# that is not already foreground, and a click on a tab then raises that document *inside* Word without
+# Word coming forward - so a reading of the row comes back naming some other application.
 
 function Get-TopStrip {
     $frames = @(Get-Frames)
@@ -210,18 +195,33 @@ function Get-SlotDocument($index, $scroll, $scrollEnabled = $true) {
 
     $x = [int](($left + $right) / 2)
     $y = [int](($t.Top + $t.Bottom) / 2)
-    [WordLayout]::Click($x, $y)
+
+    # Confirmed onto the strip, re-measuring on every attempt. This function IS the suite's oracle -
+    # every scroll assertion is "click the computed slot, see which document came forward" - so a
+    # click that landed on the document instead reports itself as the row being scrolled wrongly.
+    # Windows are resized several times in this suite, so a rectangle is stale almost immediately.
+    if (-not (Invoke-ConfirmedClick -What "probing slot $index" -Point {
+                  $r = Get-Row $scroll $scrollEnabled
+                  $tt = $r.Layout.Tabs[$index]
+                  $l = [Math]::Max($tt.Left, $r.Layout.Track.Left)
+                  $rt = [Math]::Min($tt.Right, $r.Layout.Track.Right)
+                  [pscustomobject]@{ X = [int](($l + $rt) / 2); Y = [int](($tt.Top + $tt.Bottom) / 2) }
+              })) {
+        Write-Note "slot ${index}: the probe click never landed on the strip"
+    }
     Start-Sleep -Milliseconds 800
 
     $now = [WordLayout]::GetForeground()
     if (-not (@(Get-Frames) -contains $now)) {
         Write-Note ("the foreground was `"{0}`" - taking it back and clicking again" -f [WordLayout]::TitleOf($now))
         Set-WordForeground | Out-Null
-        $row = Get-Row $scroll $scrollEnabled
-        $t = $row.Layout.Tabs[$index]
-        $left  = [Math]::Max($t.Left, $row.Layout.Track.Left)
-        $right = [Math]::Min($t.Right, $row.Layout.Track.Right)
-        [WordLayout]::Click([int](($left + $right) / 2), [int](($t.Top + $t.Bottom) / 2))
+        Invoke-ConfirmedClick -What "re-probing slot $index" -Point {
+            $r = Get-Row $scroll $scrollEnabled
+            $tt = $r.Layout.Tabs[$index]
+            $l = [Math]::Max($tt.Left, $r.Layout.Track.Left)
+            $rt = [Math]::Min($tt.Right, $r.Layout.Track.Right)
+            [pscustomobject]@{ X = [int](($l + $rt) / 2); Y = [int](($tt.Top + $tt.Bottom) / 2) }
+        } | Out-Null
         Start-Sleep -Milliseconds 900
         $now = [WordLayout]::GetForeground()
     }
@@ -245,8 +245,12 @@ function Move-RowTo($where) {
     for ($i = 0; $i -lt $steps; $i++) {
         $row = Get-Row 0
         if ($where -eq 'end') { $button = $row.Layout.Next } else { $button = $row.Layout.Prev }
-        $p = [WordLayout]::Center($button)
-        [WordLayout]::Click($p.X, $p.Y)
+        # Confirmed onto the strip - and the last two clicks deliberately land on a chevron that has
+        # gone dead, which is still the strip, so the confirmation is right for those too.
+        Invoke-ConfirmedClick -What "chevron click $($i + 1) towards the $where" -Point {
+            $r = Get-Row 0
+            [WordLayout]::Center($(if ($where -eq 'end') { $r.Layout.Next } else { $r.Layout.Prev }))
+        } | Out-Null
         $clicks++
         Start-Sleep -Milliseconds 150
     }
@@ -258,7 +262,14 @@ function Use-Wheel($notches) {
     # Negative wheel data is a scroll down, which this strip treats as a scroll right.
     $row = Get-Row 0
     $p = [WordLayout]::Center($row.Layout.Track)
-    [WordLayout]::MouseTo($p.X, $p.Y)
+    # The wheel goes to whatever is under the POINTER, not to the foreground window - so if this move
+    # silently does not take, every notch below is delivered to some other window and the row simply
+    # does not move, which reads exactly like a strip that ignores the wheel.
+    if (-not (Set-Pointer $p.X $p.Y 'putting the pointer over the tab row')) {
+        Write-Note 'the pointer would not go over the row - the wheel notches below will not reach the strip'
+    }
+    $overWhat = Get-ClassAt $p.X $p.Y
+    if ($overWhat -ne 'WordTabStrip') { Write-Note "the pointer is over `"$overWhat`", not the strip - the wheel will go there" }
     Start-Sleep -Milliseconds 250
     for ($i = 0; $i -lt [Math]::Abs($notches); $i++) {
         [WordTabCheck.Wheel]::mouse_event(0x0800, 0, 0, $(if ($notches -lt 0) { 120 } else { -120 }), [UIntPtr]::Zero)
@@ -275,17 +286,12 @@ function Use-Wheel($notches) {
 
 if ((Get-WordPidCount) -gt 0) {
     Write-Step "Closing $(Get-WordPidCount) Word process(es) already running"
-    for ($guard = 0; $guard -lt 15; $guard++) {
-        $open = @(Get-Frames)
-        if ($open.Count -eq 0) { break }
-        [WordLayout]::Close($open[0])
-        Start-Sleep -Seconds 2
-    }
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $process.CloseMainWindow() | Out-Null }
-    $deadline = (Get-Date).AddSeconds(25)
-    while ((Get-Date) -lt $deadline -and (Get-WordPidCount) -gt 0) { Start-Sleep -Milliseconds 500 }
-    if ((Get-WordPidCount) -gt 0) {
-        throw 'Word would not close - close it by hand, saving or discarding as you like, then re-run.'
+    # Nothing in this suite used to look for a dialog, so "Word would not close" was the only
+    # diagnosis it could give - whether the cause was a save prompt, a gallery, or Word wedged.
+    $start = Close-AllWord
+    if (-not $start.Closed) {
+        throw ("Word would not close ({0}: {1}) - close it by hand, saving or discarding as you like, then re-run." -f
+               $start.Reason, (Format-WordWindow $start.Dialog))
     }
     Start-Sleep -Seconds 2
 }
@@ -427,7 +433,11 @@ Set-WordForeground | Out-Null
 $row = Get-Row $L.MaxScroll
 $p = [WordLayout]::Center($row.Layout.Plus)
 Write-Note ("clicking the + at ({0},{1})" -f $p.X, $p.Y)
-[WordLayout]::Click($p.X, $p.Y)
+# This is the click the whole slice exists for: it used to land on a tab's close button. Confirming
+# it lands on the strip at all is the floor - the two assertions below say what it hit once there.
+Assert (Invoke-ConfirmedClick -What 'clicking the + on an overflowing row' `
+                              -Point { [WordLayout]::Center((Get-Row $L.MaxScroll).Layout.Plus) }) `
+       'the click on + landed on the strip'
 Assert (Wait-For { (Get-FrameCount) -eq ($before + 1) } 45) `
        "a document appeared: $before -> $(Get-FrameCount)"
 Assert ((Get-LogCount $mark 'new-document button clicked') -ge 1) 'the add-in logged it as the + being clicked'
@@ -467,8 +477,7 @@ Assert ((Get-SlotDocument 0 0) -like 'scroll-1*') 'the first slot holds the firs
 # slot 0 was. That is a stronger statement than "it moved": it is the step size, measured.
 Set-WordForeground | Out-Null
 $row = Get-Row 0
-$p = [WordLayout]::Center($row.Layout.Next)
-[WordLayout]::Click($p.X, $p.Y)
+Invoke-ConfirmedClick -What 'one click of the right chevron' -Point { [WordLayout]::Center((Get-Row 0).Layout.Next) } | Out-Null
 Start-Sleep -Milliseconds 600
 $width = $row.Layout.Width
 Assert ((Get-SlotDocument 1 $width) -like 'scroll-2*') "one click scrolled the row by exactly one tab ($width px)"
@@ -485,8 +494,12 @@ Assert (-not $row.Layout.CanNext)  'and nowhere further right'
 $atEnd = Get-SlotDocument ($Docs - 1) $max
 Set-WordForeground | Out-Null
 $row = Get-Row $max
-$p = [WordLayout]::Center($row.Layout.Next)
-[WordLayout]::Click($p.X, $p.Y)
+# Confirmed to land, deliberately. This is the negative test: "the row did not move" is exactly what
+# a click that never arrived also produces, so without this the assertion below can pass for the
+# wrong reason. The dead chevron is still drawn on the strip, so WordTabStrip is the right expectation.
+Assert (Invoke-ConfirmedClick -What 'clicking the dead right chevron' `
+                              -Point { [WordLayout]::Center((Get-Row $max).Layout.Next) }) `
+       'the click on the dead chevron really did land on the strip'
 Start-Sleep -Milliseconds 500
 Assert ((Get-SlotDocument ($Docs - 1) $max) -eq $atEnd) 'clicking the dead chevron does nothing at all'
 
@@ -575,6 +588,10 @@ $grabX = [int]($t.Left + ($t.Right - $t.Left) * 0.4)
 $edgeX = $row.Layout.Track.Right - 6
 
 $mark = Get-LogMark
+# Confirmed before the button goes down, and not again until it is up. If the grab misses, "the drag
+# was recognised" fails for a reason that has nothing to do with edge-scrolling.
+$onWhat = Get-ClassAt $grabX $y
+Assert ($onWhat -eq 'WordTabStrip') "the drag starts on the strip (`"$onWhat`" is under the grab point)"
 [WordLayout]::DragHold($grabX, $y, $edgeX, $y, 14, 55)
 Start-Sleep -Milliseconds 2500          # holding still against the edge: the timer's job
 [WordLayout]::DragRelease($edgeX, $y)
@@ -601,15 +618,11 @@ Write-Step 'HKCU\Software\WordTab\TabScroll=0 - every tab on screen, however nar
 # this has not run on.
 
 Write-Note 'closing Word - the switch is read once, when the add-in starts'
-for ($guard = 0; $guard -lt 20; $guard++) {
-    $open = @(Get-Frames)
-    if ($open.Count -eq 0) { break }
-    [WordLayout]::Close($open[0])
-    Start-Sleep -Milliseconds 1200
+$between = Close-AllWord
+if (-not $between.Closed) {
+    throw ("Word would not close before the TabScroll=0 run ({0}: {1})." -f
+           $between.Reason, (Format-WordWindow $between.Dialog))
 }
-$deadline = (Get-Date).AddSeconds(25)
-while ((Get-Date) -lt $deadline -and (Get-WordPidCount) -gt 0) { Start-Sleep -Milliseconds 500 }
-if ((Get-WordPidCount) -gt 0) { throw 'Word would not close before the TabScroll=0 run.' }
 Start-Sleep -Seconds 2
 
 $restore = $null
@@ -665,11 +678,10 @@ finally {
 
 if (-not $KeepOpen) {
     Write-Step 'Closing Word'
-    for ($guard = 0; $guard -lt 25; $guard++) {
-        $open = @(Get-Frames)
-        if ($open.Count -eq 0) { break }
-        [WordLayout]::Close($open[0])
-        Start-Sleep -Milliseconds 1200
+    $end = Close-AllWord
+    if (-not $end.Closed) {
+        Write-Note ("Word is still up ({0}): {1}" -f $end.Reason, (Format-WordWindow $end.Dialog))
+        Write-Note 'Left running rather than killed. Answer it by hand before the next suite.'
     }
 }
 

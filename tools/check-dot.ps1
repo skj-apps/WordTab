@@ -65,6 +65,12 @@ Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
 )
 [WordLayout]::MakeDpiAware() | Out-Null
 
+# Confirmed input, one shared idea of what a Word dialog is, and the bounded waits. See the header of
+# tools\WordTabHarness.ps1 for why these are not per-suite copies any more. The narrowed dialog test
+# this suite wrote - the one that excludes `Net UI Tool Window` - lives there now and covers all
+# eleven suites, with the #32768 exclusion the other two versions had and this one did not.
+. (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
+
 $script:Failures = 0
 $script:Checks   = 0
 
@@ -85,23 +91,18 @@ function Assert($condition, $text) {
 
 $VK = @{ S = 0x53; X = 0x58; ESC = 0x1B }
 
-function Get-WordPids { @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }) }
-function Get-Frames {
-    $found = @()
-    foreach ($id in Get-WordPids) { $found += [WordLayout]::Frames($id) }
-    return @($found)
-}
-# Always through this - a PowerShell function returning an empty array returns *nothing*, and
-# `(Get-Frames).Count` is then a hard error under StrictMode at the two moments that matter most.
-function Get-FrameCount { return @(Get-Frames).Count }
+function Get-WordPids { return Get-WordPidList }
+function Get-Frames { return Get-WordFrameList }
+
+function Get-FrameCount { return Get-WordFrameTally }
 
 function Get-Parts($frame) {
     $kids = [WordLayout]::Children($frame)
     [pscustomobject]@{
         Frame = $frame
         Rect  = [WordLayout]::RectOf($frame)
-        Strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' })[0]
-        Wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' })[0]
+        Strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' }) | Select-Object -First 1
+        Wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' }) | Select-Object -First 1
         Title = [WordLayout]::TitleOf($frame)
     }
 }
@@ -160,37 +161,9 @@ function Wait-Dot($frame, $on, $seconds = 12) {
     return Get-DotState $frame
 }
 
-function Set-WordForeground($seconds = 4) {
-    $frames = @(Get-Frames)
-    if ($frames.Count -eq 0) { return [IntPtr]::Zero }
-
-    for ($round = 1; $round -le 3; $round++) {
-        $now = [WordLayout]::GetForeground()
-        if ($frames -contains $now) { return $now }
-
-        Write-Note ("the foreground was `"{0}`" - taking it back" -f [WordLayout]::TitleOf($now))
-        [WordLayout]::Focus($frames[0]) | Out-Null
-        $deadline = (Get-Date).AddSeconds($seconds)
-        while ((Get-Date) -lt $deadline) {
-            $now = [WordLayout]::GetForeground()
-            if (@(Get-Frames) -contains $now) { return $now }
-            Start-Sleep -Milliseconds 250
-        }
-
-        # This suite drives real clicks at screen coordinates, so a window over Word receives them.
-        # Never Progman or WorkerW: that is the desktop, and minimising it is "Show Desktop".
-        $now = [WordLayout]::GetForeground()
-        $cls = if ($now -ne [IntPtr]::Zero) { [WordLayout]::ClassOf($now) } else { '' }
-        if ($now -ne [IntPtr]::Zero -and -not (@(Get-Frames) -contains $now) -and
-            $cls -ne 'Progman' -and $cls -ne 'WorkerW') {
-            Write-Note ("minimising `"{0}`" - it is sitting over Word" -f [WordLayout]::TitleOf($now))
-            [WordLayout]::Show($now, 6)      # SW_MINIMIZE
-            Start-Sleep -Milliseconds 800
-        }
-    }
-    return [WordLayout]::GetForeground()
-}
-
+# Set-WordForeground comes from WordTabHarness.ps1 now, with one guard this copy did not have: it
+# never minimises a window belonging to Word itself. THIS suite deliberately raises Word's save
+# prompt, and minimising that would leave Word disabled behind a question nobody can see.
 function Get-TopStrip {
     Set-WordForeground | Out-Null
     $frames = @(Get-Frames)
@@ -228,99 +201,19 @@ function Get-Spot($index) {
 
 function Format-Rect($r) { "({0},{1} {2}x{3})" -f $r.Left, $r.Top, ($r.Right - $r.Left), ($r.Bottom - $r.Top) }
 
-# Click a point on the strip, having first checked that the strip is what is under it. `point` is a
-# scriptblock re-run on every attempt, because the strip moves and because taking the foreground back
-# can move it again. AN INJECTED INPUT THAT WAS NOT CONFIRMED TO LAND IS NOT AN INPUT.
-function Invoke-StripClick($what, [scriptblock]$point) {
-    for ($try = 1; $try -le 3; $try++) {
-        Set-WordForeground | Out-Null
-        $p = & $point
-        $cls = [WordLayout]::ClassOf([WordLayout]::WindowAt($p.X, $p.Y))
-        if ($cls -eq 'WordTabStrip') {
-            [WordLayout]::Click($p.X, $p.Y)
-            return $true
-        }
-        Write-Note ("{0}: ({1},{2}) is over `"{3}`", not the strip - taking the foreground back and re-measuring" -f
-                    $what, $p.X, $p.Y, $cls)
-        $blocking = Get-WordDialog
-        if ($blocking) { Write-Note ("  Word has a dialog up: {0}" -f (Format-Dialog $blocking)) }
-        Start-Sleep -Milliseconds 800
-    }
-    return $false
-}
-
-# Move the pointer, and prove it arrived. SendInput's absolute move silently does not take when
-# another process holds the foreground or a hand is on the mouse, and a hover that never happened
-# looks exactly like a hover that was not drawn.
-function Set-Pointer($x, $y, $what) {
-    for ($try = 1; $try -le 5; $try++) {
-        [WordLayout]::MouseTo($x, $y)
-        Start-Sleep -Milliseconds 250
-        $at = [WordLayout]::Cursor()
-        if (([Math]::Abs($at.X - $x) -le 2) -and ([Math]::Abs($at.Y - $y) -le 2)) { return $true }
-        Write-Note ("{0}: asked for ({1},{2}), the pointer is at ({3},{4}) - trying again" -f
-                    $what, $x, $y, $at.X, $at.Y)
-        Start-Sleep -Milliseconds 500
-    }
-    return $false
-}
-
-# Word asking the user something.
+# Invoke-StripClick, Set-Pointer, Get-WordDialog, Format-Dialog, Get-SavePrompt and Wait-Prompt all
+# come from WordTabHarness.ps1 now, with the same behaviour and one fix.
 #
-# `Net UI Tool Window` is excluded, and that exclusion cost a whole battery run to learn. It is
-# Office's floating-UI host - galleries, task-pane popouts, notification toasts - not a question, and
-# one of them appeared at 622x298 while check-title was closing seven windows. Because "any visible
-# top-level window of Word's that is not an OpusApp and is bigger than 150x60" matched it, the suite
-# refused to close Word, left it running, and the two suites after it failed on the leftovers: the
-# dot suite hit the same window, and soak-stack opened six documents and measured ELEVEN.
+# This suite wrote the narrowed dialog test - the one that excludes `Net UI Tool Window`, Office's
+# floating-UI host, after a 622x298 one was read as a question and took three suites red with it.
+# What it did NOT exclude was `#32768`, the popup menu, which check-menu and check-title both did:
+# so an open context menu read here as "Word is asking something". Neither of the three versions in
+# the repo was right, and the shared one excludes all three kinds. See Get-WordWindowKind.
 #
-# What a real prompt is, measured rather than assumed - twice in that same battery: the save prompt
-# is `NUIDialog` at 920x713 and the Save As question is `NUIDialog` at 920x641. The size floor stays
-# as a second filter.
-#
-# NOTE: the other nine suites still carry the unnarrowed version. Retrofitting them is deliberately
-# not done here - check-menu's prompt detection is the most safety-critical assertion in the project
-# and it is not this slice's to change - but it belongs on the same list as the Set-Pointer retrofit.
-function Get-WordDialog {
-    foreach ($id in Get-WordPids) {
-        foreach ($w in [WordLayout]::TopLevel($id)) {
-            if (-not $w.Visible) { continue }
-            if ($w.Class -eq 'OpusApp') { continue }
-            if ($w.Class -eq 'Net UI Tool Window') { continue }
-            $width = $w.Right - $w.Left
-            $height = $w.Bottom - $w.Top
-            if ($width -lt 150 -or $height -lt 60) { continue }
-            return [pscustomobject]@{ Hwnd = $w.Hwnd; Class = $w.Class; Title = $w.Title
-                                      Width = $width; Height = $height }
-        }
-    }
-    return $null
-}
-
-function Format-Dialog($d) {
-    if (-not $d) { return '(nothing)' }
-    return "class={0} {1}x{2} |{3}|" -f $d.Class, $d.Width, $d.Height, $d.Title
-}
-
-# Word asking the user something, as opposed to Word's own chrome going past. Confirmed twice, a
-# second and a half apart: a single sample reads shutdown chrome as a save prompt.
-function Get-SavePrompt {
-    if (-not (Get-WordDialog)) { return $null }
-    Start-Sleep -Milliseconds 1500
-    return Get-WordDialog
-}
-
-function Wait-Prompt($present, $seconds = 10) {
-    $deadline = (Get-Date).AddSeconds($seconds)
-    while ((Get-Date) -lt $deadline) {
-        $d = Get-WordDialog
-        if ($present -and $d) { return $d }
-        if (-not $present -and -not $d) { return $null }
-        Start-Sleep -Milliseconds 400
-    }
-    return Get-WordDialog
-}
-
+# Wait-Prompt is Wait-WordDialog. The double read a second and a half apart is still in
+# Get-WordSavePrompt, and still for the reason measured here: a single sample reads Word's shutdown
+# chrome as a prompt.
+function Wait-Prompt($present, $seconds = 10) { return (Wait-WordDialog $present $seconds) }
 # ---- photographs ------------------------------------------------------------------------------
 #
 # CopyFromScreen, not PrintWindow: this is about what the user can see.
@@ -428,46 +321,46 @@ function Read-TabButton($index, $label) {
 
 # ---- Word up and down --------------------------------------------------------------------------
 
+# NEVER answer a question this script did not raise: Escape cancels, it does not discard, and "the
+# cleanup step threw away my work" is not a thing a test script may ever do. Close-AllWord stops on a
+# question and hands it back rather than pressing anything.
 function Close-Word {
     if (@(Get-WordPids).Count -eq 0) { return }
     Write-Note "closing Word: $(Get-FrameCount) window(s)"
-    for ($guard = 0; $guard -lt 24; $guard++) {
-        $open = @(Get-Frames)
-        if ($open.Count -eq 0) { break }
-        [WordLayout]::Close($open[0])
-        Start-Sleep -Milliseconds 1200
-        # A leftover dirty document. Deliberately not answered: a test script may not discard work it
-        # did not create. This suite makes documents dirty on purpose, so it saves them itself before
-        # ever getting here.
-        $prompt = Get-SavePrompt
-        if ($prompt) {
-            Write-Note ("Word put up: {0}" -f (Format-Dialog $prompt))
-            [WordLayout]::Press($VK.ESC)
-            Start-Sleep -Seconds 2
-            throw ("Word is asking something and it is still there after Escape: {0}  Answer it by hand and re-run." -f
-                   (Format-Dialog $prompt))
+    $end = Close-AllWord
+    if (-not $end.Closed) {
+        if ($end.Reason -eq 'question') {
+            throw ("Word is asking something: {0}  Answer it by hand and re-run." -f (Format-WordWindow $end.Dialog))
         }
+        throw ("Word would not close ({0}, {1} frame(s) left) - close it by hand and re-run." -f $end.Reason, $end.Frames)
     }
-    foreach ($p in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $p.CloseMainWindow() | Out-Null }
-    $deadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $deadline -and @(Get-WordPids).Count -gt 0) { Start-Sleep -Milliseconds 500 }
-    if (@(Get-WordPids).Count -gt 0) { throw 'Word would not close - close it by hand and re-run.' }
     Start-Sleep -Seconds 2
 }
 
 function Open-Document($path, $first) {
     $before = @(Get-Frames)
     Start-Process -FilePath 'winword.exe' -ArgumentList "`"$path`""
-    Start-Sleep -Seconds $(if ($first) { 16 } else { 7 })
-    $deadline = (Get-Date).AddSeconds(30)
+    # Waiting for the new window rather than sleeping 16 seconds for the first and 7 for the rest.
+    # This is the harness getting into position; nothing here asserts how long Word takes to open a
+    # file. It waits for a window that was NOT there before, so a stale frame cannot satisfy it, and
+    # then for the add-in to have carved its band, because everything in this suite measures the strip.
+    $deadline = (Get-Date).AddSeconds(45)
     while ((Get-Date) -lt $deadline) {
         $new = @(Get-Frames | Where-Object { $before -notcontains $_ })
-        if ($new.Count -gt 0) { Start-Sleep -Seconds 2; return $new[0] }
-        Start-Sleep -Milliseconds 500
+        if ($new.Count -gt 0) {
+            # NOT `(Get-Parts $new[0]).Strip`. Get-Parts builds Strip as `@(... | Where-Object ...)[0]`
+            # and under Set-StrictMode -Version Latest indexing an empty match is a HARD ERROR, not
+            # $null - so a wait for "the strip has appeared" would throw at exactly the moment the
+            # strip has not appeared, which is the only moment it is ever called. The guarded shape is
+            # a re-wrapped @() and .Count, which is what Wait-WordReady uses for the same reason.
+            Wait-Until { @([WordLayout]::Children($new[0]) | Where-Object { $_.Class -eq 'WordTabStrip' }).Count -gt 0 } 20 300 | Out-Null
+            Start-Sleep -Seconds 2
+            return $new[0]
+        }
+        Start-Sleep -Milliseconds 400
     }
     return [IntPtr]::Zero
 }
-
 # Put the caret in the document behind tab $index and type, and *prove* it before returning. A
 # keystroke sent to a window that was only activated programmatically goes nowhere in Word, which is
 # why this clicks into the page first; and a missed keystroke is indistinguishable from a broken
@@ -475,8 +368,12 @@ function Open-Document($path, $first) {
 function Set-Dirty($index) {
     for ($try = 1; $try -le 6; $try++) {
         Set-WordForeground | Out-Null
-        $spot = Get-Spot $index
-        [WordLayout]::Click($spot.X, $spot.Y)
+        # Confirmed onto the strip. If this misses, the wrong document is typed into and the dot
+        # assertions afterwards are about a document nothing happened to.
+        if (-not (Invoke-ConfirmedClick -What "selecting tab $index before typing" -Point { Get-Spot $index })) {
+            Write-Note "attempt ${try}: could not put the click on tab $index"
+            continue
+        }
         Start-Sleep -Milliseconds 900
 
         $top = Get-TopStrip
@@ -512,8 +409,16 @@ function Set-Dirty($index) {
 
         $before = Get-RectShot $shot
 
-        # No Focus() here: the click into the page is what makes Word foreground, and it does it as
-        # user input, which Windows honours unconditionally.
+        # No Focus() here, and deliberately not Invoke-ConfirmedClick either: that takes the
+        # foreground back before it clicks, and the click into the page is what makes Word foreground
+        # as *user input*, which Windows honours unconditionally. So the aim is confirmed the passive
+        # way - ask what is under the point, change nothing - and the outcome by the photograph below.
+        $under = Get-ClassAt $x $y
+        if ($under -notin @('_WwG', '_WwN', '_WwB')) {
+            Write-Note ("attempt {0}: ({1},{2}) is over `"{3}`", not the document page - re-measuring" -f $try, $x, $y, $under)
+            $before.Bitmap.Dispose()
+            continue
+        }
         [WordLayout]::Click($x, $y)
         Start-Sleep -Milliseconds 600
         for ($k = 0; $k -lt 5; $k++) { [WordLayout]::Press($VK.X) }
@@ -558,17 +463,26 @@ function Set-Dirty($index) {
 # fixture here is a real file that Word has already written once, so this never opens Save As.
 function Save-Tab($index) {
     Set-WordForeground | Out-Null
-    $spot = Get-Spot $index
-    [WordLayout]::Click($spot.X, $spot.Y)
+    Invoke-ConfirmedClick -What "selecting tab $index before saving" -Point { Get-Spot $index } | Out-Null
     Start-Sleep -Milliseconds 900
     $top = Get-TopStrip
     if ($top.Wwf) {
         $view = [WordLayout]::RectOf($top.Wwf.Hwnd)
-        [WordLayout]::Click(($view.Left + [int](($view.Right - $view.Left) / 3)),
-                            ($view.Top + [int](($view.Bottom - $view.Top) / 2)))
-        Start-Sleep -Milliseconds 600
+        $cx = $view.Left + [int](($view.Right - $view.Left) / 3)
+        $cy = $view.Top  + [int](($view.Bottom - $view.Top) / 2)
+        # Passive confirmation, for the same reason as Set-Dirty: the click into the page is what
+        # gives Word the foreground as user input, so nothing may take it first.
+        $under = Get-ClassAt $cx $cy
+        if ($under -in @('_WwG', '_WwN', '_WwB')) {
+            [WordLayout]::Click($cx, $cy)
+            Start-Sleep -Milliseconds 600
+        } else {
+            Write-Note "the click into the page would land on `"$under`" - skipping it and saving anyway"
+        }
     }
-    [WordLayout]::CtrlPress($VK.S)
+    # Ctrl+S saves whatever document is in front. Aimed at one named window, so a Focus that did not
+    # take cannot save the wrong document.
+    Invoke-ConfirmedKeyOn -Hwnd $top.Frame -Vk $VK.S -What "Ctrl+S on tab $index" -Ctrl | Out-Null
     Start-Sleep -Seconds 2
 }
 
@@ -698,7 +612,7 @@ $prompt = Wait-Prompt $true 12
 Assert ($null -ne $prompt) "Word asked about the unsaved changes, so the click did reach the close button ($(Format-Dialog $prompt))"
 
 # Escape is Cancel. A test script may not discard work, and this suite created that work.
-[WordLayout]::Press($VK.ESC)
+Invoke-ConfirmedKey -Vk $VK.ESC -What 'Escape to cancel the save prompt' | Out-Null
 Start-Sleep -Seconds 2
 Assert ($null -eq (Wait-Prompt $false 10)) 'the prompt went away on Escape'
 Assert ((Get-FrameCount) -eq 2) "cancelling left both documents open (got $(Get-FrameCount))"

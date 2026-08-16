@@ -96,6 +96,12 @@ Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
 )
 [WordLayout]::MakeDpiAware() | Out-Null
 
+# Confirmed input, one shared idea of what a Word dialog is, and the bounded waits. See the header of
+# tools\WordTabHarness.ps1 for why these are not per-suite copies any more. Set-Pointer, which this
+# suite invented after losing two hover assertions to a pointer that never moved, lives there now and
+# is used by every suite.
+. (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
+
 $LogPath  = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
 $StyleKey = 'HKCU:\Software\WordTab'
 $VK_W     = 0x57
@@ -111,15 +117,11 @@ function Assert($condition, $text) {
     else { $script:Failures++; Write-Host "    FAIL  $text" -ForegroundColor Red }
 }
 
-function Get-WordPids { @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }) }
-function Get-WordPidCount { return @(Get-WordPids).Count }
+function Get-WordPids { return Get-WordPidList }
+function Get-WordPidCount { return Get-WordPidTally }
 
-function Get-Frames {
-    $found = @()
-    foreach ($id in @(Get-WordPids)) { $found += [WordLayout]::Frames($id) }
-    return @($found)
-}
-function Get-FrameCount { return @(Get-Frames).Count }
+function Get-Frames { return Get-WordFrameList }
+function Get-FrameCount { return Get-WordFrameTally }
 
 function Get-Child($frame, $class) {
     foreach ($kid in [WordLayout]::Children($frame)) {
@@ -245,19 +247,15 @@ function Save-StripShot($strip, $name) {
 
 # ---- Word ---------------------------------------------------------------------------------------
 
+# This suite had no idea what a Word dialog was - nothing in it ever looked for one - so "Word would
+# not close" was the only diagnosis it could give, whether the cause was a save prompt, a gallery
+# left open, or Word genuinely wedged. Close-AllWord names which.
 function Stop-Word {
     if ((Get-WordPidCount) -eq 0) { return }
-    for ($guard = 0; $guard -lt 12; $guard++) {
-        $open = @(Get-Frames)
-        if ($open.Count -eq 0) { break }
-        [WordLayout]::Close($open[0])
-        Start-Sleep -Seconds 2
-    }
-    foreach ($p in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $p.CloseMainWindow() | Out-Null }
-    $deadline = (Get-Date).AddSeconds(25)
-    while ((Get-Date) -lt $deadline -and (Get-WordPidCount) -gt 0) { Start-Sleep -Milliseconds 500 }
-    if ((Get-WordPidCount) -gt 0) {
-        throw 'Word would not close - close it by hand, saving or discarding as you like, then re-run.'
+    $end = Close-AllWord
+    if (-not $end.Closed) {
+        throw ("Word would not close ({0}: {1}) - close it by hand, saving or discarding as you like, then re-run." -f
+               $end.Reason, (Format-WordWindow $end.Dialog))
     }
     Start-Sleep -Seconds 2
 }
@@ -341,7 +339,7 @@ Assert ((Get-FrameCount) -eq $Documents) "$Documents Word windows ($(Get-FrameCo
 
 $frame = Focus-Word
 $strip = Get-StripOf $frame
-[WordLayout]::MouseTo(4, 4)
+Set-Pointer 4 4 'parking the pointer clear of the strip' | Out-Null
 Start-Sleep -Milliseconds 900
 
 $stripRect = [WordLayout]::RectOf($strip)
@@ -482,18 +480,9 @@ $shot.Bitmap.Dispose()
 #
 # Measured, twice: a run asked for (258,540) and left the pointer at (1894,459), over the desktop.
 # Two suites' worth of diagnosis went into a hover highlight that was working perfectly.
-function Set-Pointer($x, $y, $what) {
-    for ($try = 1; $try -le 5; $try++) {
-        [WordLayout]::MouseTo($x, $y)
-        Start-Sleep -Milliseconds 250
-        $at = [WordLayout]::Cursor()
-        if (([Math]::Abs($at.X - $x) -le 2) -and ([Math]::Abs($at.Y - $y) -le 2)) { return $true }
-        Write-Note ("{0}: asked for ({1},{2}), the pointer is at ({3},{4}) - trying again" -f
-                    $what, $x, $y, $at.X, $at.Y)
-        Start-Sleep -Milliseconds 500
-    }
-    return $false
-}
+#
+# Set-Pointer itself now lives in tools\WordTabHarness.ps1, unchanged, so the other ten suites get it
+# too. This is where it was invented; the comment stays here because this is where the evidence is.
 
 Write-Step 'Hover'
 
@@ -563,7 +552,11 @@ $width = $pick.Right - $pick.Left
 $x = $pick.Left + [int]($width / 3)
 $y = [int](($pick.Top + $pick.Bottom) / 2)
 
-[WordLayout]::Click($x, $y)
+Invoke-ConfirmedClick -What 'selecting the tab to be carried' -Point {
+    $l = Get-Layout (Get-StripOf (Get-TheFrame))
+    $p = $l.Tabs[0]
+    [pscustomobject]@{ X = $p.Left + [int](($p.Right - $p.Left) / 3); Y = [int](($p.Top + $p.Bottom) / 2) }
+} | Out-Null
 Start-Sleep -Seconds 2
 [WordLayout]::Focus((Get-TheFrame)) | Out-Null
 Start-Sleep -Milliseconds 1200
@@ -576,10 +569,14 @@ $width = $pick.Right - $pick.Left
 $x = $pick.Left + [int]($width / 3)
 $y = [int](($pick.Top + $pick.Bottom) / 2)
 
-[WordLayout]::MouseTo($x, $y)
+Assert (Set-Pointer $x $y 'hovering the tab to be carried') 'the pointer could be put on the tab about to be carried'
 Start-Sleep -Milliseconds 900
 $rest = Get-StripShot $strip
 
+# Confirmed before the button goes down, and not again until it is up: everything from DragHold to
+# DragRelease is one gesture, and re-aiming inside it would measure a different one.
+$onWhat = Get-ClassAt $x $y
+Assert ($onWhat -eq 'WordTabStrip') "the pick-up starts on the strip, not on `"$onWhat`""
 [WordLayout]::DragHold($x, $y, ($x + [int]($width / 3)), $y, 8, 70)
 Start-Sleep -Milliseconds 700
 $lifted = Get-StripShot $strip
@@ -602,8 +599,13 @@ $frame = Focus-Word
 $strip = Get-StripOf $frame
 $layout = Get-Layout $strip
 $spot = $layout.Tabs[0]
-[WordLayout]::RightClick(($spot.Left + [int](($spot.Right - $spot.Left) / 3)),
-                         [int](($spot.Top + $spot.Bottom) / 2))
+# Expecting the strip: a right-click that lands on the document opens WORD's context menu, which is
+# also a visible #32768, and this section then photographs Word's menu and calls it ours.
+Assert (Invoke-ConfirmedClick -What 'right-clicking tab 0' -Button right -Point {
+            $l = Get-Layout (Get-StripOf (Get-TheFrame))
+            $p = $l.Tabs[0]
+            [pscustomobject]@{ X = $p.Left + [int](($p.Right - $p.Left) / 3); Y = [int](($p.Top + $p.Bottom) / 2) }
+        }) 'the right-click landed on the strip, so any menu that appears is ours'
 Start-Sleep -Seconds 2
 
 $menuWindow = [IntPtr]::Zero
@@ -660,14 +662,9 @@ if ($menuWindow -ne [IntPtr]::Zero) {
     $menuShot.Bitmap.Dispose()
 }
 
-[WordLayout]::Press(0x1B)      # Escape
+Invoke-ConfirmedKey -Vk 0x1B -What 'Escape to close the menu' | Out-Null
 Start-Sleep -Seconds 1
-$stillUp = [IntPtr]::Zero
-foreach ($id in Get-WordPids) {
-    $w = [WordLayout]::PopupMenuWindow($id)
-    if ($w -ne [IntPtr]::Zero) { $stillUp = $w }
-}
-Assert ($stillUp -eq [IntPtr]::Zero) 'and it closes on Escape, leaving nothing behind'
+Assert ((Get-WordMenu) -eq [IntPtr]::Zero) 'and it closes on Escape, leaving nothing behind'
 
 # ---- 6. the palette follows Word while Word is running -----------------------------------------------
 #
@@ -696,12 +693,16 @@ if ($NoThemeSwitch) {
     # here rather than left to whatever the previous section happened to do.
     $layout = Get-Layout $strip
     $lastTab = $layout.Tabs[$layout.Tabs.Length - 1]
-    [WordLayout]::Click([int](($lastTab.Left + $lastTab.Right) / 2), [int](($lastTab.Top + $lastTab.Bottom) / 2))
+    Invoke-ConfirmedClick -What 'selecting the last tab so tab zero is idle' -Point {
+        $l = Get-Layout (Get-StripOf (Get-TheFrame))
+        $t = $l.Tabs[$l.Tabs.Length - 1]
+        [pscustomobject]@{ X = [int](($t.Left + $t.Right) / 2); Y = [int](($t.Top + $t.Bottom) / 2) }
+    } | Out-Null
     Start-Sleep -Seconds 2
     $frame = Focus-Word
     $strip = Get-StripOf $frame
 
-    [WordLayout]::MouseTo(4, 4)
+    Set-Pointer 4 4 'parking the pointer clear of the strip' | Out-Null
     Start-Sleep -Milliseconds 800
 
     $stripRect = [WordLayout]::RectOf($strip)
@@ -718,7 +719,7 @@ if ($NoThemeSwitch) {
 
     [WordLayout]::Focus($frame) | Out-Null
     Start-Sleep -Milliseconds 1200
-    [WordLayout]::MouseTo(4, 4)
+    Set-Pointer 4 4 'parking the pointer clear of the strip' | Out-Null
     Start-Sleep -Milliseconds 800
 
     $stripRect = [WordLayout]::RectOf($strip)
@@ -771,7 +772,10 @@ $frame = Focus-Word
 $strip = Get-StripOf $frame
 Start-Sleep -Milliseconds 800
 
-[WordLayout]::CtrlPress($VK_W)
+# Aimed at one named window. Ctrl+W closes whichever document is in front, so a Focus that quietly
+# did not take does not lose the keystroke - it closes the wrong document.
+Assert (Invoke-ConfirmedKeyOn -Hwnd $frame -Vk $VK_W -What 'Ctrl+W on the last document' -Ctrl) `
+       'Ctrl+W went to the window it was aimed at'
 Assert (Wait-For { $w = Get-Child (Get-TheFrame) '_WwF'
                    $w -and ([WordLayout]::FirstChild($w.Hwnd) -eq [IntPtr]::Zero) } 25) `
     'the last document closed and left its window standing'
@@ -779,7 +783,7 @@ Start-Sleep -Seconds 3
 
 $frame = Focus-Word
 $strip = Get-StripOf $frame
-[WordLayout]::MouseTo(4, 4)
+Set-Pointer 4 4 'parking the pointer clear of the strip' | Out-Null
 Start-Sleep -Milliseconds 900
 $stripRect = [WordLayout]::RectOf($strip)
 $emptyShot = Get-StripShot $strip
@@ -818,7 +822,11 @@ $messageX = $emptyLayout.Plus.Right + 100
 $messageY = [int](($stripRect.Top + $stripRect.Bottom) / 2)
 Assert ([WordLayout]::WindowAt($messageX, $messageY) -eq $strip) `
     'the message is inside the strip, so the next click is a fair test'
-[WordLayout]::Click($messageX, $messageY)
+# Confirmed to land, deliberately: this is the negative test, and a click that never arrived produces
+# exactly the same "nothing happened" as a label correctly ignoring one.
+Assert (Invoke-ConfirmedClick -What 'clicking the empty row''s message' `
+                             -Point { [pscustomobject]@{ X = $messageX; Y = $messageY } }) `
+       'the click really did land on the strip, so "nothing happened" means the label ignored it'
 Start-Sleep -Seconds 3
 Assert (-not ([WordLayout]::FirstChild((Get-Child (Get-TheFrame) '_WwF').Hwnd) -ne [IntPtr]::Zero)) `
     'clicking the message does nothing - it is a label, not a button'
@@ -836,7 +844,7 @@ try {
     Open-Documents 2
     $frame = Focus-Word
     $strip = Get-StripOf $frame
-    [WordLayout]::MouseTo(4, 4)
+    Set-Pointer 4 4 'parking the pointer clear of the strip' | Out-Null
     Start-Sleep -Milliseconds 900
 
     $stripRect = [WordLayout]::RectOf($strip)

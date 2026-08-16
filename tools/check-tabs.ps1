@@ -66,6 +66,10 @@ Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
 )
 [WordLayout]::MakeDpiAware() | Out-Null
 
+# Confirmed input, one shared idea of what a Word dialog is, and the bounded waits. See the header of
+# tools\WordTabHarness.ps1 for why these are not per-suite copies any more.
+. (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
+
 $script:Failures = 0
 $script:Checks   = 0
 
@@ -77,13 +81,7 @@ function Assert($condition, $text) {
     else { $script:Failures++; Write-Host "    FAIL  $text" -ForegroundColor Red }
 }
 
-function Get-Frames {
-    $found = @()
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
-        $found += [WordLayout]::Frames($process.Id)
-    }
-    return @($found)
-}
+function Get-Frames { return Get-WordFrameList }
 
 # Always ask for the count through this. A PowerShell function that returns an empty array returns
 # *nothing*, and `(Get-Frames).Count` on nothing is a hard error rather than 0 - which bites exactly
@@ -95,8 +93,8 @@ function Get-Parts($frame) {
     [pscustomobject]@{
         Frame = $frame
         Rect  = [WordLayout]::RectOf($frame)
-        Strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' })[0]
-        Wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' })[0]
+        Strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' }) | Select-Object -First 1
+        Wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' }) | Select-Object -First 1
         Title = [WordLayout]::TitleOf($frame)
     }
 }
@@ -144,9 +142,18 @@ function Get-Spot($kind, $index) {
     }
 }
 
+# The only click path in this suite, so this is the one place confirmation has to go.
+#
+# The scriptblock is re-run on every attempt rather than the spot being measured once: the strip
+# moves, and taking the foreground back after a failed attempt can move it again. Returns the spot it
+# actually clicked, and $null if it never got the strip under the pointer - AN INJECTED INPUT YOU DID
+# NOT CONFIRM LANDED IS NOT AN INPUT, and a click that missed reads exactly like a button that does
+# nothing.
 function Invoke-Spot($kind, $index) {
-    $spot = Get-Spot $kind $index
-    [WordLayout]::Click($spot.X, $spot.Y)
+    $spot = $null
+    $aim = { $script:lastSpot = Get-Spot $kind $index; return $script:lastSpot }
+    if (Invoke-ConfirmedClick -What "clicking $kind $index" -Point $aim) { $spot = $script:lastSpot }
+    else { Write-Note "the $kind-$index click never landed on the strip" }
     return $spot
 }
 
@@ -205,31 +212,35 @@ function Measure-Changed($a, $b, $origin, $rect) {
 # the document - and a check that starts in that state is measuring something other than what it
 # says it is. This has already happened once.
 
-$running = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)
+# One WM_CLOSE per frame, not CloseMainWindow. A Word process holding a stack has N top-level windows
+# and CloseMainWindow closes exactly one of them - which the cleanup at the *bottom* of this file
+# already knew and said so, while this one at the top did it the broken way for eight slices. A
+# pre-run cleanup that leaves three of four windows up is the worst place for that bug: everything
+# after it measures leftovers.
+$running = @(Get-WordPidList)
 if ($running.Count -gt 0) {
     Write-Step "Closing $($running.Count) Word process(es) already running"
-    foreach ($process in $running) { $process.CloseMainWindow() | Out-Null }
-    $deadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $deadline -and (Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
-        Start-Sleep -Milliseconds 500
+    $start = Close-AllWord
+    if (-not $start.Closed) {
+        throw ("Word would not close ({0}: {1}) - close it by hand, saving or discarding as you like, then re-run." -f
+               $start.Reason, (Format-WordWindow $start.Dialog))
     }
-    $left = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)
-    if ($left.Count -gt 0) { throw "Word would not close ($($left.Count) left) - close it by hand, saving or discarding as you like, then re-run." }
     Start-Sleep -Seconds 2
 }
 
 $scratch = Join-Path $env:TEMP 'wordtab-check'
 New-Item -ItemType Directory -Path $scratch -Force | Out-Null
 
+# Waiting for each document to arrive rather than sleeping 14 seconds for the first and 7 for each
+# one after. This is the harness getting into position - nothing below asserts how long Word takes to
+# open a file - so a wait here cannot weaken a check, and on a three-document run those two literals
+# were 28 seconds on their own.
 for ($i = 1; $i -le $Documents; $i++) {
     $path = Join-Path $scratch "wordtab-tabs-$i.rtf"
     "{\rtf1\ansi WordTab tab check - document $i.\par}" | Set-Content -Path $path -Encoding Ascii
     Start-Process -FilePath 'winword.exe' -ArgumentList "`"$path`""
-    Start-Sleep -Seconds $(if ($i -eq 1) { 14 } else { 7 })
+    if (-not (Wait-WordReady $i 45)) { Write-Note "document $i did not arrive with a strip on it within 45s" }
 }
-
-$deadline = (Get-Date).AddSeconds(45)
-while ((Get-Date) -lt $deadline -and (Get-FrameCount) -lt $Documents) { Start-Sleep -Milliseconds 500 }
 
 $frames = @(Get-Frames)
 Write-Note "$($frames.Count) visible Word frame(s)"
@@ -284,7 +295,16 @@ Assert (@($activated | Sort-Object -Unique).Count -eq $count) "each of the $coun
 # not". Both halves are asserted, because a hover that lit everything would satisfy the first.
 
 Write-Step 'Hovering a tab'
-[WordLayout]::MouseTo(4, 4)                      # off the strip entirely, so nothing is hot
+
+# Parked with a cursor readback, not a bare MouseTo. SendInput's absolute move silently does not take
+# when another process holds the foreground or a hand is on the mouse, and if the park does not take,
+# the cold and hot photographs are of the SAME pointer position - every hover assertion then fails
+# with "0 pixels changed", which is byte-identical to a hover that is not drawn. Measured in the look
+# slice: a run asked for (258,540) and left the pointer at (1894,459), over the desktop.
+#
+# Confirmed by where the pointer ended up, NOT by what is under it: (4,4) is deliberately off the
+# strip, so a WordTabStrip-under-the-point check would be exactly wrong here.
+Assert (Set-Pointer 4 4 'parking the pointer clear of the strip') 'the pointer could be parked off the strip'
 Start-Sleep -Milliseconds 900
 $top = Get-TopStrip
 $cold = Get-StripShot $top.Strip.Hwnd
@@ -295,7 +315,9 @@ $spot = Get-Spot 'close' $target
 $control = (Get-Spot 'label' $other).Rect
 $control.Right = $control.Left + [int](($control.Right - $control.Left) / 3)
 
-[WordLayout]::MouseTo($spot.X, $spot.Y)
+Assert (Set-Pointer $spot.X $spot.Y "hovering tab $target's close button") 'the pointer could be put on the close button'
+Write-Note ("the pointer is at ({0},{1}), over `"{2}`"" -f
+            [WordLayout]::Cursor().X, [WordLayout]::Cursor().Y, (Get-ClassAt $spot.X $spot.Y))
 Start-Sleep -Milliseconds 900
 $hot = Get-StripShot $top.Strip.Hwnd
 
@@ -319,7 +341,7 @@ if ($Screenshot) {
     Write-Note (Join-Path $ShotDir 'wordtab-strip-hover.png')
 }
 $cold.Bitmap.Dispose(); $hot.Bitmap.Dispose()
-[WordLayout]::MouseTo(4, 4)
+Set-Pointer 4 4 'parking the pointer again' | Out-Null
 
 # ---- the new-document button ---------------------------------------------------------------------
 
@@ -349,6 +371,13 @@ Write-Step 'Pressing a close button and sliding off'
 $count = (Get-FrameCount)
 $button = Get-Spot 'close' 0
 $away = Get-Spot 'label' 0
+
+# The press point is confirmed before the gesture, never during it: this is one continuous
+# button-down movement, and re-aiming halfway through would break the very gesture being measured.
+# If the press lands somewhere other than the close button, "nothing closed" is true for the wrong
+# reason and the safety property goes unchecked while the suite prints PASS.
+$onButton = (Get-ClassAt $button.X $button.Y)
+Assert ($onButton -eq 'WordTabStrip') "the press point is on the strip, not `"$onButton`" - so the gesture starts on the close button"
 [WordLayout]::PressAndSlideOff($button.X, $button.Y, $away.X, $away.Y)
 Start-Sleep -Seconds 3
 
@@ -409,8 +438,9 @@ if ($count -ge 3) {
 Write-Step 'Middle-clicking a tab'
 $count = (Get-FrameCount)
 if ($count -ge 2) {
-    $spot = Get-Spot 'label' ($count - 1)
-    [WordLayout]::MiddleClick($spot.X, $spot.Y)
+    $landed = Invoke-ConfirmedClick -What 'middle-clicking the last tab' -Button middle `
+                                    -Point { Get-Spot 'label' ($count - 1) }
+    Assert $landed 'the middle-click was confirmed to land on the strip'
     $closed = Wait-Frames ($count - 1) 20
     Assert $closed "middle-click closed it ($((Get-FrameCount)) window(s), expected $($count - 1))"
 } else {
@@ -428,8 +458,14 @@ for ($guard = 0; $guard -lt 8; $guard++) {
     $open = @(Get-Frames)
     if ($open.Count -le 1) { break }
     [WordLayout]::Close($open[0])
-    Start-Sleep -Seconds 4
+    Wait-Until { @(Get-Frames).Count -lt $open.Count } 10 300 | Out-Null
 }
+
+# A FIXED settle after the loop, for the same reason as check-stack: "the last window is back in
+# Alt+Tab" is about the add-in taking WS_EX_TOOLWINDOW back off it, which happens on the janitor's
+# own cadence after the close, not when the window count drops. check-stack went red on exactly this
+# and this file had the identical change and happened not to - which is worse, not better.
+Start-Sleep -Seconds 4
 $last = @(Get-Frames)
 if ($last.Count -eq 1) {
     Assert (-not [WordLayout]::IsToolWindow($last[0])) 'the last window is back in Alt+Tab'
@@ -446,28 +482,18 @@ if ($last.Count -eq 1) {
 
 # ---- done ---------------------------------------------------------------------------------------
 #
-# CloseMainWindow and a long wait, and no Kill. Killing Word leaves it offering to recover these
-# documents on the next launch, which quietly changes what the *next* run measures.
+# One WM_CLOSE per frame, and no Kill. Killing Word leaves it offering to recover these documents on
+# the next launch, which quietly changes what the *next* run measures. A Word process holding a stack
+# has N top-level windows and CloseMainWindow closes exactly one of them - measured, four documents
+# left open after two rounds of it - which is why this is not that.
 
 if (-not $KeepOpen) {
     Write-Step 'Closing Word'
-
-    # One window at a time, not CloseMainWindow. A Word process holding a stack has N top-level
-    # windows and CloseMainWindow closes exactly one of them - measured, four documents left open
-    # after two rounds of it. Each of these is the same WM_CLOSE the user's own close button sends.
-    for ($guard = 0; $guard -lt 12; $guard++) {
-        $open = @(Get-Frames)
-        if ($open.Count -eq 0) { break }
-        [WordLayout]::Close($open[0])
-        Start-Sleep -Seconds 3
+    $end = Close-AllWord
+    if (-not $end.Closed) {
+        Write-Note ("Word is still up ({0}): {1}" -f $end.Reason, (Format-WordWindow $end.Dialog))
+        Write-Note 'Left running rather than killed. Answer it by hand before the next suite.'
     }
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $process.CloseMainWindow() | Out-Null }
-    $deadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $deadline -and (Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
-        Start-Sleep -Milliseconds 500
-    }
-    $stuck = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)
-    if ($stuck.Count -gt 0) { Write-Note "$($stuck.Count) Word process(es) would not close - left running rather than killed" }
 }
 
 Write-Host ''

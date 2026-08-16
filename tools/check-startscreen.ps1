@@ -76,6 +76,10 @@ Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
 )
 [WordLayout]::MakeDpiAware() | Out-Null
 
+# Confirmed input, one shared idea of what a Word dialog is, and the bounded waits. See the header of
+# tools\WordTabHarness.ps1 for why these are not per-suite copies any more.
+. (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
+
 $LogPath = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
 $VK_W        = 0x57
 $SW_MINIMIZE = 6
@@ -95,15 +99,11 @@ function Assert($condition, $text) {
 # empty array returns *nothing*, and `.Count` on nothing is a hard error under Set-StrictMode rather
 # than 0. This suite spends most of its time at zero or one of everything, so the trap that has
 # already cost two runs on this project is the normal case here.
-function Get-WordPids { @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }) }
-function Get-WordPidCount { return @(Get-WordPids).Count }
+function Get-WordPids { return Get-WordPidList }
+function Get-WordPidCount { return Get-WordPidTally }
 
-function Get-Frames {
-    $found = @()
-    foreach ($id in @(Get-WordPids)) { $found += [WordLayout]::Frames($id) }
-    return @($found)
-}
-function Get-FrameCount { return @(Get-Frames).Count }
+function Get-Frames { return Get-WordFrameList }
+function Get-FrameCount { return Get-WordFrameTally }
 
 # Deliberately not the `@(... | Where-Object ...)[0]` shape the older suites use: under
 # Set-StrictMode that *throws* on an empty match rather than yielding $null, and every window this
@@ -204,17 +204,10 @@ function Save-StripShot($strip, $name) {
 
 if ((Get-WordPidCount) -gt 0) {
     Write-Step "Closing $(Get-WordPidCount) Word process(es) already running"
-    for ($guard = 0; $guard -lt 12; $guard++) {
-        $open = @(Get-Frames)
-        if ($open.Count -eq 0) { break }
-        [WordLayout]::Close($open[0])
-        Start-Sleep -Seconds 2
-    }
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $process.CloseMainWindow() | Out-Null }
-    $deadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $deadline -and (Get-WordPidCount) -gt 0) { Start-Sleep -Milliseconds 500 }
-    if ((Get-WordPidCount) -gt 0) {
-        throw 'Word would not close - close it by hand, saving or discarding as you like, then re-run.'
+    $start = Close-AllWord
+    if (-not $start.Closed) {
+        throw ("Word would not close ({0}: {1}) - close it by hand, saving or discarding as you like, then re-run." -f
+               $start.Reason, (Format-WordWindow $start.Dialog))
     }
     Start-Sleep -Seconds 2
 }
@@ -281,9 +274,9 @@ Write-Step 'A second document, from the + button'
 # document rather than opening a second window beside it - so opening a file here would leave one
 # window and quietly measure nothing. Measured, and it cost a run of this suite to find.
 
-$strip = Get-StripOf (Get-TheFrame)
-$plusOne = Get-PlusAt $strip 1
-[WordLayout]::Click($plusOne.X, $plusOne.Y)
+Assert (Invoke-ConfirmedClick -What 'clicking the + with one tab in the row' -Point {
+            Get-PlusAt (Get-StripOf (Get-TheFrame)) 1
+        }) 'the click on + landed on the strip'
 Assert (Wait-For { (Get-FrameCount) -eq 2 } 45) "two windows ($(Get-FrameCount))"
 Start-Sleep -Seconds 4
 
@@ -302,9 +295,11 @@ Save-StripShot $topStrip 'startscreen-two-tabs'
 # WM_CLOSE is a different thing: it closes the window, and on the last window it closes Word.
 
 Write-Step "Word's own Ctrl+W with another document still open"
-[WordLayout]::Focus($top) | Out-Null
-Start-Sleep -Milliseconds 800
-[WordLayout]::CtrlPress($VK_W)
+# Aimed at ONE window and confirmed before it is sent. Ctrl+W closes whichever document is in front,
+# so a Focus that quietly did not take does not lose the keystroke - it closes the wrong document,
+# and everything after this measures a window that should not be there.
+Assert (Invoke-ConfirmedKeyOn -Hwnd $top -Vk $VK_W -What 'Ctrl+W on the chosen window' -Ctrl) `
+       'Ctrl+W went to the window it was aimed at'
 Assert (Wait-For { (Get-FrameCount) -eq 1 } 25) "one window left ($(Get-FrameCount))"
 Start-Sleep -Seconds 3
 
@@ -314,9 +309,8 @@ Assert (-not [WordLayout]::IsToolWindow($survivor)) 'and the last window is back
 
 Write-Step "Word's own Ctrl+W on the LAST document"
 $mark = Get-LogMark
-[WordLayout]::Focus($survivor) | Out-Null
-Start-Sleep -Milliseconds 800
-[WordLayout]::CtrlPress($VK_W)
+Assert (Invoke-ConfirmedKeyOn -Hwnd $survivor -Vk $VK_W -What 'Ctrl+W on the last document' -Ctrl) `
+       'Ctrl+W went to the last document, not to whatever else was in front'
 Start-Sleep -Seconds 8
 
 Assert ((Get-WordPidCount) -gt 0) 'Word is still running - closing a document is not closing Word'
@@ -359,7 +353,12 @@ $tabSpot = [WordLayout]::Center($oneTab.Tabs[0])
 $overTab = [WordLayout]::WindowAt($tabSpot.X, $tabSpot.Y)
 Assert ($overTab -eq $strip) 'the place the old "Word" tab occupied is still inside the strip, so the next click is a fair test'
 $beforePids = Get-WordPidCount
-[WordLayout]::Click($tabSpot.X, $tabSpot.Y)
+# Confirmed to LAND, deliberately - this is the negative test, and "nothing happened" is exactly what
+# a click that never arrived also produces. The whole point of this section is that the click was
+# real and the row still did nothing.
+Assert (Invoke-ConfirmedClick -What 'clicking where the old "Word" tab used to be' -Point {
+            [WordLayout]::Center(([WordLayout]::Tabs((Get-StripOf (Get-TheFrame)), 1)).Tabs[0])
+        }) 'the click really did land on the strip, so "nothing happened" means the row ignored it'
 Start-Sleep -Seconds 3
 Assert ((Get-WordPidCount) -eq $beforePids) 'clicking where the "Word" tab used to be does not close Word'
 Assert ((Get-FrameCount) -eq 1) "nor open anything ($(Get-FrameCount) windows)"
@@ -369,9 +368,9 @@ Assert (-not (Test-HasDocument (Get-TheFrame))) 'and it certainly does not conju
 
 Write-Step 'Pressing + to come back from empty'
 $mark = Get-LogMark
-$strip = Get-StripOf (Get-TheFrame)
-$plusEmpty = Get-PlusAt $strip 0
-[WordLayout]::Click($plusEmpty.X, $plusEmpty.Y)
+Assert (Invoke-ConfirmedClick -What 'clicking the + on an empty row' -Point {
+            Get-PlusAt (Get-StripOf (Get-TheFrame)) 0
+        }) 'the click on + landed on the strip'
 Assert (Wait-For { Test-HasDocument (Get-TheFrame) } 25) 'a document is back - so that really was the +, and the row really was empty'
 Start-Sleep -Seconds 3
 Assert ((Get-FrameCount) -eq 1) "Word put it in this same window rather than opening another ($(Get-FrameCount) windows)"
@@ -385,9 +384,8 @@ Save-StripShot (Get-StripOf (Get-TheFrame)) 'startscreen-back-to-one-tab'
 # doing that, the empty window would still be sitting in the row alongside the file that just opened.
 
 Write-Step 'Emptying it again, then opening a real file from outside'
-[WordLayout]::Focus((Get-TheFrame)) | Out-Null
-Start-Sleep -Milliseconds 800
-[WordLayout]::CtrlPress($VK_W)
+Assert (Invoke-ConfirmedKeyOn -Hwnd (Get-TheFrame) -Vk $VK_W -What 'Ctrl+W to empty the window again' -Ctrl) `
+       'Ctrl+W went to the window it was aimed at'
 Assert (Wait-For { -not (Test-HasDocument (Get-TheFrame)) } 20) 'empty again'
 Start-Sleep -Seconds 2
 
@@ -427,16 +425,11 @@ Assert (-not [WordLayout]::IsToolWindow($frame)) 'and reachable'
 
 if (-not $KeepOpen) {
     Write-Step 'Closing Word'
-    for ($guard = 0; $guard -lt 12; $guard++) {
-        $open = @(Get-Frames)
-        if ($open.Count -eq 0) { break }
-        [WordLayout]::Close($open[0])
-        Start-Sleep -Seconds 3
+    $end = Close-AllWord
+    if (-not $end.Closed) {
+        Write-Note ("Word is still up ({0}): {1}" -f $end.Reason, (Format-WordWindow $end.Dialog))
+        Write-Note 'Left running rather than killed. Answer it by hand before the next suite.'
     }
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $process.CloseMainWindow() | Out-Null }
-    $deadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $deadline -and (Get-WordPidCount) -gt 0) { Start-Sleep -Milliseconds 500 }
-    if ((Get-WordPidCount) -gt 0) { Write-Note "$(Get-WordPidCount) Word process(es) would not close - left running rather than killed" }
 }
 
 Write-Host ''

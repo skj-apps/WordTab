@@ -53,6 +53,10 @@ Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
 )
 [WordLayout]::MakeDpiAware() | Out-Null
 
+# Confirmed input, one shared idea of what a Word dialog is, and the bounded waits. See the header of
+# tools\WordTabHarness.ps1 for why these are not per-suite copies any more.
+. (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
+
 $script:Failures = 0
 $script:Checks   = 0
 
@@ -64,21 +68,20 @@ function Assert($condition, $text) {
     else { $script:Failures++; Write-Host "    FAIL  $text" -ForegroundColor Red }
 }
 
-function Get-Frames {
-    $found = @()
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
-        $found += [WordLayout]::Frames($process.Id)
-    }
-    return @($found)
-}
+function Get-Frames { return Get-WordFrameList }
+
+# Always ask for the count through this, never `(Get-Frames).Count`: a PowerShell function that
+# returns an empty array returns *nothing*, and .Count on nothing is a hard error under
+# Set-StrictMode rather than 0 - which bites exactly when the last document has closed.
+function Get-FrameCount { return Get-WordFrameTally }
 
 function Get-Parts($frame) {
     $kids = [WordLayout]::Children($frame)
     [pscustomobject]@{
         Frame  = $frame
         Rect   = [WordLayout]::RectOf($frame)
-        Strip  = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' })[0]
-        Wwf    = @($kids | Where-Object { $_.Class -eq '_WwF' })[0]
+        Strip  = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' }) | Select-Object -First 1
+        Wwf    = @($kids | Where-Object { $_.Class -eq '_WwF' }) | Select-Object -First 1
         Title  = [WordLayout]::TitleOf($frame)
     }
 }
@@ -100,21 +103,9 @@ function Get-TopParts($all) {
     return $null
 }
 
-# Bring Word forward and wait until one of its frames really is the foreground window. Focus() does
-# the AttachThreadInput handshake, which is how a process that is not foreground asks for it.
-function Set-WordForeground($seconds = 6) {
-    $frames = @(Get-Frames)
-    if ($frames.Count -eq 0) { return $false }
-    if ($frames -contains [WordLayout]::GetForeground()) { return $true }
-
-    [WordLayout]::Focus($frames[0]) | Out-Null
-    $deadline = (Get-Date).AddSeconds($seconds)
-    while ((Get-Date) -lt $deadline) {
-        if (@(Get-Frames) -contains [WordLayout]::GetForeground()) { return $true }
-        Start-Sleep -Milliseconds 250
-    }
-    return $false
-}
+# Set-WordForeground and Test-WordForeground now come from WordTabHarness.ps1. The local copy here
+# was one of six that had drifted apart; the shared one also minimises an application that will not
+# give the foreground up, and knows the three windows it must never minimise.
 
 # One rectangle, or several? Compared as strings because that is exactly the question - identical
 # or not - and it prints usefully when the answer is "not".
@@ -168,15 +159,25 @@ $scratch = Join-Path $env:TEMP 'wordtab-check'
 New-Item -ItemType Directory -Path $scratch -Force | Out-Null
 
 $startedWord = -not (Get-Process -Name WINWORD -ErrorAction SilentlyContinue)
+
+# Wait for each document to arrive rather than sleeping 14 seconds for the first and 7 for each one
+# after. Those numbers were a guess about how long this machine takes, and on a three-document run
+# they were 28 seconds of the suite on their own. Waiting for the window to exist AND to have a strip
+# on it is both faster when Word is quick and more correct when it is slow: a frame appears before
+# the add-in has drawn anything, and a suite that measures the strip in that gap measures nothing.
+#
+# This is a precondition, never an assertion. Nothing below asserts the document count - it throws if
+# there are too few - so polling for it cannot make a check pass by definition. That distinction is
+# what makes a wait honest, and it is why several fixed sleeps further down are deliberately left
+# alone.
 for ($i = 1; $i -le $Documents; $i++) {
     $path = Join-Path $scratch "wordtab-stack-$i.rtf"
     "{\rtf1\ansi WordTab stack check - document $i.\par}" | Set-Content -Path $path -Encoding Ascii
     Start-Process -FilePath 'winword.exe' -ArgumentList "`"$path`""
-    Start-Sleep -Seconds $(if ($i -eq 1) { 14 } else { 7 })
+    if (-not (Wait-WordReady $i 45)) {
+        Write-Note "document $i did not arrive with a strip on it within 45s - carrying on and letting the assertions report it"
+    }
 }
-
-$deadline = (Get-Date).AddSeconds(45)
-while ((Get-Date) -lt $deadline -and (Get-Frames).Count -lt $Documents) { Start-Sleep -Milliseconds 500 }
 
 $frames = Get-Frames
 Write-Note "$($frames.Count) visible Word frame(s)"
@@ -226,24 +227,35 @@ Write-Step 'Clicking each tab'
 [WordLayout]::Focus($active) | Out-Null
 Start-Sleep -Milliseconds 500
 
-Assert (Set-WordForeground) 'Word is the foreground application, so a tab click can switch to it'
+Set-WordForeground | Out-Null
+Assert (Test-WordForeground) 'Word is the foreground application, so a tab click can switch to it'
 
 $parts = @(Get-Frames | ForEach-Object { Get-Parts $_ })
 $count = $parts.Count
 $top   = Get-TopParts $parts
 
 $activated = @()
+$landed = 0
 for ($i = 0; $i -lt $count; $i++) {
     # Measured inside the loop, not once before it. The strip moves whenever Word relays a window
     # out, and it was measured shifting 46 pixels between two clicks a second apart - after which a
     # rectangle taken before the loop points into the document and the click does nothing at all.
-    $live = Get-TopParts @(Get-Frames | ForEach-Object { Get-Parts $_ })
-    if (-not $live) { $live = $top }
-    $tab = ([WordLayout]::Tabs($live.Strip.Hwnd, $count)).Tabs[$i]
-
-    $x = $tab.Left + [int](($tab.Right - $tab.Left) / 3)
-    $y = [int](($tab.Top + $tab.Bottom) / 2)
-    [WordLayout]::Click($x, $y)
+    #
+    # The scriptblock is the point: Invoke-ConfirmedClick re-runs it on every attempt, so a retry
+    # after the foreground was taken back re-measures rather than re-using a rectangle that has
+    # since moved. A click that never reached the strip and a tab that does not switch windows are
+    # otherwise the same evidence.
+    $aim = {
+        $live = Get-TopParts @(Get-Frames | ForEach-Object { Get-Parts $_ })
+        if (-not $live) { $live = $top }
+        $tab = ([WordLayout]::Tabs($live.Strip.Hwnd, $count)).Tabs[$i]
+        [pscustomobject]@{
+            X = $tab.Left + [int](($tab.Right - $tab.Left) / 3)
+            Y = [int](($tab.Top + $tab.Bottom) / 2)
+        }
+    }
+    $x = (& $aim).X
+    if (Invoke-ConfirmedClick -What "clicking tab $i" -Point $aim) { $landed++ }
     Start-Sleep -Milliseconds 900
 
     $now = [WordLayout]::GetForeground()
@@ -251,6 +263,8 @@ for ($i = 0; $i -lt $count; $i++) {
     Write-Note ("tab {0} at x={1} -> foreground 0x{2:X} `"{3}`"" -f $i, $x, [int64]$now, $title)
     $activated += $now
 }
+
+Assert ($landed -eq $count) "every one of the $count tab clicks was confirmed to land on the strip ($landed of $count)"
 
 $distinct = @($activated | Sort-Object -Unique)
 Assert ($distinct.Count -eq $count) "each of the $count tabs brought a different window forward ($($distinct.Count) distinct)"
@@ -347,8 +361,21 @@ for ($guard = 0; $guard -lt 6; $guard++) {
     $open = @(Get-Frames)
     if ($open.Count -le 1) { break }
     [WordLayout]::Close($open[0])
-    Start-Sleep -Seconds 4
+    Wait-Until { @(Get-Frames).Count -lt $open.Count } 10 300 | Out-Null
 }
+
+# A FIXED settle, and it is deliberate. The first version of this loop replaced the old
+# `Start-Sleep -Seconds 4` after each close with the count-wait above and nothing else, reasoning
+# that the assertions below are about the surviving window rather than about how many windows there
+# are. That reasoning was wrong in a way worth recording: the count drops the instant Word destroys
+# the window, but "the last window is back in Alt+Tab" is about the add-in taking WS_EX_TOOLWINDOW
+# back OFF it, which its janitor does on its own half-second cadence AFTER the close. The wait
+# returned before the add-in had done it, and the very next battery went red here.
+#
+# So the sleep the assertion actually depended on is restored, once, after the loop instead of after
+# every close. What it buys is the add-in's reconcile, and how long that takes is part of the claim -
+# waiting for `-not IsToolWindow` instead would make the assertion unable to fail.
+Start-Sleep -Seconds 4
 $last = @(Get-Frames)
 if ($last.Count -eq 1) {
     Assert (-not [WordLayout]::IsToolWindow($last[0])) 'the last window is back in Alt+Tab'
@@ -381,11 +408,22 @@ if ($Screenshot) {
 
 # ---- done ---------------------------------------------------------------------------------------
 
+# NEVER Kill, and that is not fastidiousness. A killed Word offers to recover those documents on the
+# next launch, and the recovered documents then make the NEXT suite measure seven windows where it
+# asserts three. This suite runs first in check-all, so its cleanup is the one with the most to
+# poison - and it was doing exactly that: CloseMainWindow closes one of N frames, then Kill took the
+# rest. The same violation was found and fixed inside soak-stack in the scrolling-row slice; this
+# copy survived because nothing had gone looking for the second one.
+#
+# Close-AllWord posts WM_CLOSE per frame and stops if Word asks a question, because a test script may
+# not answer a save prompt it did not raise.
 if (-not $KeepOpen -and $startedWord) {
     Write-Step 'Closing Word'
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $process.CloseMainWindow() | Out-Null }
-    Start-Sleep -Seconds 4
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $process.Kill() }
+    $end = Close-AllWord
+    if (-not $end.Closed) {
+        Write-Note ("Word is still up ({0}): {1}" -f $end.Reason, (Format-WordWindow $end.Dialog))
+        Write-Note 'Answer it by hand before running the next suite - a leftover Word poisons whatever runs next.'
+    }
 }
 
 Write-Host ''

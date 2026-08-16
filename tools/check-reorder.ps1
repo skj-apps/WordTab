@@ -73,6 +73,10 @@ Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
 )
 [WordLayout]::MakeDpiAware() | Out-Null
 
+# Confirmed input, one shared idea of what a Word dialog is, and the bounded waits. See the header of
+# tools\WordTabHarness.ps1 for why these are not per-suite copies any more.
+. (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
+
 $script:Failures = 0
 $script:Checks   = 0
 
@@ -84,29 +88,21 @@ function Assert($condition, $text) {
     else { $script:Failures++; Write-Host "    FAIL  $text" -ForegroundColor Red }
 }
 
-function Get-Frames {
-    $found = @()
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
-        $found += [WordLayout]::Frames($process.Id)
-    }
-    return @($found)
-}
+function Get-Frames { return Get-WordFrameList }
 
 # A PowerShell function returning an empty array returns *nothing*, and .Count on nothing throws -
 # which bites exactly when the last document closes. Re-wrapping is what makes 0 come back as 0.
-function Get-FrameCount { return @(Get-Frames).Count }
+function Get-FrameCount { return Get-WordFrameTally }
 
-function Get-WordPids {
-    return @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-}
+function Get-WordPids { return Get-WordPidList }
 
 function Get-Parts($frame) {
     $kids = [WordLayout]::Children($frame)
     [pscustomobject]@{
         Frame = $frame
         Rect  = [WordLayout]::RectOf($frame)
-        Strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' })[0]
-        Wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' })[0]
+        Strip = @($kids | Where-Object { $_.Class -eq 'WordTabStrip' }) | Select-Object -First 1
+        Wwf   = @($kids | Where-Object { $_.Class -eq '_WwF' }) | Select-Object -First 1
         Title = [WordLayout]::TitleOf($frame)
     }
 }
@@ -172,22 +168,9 @@ function Format-Rect($r) { "({0},{1} {2}x{3})" -f $r.Left, $r.Top, ($r.Right - $
 # Focus() does the AttachThreadInput handshake, which is how a process that is not foreground asks
 # for it. Only the check script does this - the add-in deliberately does not, because a click on a
 # tab is user input into Word and Word can take the foreground on its own from there.
-function Set-WordForeground($seconds = 6) {
-    $frames = @(Get-Frames)
-    if ($frames.Count -eq 0) { return [IntPtr]::Zero }
-
-    $now = [WordLayout]::GetForeground()
-    if ($frames -contains $now) { return $now }
-
-    [WordLayout]::Focus($frames[0]) | Out-Null
-    $deadline = (Get-Date).AddSeconds($seconds)
-    while ((Get-Date) -lt $deadline) {
-        $now = [WordLayout]::GetForeground()
-        if (@(Get-Frames) -contains $now) { return $now }
-        Start-Sleep -Milliseconds 250
-    }
-    return [IntPtr]::Zero
-}
+# Set-WordForeground comes from WordTabHarness.ps1 now. The copy that used to live here gave up
+# after one attempt and returned IntPtr.Zero; the shared one retries, and as a last resort minimises
+# the application sitting over Word - which is exactly the case this suite lost a drag to.
 
 # Read the tab row, left to right, as a list of window handles.
 function Get-Order {
@@ -196,8 +179,13 @@ function Get-Order {
     $count = (Get-FrameCount)
     $order = @()
     for ($i = 0; $i -lt $count; $i++) {
-        $spot = Get-TabSpot $i
-        [WordLayout]::Click($spot.X, $spot.Y)
+        # Confirmed onto the strip, and re-measured on every attempt. Reading the row is the whole
+        # oracle of this suite - every reorder assertion is "the order before" against "the order
+        # after" - so a click that missed does not report itself as a missed click, it reports
+        # itself as a tab that did not move.
+        if (-not (Invoke-ConfirmedClick -What "reading tab $i" -Point { Get-TabSpot $i })) {
+            Write-Note "tab ${i}: the click never landed on the strip - the row reading below is unreliable"
+        }
         Start-Sleep -Milliseconds 700
 
         $now = [WordLayout]::GetForeground()
@@ -208,8 +196,7 @@ function Get-Order {
             Write-Note ("tab {0}: the foreground was `"{1}`" - taking it back and re-reading" -f `
                         $i, [WordLayout]::TitleOf($now))
             Set-WordForeground | Out-Null
-            $spot = Get-TabSpot $i
-            [WordLayout]::Click($spot.X, $spot.Y)
+            Invoke-ConfirmedClick -What "re-reading tab $i" -Point { Get-TabSpot $i } | Out-Null
             Start-Sleep -Milliseconds 900
             $now = [WordLayout]::GetForeground()
         }
@@ -298,17 +285,14 @@ function Wait-Frames($expected, $seconds = 20) {
 # those documents on the next launch, which adds a window nobody asked for and a recovery pane over
 # the document - and a check that starts in that state is measuring something other than what it says.
 
-$running = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)
+$running = @(Get-WordPids)
 if ($running.Count -gt 0) {
     Write-Step "Closing $($running.Count) Word process(es) already running"
-    foreach ($frame in @(Get-Frames)) { [WordLayout]::Close($frame); Start-Sleep -Seconds 2 }
-    foreach ($process in $running) { $process.CloseMainWindow() | Out-Null }
-    $deadline = (Get-Date).AddSeconds(25)
-    while ((Get-Date) -lt $deadline -and (Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
-        Start-Sleep -Milliseconds 500
+    $start = Close-AllWord
+    if (-not $start.Closed) {
+        throw ("Word would not close ({0}: {1}) - close it by hand, then re-run." -f
+               $start.Reason, (Format-WordWindow $start.Dialog))
     }
-    $left = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)
-    if ($left.Count -gt 0) { throw "Word would not close ($($left.Count) left) - close it by hand, then re-run." }
     Start-Sleep -Seconds 2
 }
 
@@ -322,7 +306,8 @@ for ($i = 0; $i -lt $Documents; $i++) {
     $path = Join-Path $scratch ("wordtab-order-{0}.rtf" -f $letters[$i])
     "{\rtf1\ansi WordTab reorder check - document $($letters[$i]).\par}" | Set-Content -Path $path -Encoding Ascii
     Start-Process -FilePath 'winword.exe' -ArgumentList "`"$path`""
-    Start-Sleep -Seconds $(if ($i -eq 0) { 14 } else { 7 })
+    # Waiting for Word to get into position, not for anything this suite claims about the product.
+    if (-not (Wait-WordReady ($i + 1) 45)) { Write-Note "document $($letters[$i]) did not arrive with a strip on it within 45s" }
 }
 
 $deadline = (Get-Date).AddSeconds(45)
@@ -357,7 +342,13 @@ Assert (Test-SameOrder $baseline $again) 'reading the row twice gives the same o
 
 Write-Step 'Pressing a tab and moving two pixels'
 $mark = Get-LogMark
+Set-WordForeground | Out-Null
 $spot = Get-TabSpot 0
+# Confirmed BEFORE the button goes down, never during. This is one continuous button-down gesture and
+# a retry that re-presses would break it. Without the check, a press that landed off the strip also
+# produces "no drag started" and "nothing moved" - both assertions pass while nothing was measured.
+$onWhat = Get-ClassAt $spot.X $spot.Y
+Assert ($onWhat -eq 'WordTabStrip') "the press starts on the strip, not on `"$onWhat`""
 [WordLayout]::DragTo($spot.X, $spot.Y, ($spot.X + 2), $spot.Y, 2, 150)
 Start-Sleep -Milliseconds 800
 
@@ -379,12 +370,14 @@ Set-WordForeground | Out-Null
 $mark = Get-LogMark
 $mover = $baseline[0]
 
-# Select it and hover it, so both photographs have the same tab selected and the same one hot.
+# Select it and hover it, so both photographs have the same tab selected and the same one hot. Both
+# confirmed: if the hover silently does not take, the "resting" and "lifted" photographs are of the
+# same pointer position and the drawing difference being measured is not the one named.
 $spot = Get-TabSpot 0
-[WordLayout]::Click($spot.X, $spot.Y)
+Invoke-ConfirmedClick -What 'selecting the tab to be carried' -Point { Get-TabSpot 0 } | Out-Null
 Start-Sleep -Milliseconds 800
 $spot = Get-TabSpot 0
-[WordLayout]::MouseTo($spot.X, $spot.Y)
+Assert (Set-Pointer $spot.X $spot.Y 'hovering the tab to be carried') 'the pointer could be put on the tab about to be carried'
 Start-Sleep -Milliseconds 900
 
 $top = Get-TopStrip
@@ -397,6 +390,10 @@ $far = (Get-TabSpot ((Get-FrameCount) - 1)).Rect
 
 try {
     $step1 = $spot.X + [int]($spot.Width / 3)
+    # Confirmed here, and nowhere after: everything from DragHold to DragRelease is one gesture with
+    # the button down, and re-aiming inside it would produce a different gesture from the one named.
+    $onWhat = Get-ClassAt $spot.X $spot.Y
+    Assert ($onWhat -eq 'WordTabStrip') "the pick-up starts on the strip, not on `"$onWhat`""
     [WordLayout]::DragHold($spot.X, $spot.Y, $step1, $spot.Y, 8, 70)
     $lifted = Get-StripShot $top.Strip.Hwnd
 
@@ -462,9 +459,12 @@ Write-Step 'Cancelling a drag with the right button'
 $before = Get-Order
 $mark = Get-LogMark
 
+Set-WordForeground | Out-Null
 $spot = Get-TabSpot 0
 $target = Get-TabSpot 2
 try {
+    $onWhat = Get-ClassAt $spot.X $spot.Y
+    Assert ($onWhat -eq 'WordTabStrip') "the cancelled drag starts on the strip, not on `"$onWhat`""
     [WordLayout]::DragHold($spot.X, $spot.Y, $target.X, $target.Y, 12, 60)
     Assert (@(Get-LogSince $mark 'tab moved').Count -ge 1) 'the row had rearranged before the cancel'
     [WordLayout]::RightTap($target.X, $target.Y)
@@ -478,12 +478,7 @@ Assert (@(Get-LogSince $mark 'drag cancelled').Count -ge 1) 'the add-in reports 
 
 # No menu, ours or Word's. The right button during a drag means cancel, and a cancel that also opened
 # a context menu would be two answers to one gesture.
-$menu = [IntPtr]::Zero
-foreach ($id in Get-WordPids) {
-    $w = [WordLayout]::PopupMenuWindow($id)
-    if ($w -ne [IntPtr]::Zero) { $menu = $w }
-}
-Assert ($menu -eq [IntPtr]::Zero) 'no context menu was left on screen'
+Assert ((Get-WordMenu) -eq [IntPtr]::Zero) 'no context menu was left on screen'
 
 $cancelled = Get-Order
 Write-Note "order: $(Format-Order $cancelled)"
@@ -501,6 +496,8 @@ $last = Get-TabSpot ($count - 1)
 # Hard against the right-hand end of the strip, so it is the add-in's clamp that decides where the
 # tab lands rather than the arithmetic happening to stop in the right place.
 $beyond = [Math]::Min($last.Rect.Right + $last.Width, $last.Band.Right - 2)
+$onWhat = Get-ClassAt $spot.X $spot.Y
+Assert ($onWhat -eq 'WordTabStrip') "the off-the-end drag starts on the strip, not on `"$onWhat`""
 [WordLayout]::DragTo($spot.X, $spot.Y, $beyond, $last.Y, 14, 60)
 Start-Sleep -Milliseconds 900
 
@@ -516,6 +513,8 @@ Write-Step 'Dragging it back to the front'
 $spot = Get-TabSpot ($count - 1)
 $first = Get-TabSpot 0
 $backTo = [Math]::Max($first.Rect.Left + 2, $first.Band.Left + 2)
+$onWhat = Get-ClassAt $spot.X $spot.Y
+Assert ($onWhat -eq 'WordTabStrip') "the drag back to the front starts on the strip, not on `"$onWhat`""
 [WordLayout]::DragTo($spot.X, $spot.Y, $backTo, $first.Y, 14, 60)
 Start-Sleep -Milliseconds 900
 
@@ -527,8 +526,8 @@ Assert ($front[0] -eq $mover) "`"$(Name $mover)`" is the first tab again"
 
 Write-Step 'Opening a document after the row has been rearranged'
 $before = Get-Order
-$plus = Get-PlusSpot
-[WordLayout]::Click($plus.X, $plus.Y)
+Assert (Invoke-ConfirmedClick -What 'clicking the new-document button' -Point { Get-PlusSpot }) `
+       'the click on + landed on the strip'
 $arrived = Wait-Frames (@($before).Count + 1) 25
 Assert $arrived "clicking + made a document ($((Get-FrameCount)) window(s), expected $(@($before).Count + 1))"
 
@@ -567,21 +566,11 @@ if (@($before).Count -ge 3) {
 
 if (-not $KeepOpen) {
     Write-Step 'Closing Word'
-    # One window at a time, not CloseMainWindow. A Word process holding a stack has N top-level
-    # windows and CloseMainWindow closes exactly one of them.
-    for ($guard = 0; $guard -lt 12; $guard++) {
-        $open = @(Get-Frames)
-        if ($open.Count -eq 0) { break }
-        [WordLayout]::Close($open[0])
-        Start-Sleep -Seconds 3
+    $end = Close-AllWord
+    if (-not $end.Closed) {
+        Write-Note ("Word is still up ({0}): {1}" -f $end.Reason, (Format-WordWindow $end.Dialog))
+        Write-Note 'Left running rather than killed. Answer it by hand before the next suite.'
     }
-    foreach ($process in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $process.CloseMainWindow() | Out-Null }
-    $deadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $deadline -and (Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) {
-        Start-Sleep -Milliseconds 500
-    }
-    $stuck = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)
-    if ($stuck.Count -gt 0) { Write-Note "$($stuck.Count) Word process(es) would not close - left running rather than killed" }
 }
 
 Write-Host ''
