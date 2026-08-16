@@ -14,8 +14,14 @@
 
   This is the real installer in embryo, not a dev convenience script. Keep it admin-free.
 
+  It also installs a PACKAGE. install\package.ps1 produces a folder holding this script, its
+  uninstaller, the built DLL and a manifest, and this script recognises one by its PAYLOAD.txt and
+  verifies the DLL against the hash recorded there instead of building. That is how WordTab reaches a
+  machine with no C++ toolchain, which the target corporate rig is.
+
 .PARAMETER SkipBuild
-  Register whatever is already in src\native\build instead of rebuilding.
+  Register whatever is already in src\native\build instead of rebuilding. Not needed for a package -
+  a package has nothing to build and this script works that out for itself.
 
 .PARAMETER NoBanner
   Install with the "WordTab is loaded" dialog switched off (it writes the log either way).
@@ -90,7 +96,16 @@ Write-Ok "CLSID matches wordtab.h: {$Clsid}"
 
 # ---- build ------------------------------------------------------------------------------------
 
-if ($SkipBuild) {
+# A packaged payload - see install\package.ps1 - is this same tree with the compiler-shaped hole
+# filled in: the built DLL, the one header the CLSID check reads, and a manifest naming exactly which
+# build it is. It exists because the target machine for this project has no C++ toolchain and
+# downloading one onto a locked-down corporate box is a worse ask than carrying 200KB.
+$PayloadFile = Join-Path $RepoRoot 'PAYLOAD.txt'
+$IsPayload   = Test-Path $PayloadFile
+
+if ($IsPayload) {
+    Write-Step 'Installing from a package - there are no sources here and nothing to build'
+} elseif ($SkipBuild) {
     Write-Step 'Skipping build (-SkipBuild)'
 } else {
     Write-Step 'Building the native server'
@@ -101,13 +116,32 @@ if ($SkipBuild) {
 if (-not (Test-Path $BuiltDll)) { throw "Build output not found: $BuiltDll" }
 
 # A stale DLL is the most expensive kind of wrong: everything installs cleanly, Word loads it
-# happily, and the change under test simply is not in it. Compare against the sources rather than
-# trusting that a build just happened - -SkipBuild bypasses it, and a failed build leaves the
-# previous DLL sitting there looking perfectly valid.
-$newestSource = Get-ChildItem -Path $NativeDir -Include '*.cpp', '*.h', '*.def' -File -Recurse |
-                Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if ($newestSource -and (Get-Item $BuiltDll).LastWriteTime -lt $newestSource.LastWriteTime) {
-    throw "$DllName is older than $($newestSource.Name) - it does not contain the current sources. Build it (drop -SkipBuild, and check the build actually succeeded)."
+# happily, and the change under test simply is not in it. Two ways to catch that, and the package
+# gets to use the better one.
+if ($IsPayload) {
+    # The hash the packager recorded, against the bytes that arrived. This REPLACES the timestamp
+    # comparison rather than adding to it, and that is the point: a file's LastWriteTime survives a
+    # zip, an email attachment and a USB stick unpredictably - a git clone rewrites every one of them
+    # to the moment of the clone - while its bytes either arrived intact or did not. The proxy is
+    # only ever standing in for this check; where this check is available, the proxy is noise that
+    # can fail on a correct payload.
+    $manifest = Get-Content -Path $PayloadFile
+    $wantHash = ($manifest | Where-Object { $_ -like 'Sha256:*' } | Select-Object -First 1)
+    $builtAt  = ($manifest | Where-Object { $_ -like 'Commit:*' } | Select-Object -First 1)
+    if (-not $wantHash) { throw "PAYLOAD.txt carries no Sha256: line, so the DLL cannot be verified. Re-package it." }
+    $wantHash = $wantHash.Substring(7).Trim()
+    $gotHash  = (Get-FileHash -Path $BuiltDll -Algorithm SHA256).Hash
+    if ($gotHash -ne $wantHash) {
+        throw "$DllName does not match the package manifest. Expected SHA256 $wantHash, got $gotHash. The file was altered or truncated in transit - re-copy the package."
+    }
+    Write-Ok "$DllName matches the manifest (SHA256 $($gotHash.Substring(0,16))...)"
+    if ($builtAt) { Write-Note $builtAt.Trim() }
+} else {
+    $newestSource = Get-ChildItem -Path $NativeDir -Include '*.cpp', '*.h', '*.def' -File -Recurse |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($newestSource -and (Get-Item $BuiltDll).LastWriteTime -lt $newestSource.LastWriteTime) {
+        throw "$DllName is older than $($newestSource.Name) - it does not contain the current sources. Build it (drop -SkipBuild, and check the build actually succeeded)."
+    }
 }
 
 # ---- install files ------------------------------------------------------------------------------
@@ -117,6 +151,14 @@ New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 Copy-Item -Path $BuiltDll -Destination $InstallDir -Force
 $installedDll = Join-Path $InstallDir $DllName
 if (-not (Test-Path $installedDll)) { throw "Copy failed: $installedDll missing." }
+
+# A package that travelled over the internet - OneDrive, an email attachment, a browser download -
+# arrives carrying a mark-of-the-web alternate data stream, and the copy above carries it across.
+# The same mark that puts a Word document into Protected View can make policy refuse to load a DLL,
+# and the failure looks exactly like a bad registration. One call, and it costs nothing when the file
+# never left the machine.
+try { Unblock-File -Path $installedDll -ErrorAction Stop; Write-Note 'cleared the mark-of-the-web, if it had one' } catch { }
+
 Write-Ok ("{0}  ({1:N0} bytes)" -f $installedDll, (Get-Item $installedDll).Length)
 
 # ---- register ------------------------------------------------------------------------------------
@@ -187,6 +229,40 @@ if ($disabled.Count -gt 0) {
     Write-Ok 'Word has no disabled items'
 }
 
+# Another tabbed-Word add-in is not a blocker and this deliberately does not disable one: they share
+# the same `_WwF` document frame, and on the dev rig WordTab and Office Tab have coexisted through
+# every check suite without the strip's tripwire firing once. But if the tab row ever looks doubled,
+# or the document jumps, this is the first thing to know - and turning somebody else's software off
+# on their machine is their call, so this prints the command rather than running it.
+# One warning, not one per registration. The dev rig alone has three of these ProgIds registered in
+# both hives, which came out as five separate warnings and buried the useful line - and a wall of
+# warnings after a successful install reads as a failed one.
+$rivals = @('OfficeTab.TabsforWord2013', 'OfficeTabs.Connect', 'TabsforOfficeHelper.Helper')
+$perUser = @(); $machine = @()
+foreach ($rival in $rivals) {
+    foreach ($hive in @('HKCU:', 'HKLM:')) {
+        $key = "$hive\Software\Microsoft\Office\Word\Addins\$rival"
+        if (-not (Test-Path $key)) { continue }
+        if ((Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).LoadBehavior -ne 3) { continue }
+        if ($hive -eq 'HKCU:') { $perUser += $rival } else { $machine += $rival }
+    }
+}
+$rivalNames = @(($perUser + $machine) | Select-Object -Unique)
+if ($rivalNames.Count -gt 0) {
+    Write-Warning "Another tabbed-Word add-in is set to load: $($rivalNames -join ', ')"
+    Write-Note 'That is not known to be a problem - WordTab and Office Tab have coexisted through every check'
+    Write-Note 'suite on the dev rig - but they drive the same part of Word. If the tab row looks doubled or'
+    Write-Note 'the document jumps, turn the other one off first:'
+    foreach ($r in ($perUser | Select-Object -Unique)) {
+        Write-Note "  Set-ItemProperty 'HKCU:\Software\Microsoft\Office\Word\Addins\$r' LoadBehavior 0"
+    }
+    if ($machine.Count -gt 0) {
+        Write-Note '  and for the machine-wide ones: Word > File > Options > Add-ins > Manage: COM Add-ins'
+    }
+} else {
+    Write-Ok 'no other tabbed-Word add-in is set to load'
+}
+
 if (-not $SkipSmokeTest) {
     # Activate the class outside Word. This separates "the COM registration is correct" from
     # "Word chose to load us", which are different failures with different fixes - and it runs in
@@ -205,6 +281,11 @@ if (-not $SkipSmokeTest) {
 
 Write-Host ''
 Write-Host 'Installed.' -ForegroundColor Green
-Write-Host "  Start Word. Expect a 'WordTab is loaded inside Word' dialog." -ForegroundColor Gray
+if ($NoBanner) {
+    Write-Host '  Start Word and open two documents. Expect one window with a tab for each.' -ForegroundColor Gray
+    Write-Host '  There is no load banner (-NoBanner); the log below is the proof it loaded.' -ForegroundColor Gray
+} else {
+    Write-Host "  Start Word. Expect a 'WordTab is loaded inside Word' dialog." -ForegroundColor Gray
+}
 Write-Host "  Log: $env:LOCALAPPDATA\WordTab\wordtab.log" -ForegroundColor Gray
 Write-Host "  Remove with: pwsh -File install\uninstall.ps1" -ForegroundColor Gray

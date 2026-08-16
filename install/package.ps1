@@ -1,0 +1,222 @@
+<#
+.SYNOPSIS
+  Build WordTab and lay it out as a package that installs on a machine with no compiler.
+
+.DESCRIPTION
+  The problem this exists for, stated plainly: install.ps1 builds from source, the target corporate
+  rig has no C++ toolchain, and src\native\build\ is gitignored - so cloning this repo over there
+  produces a tree that cannot be installed and does not say why until it is tried.
+
+  Downloading a toolchain onto a locked-down machine is a worse ask than carrying 200KB, so the
+  answer is to carry the 200KB. The package is this repo with the compiler-shaped hole filled in:
+
+      WordTab-<date>-<commit>\
+        PAYLOAD.txt                     which build this is, and the hash to prove it
+        README.txt                      what to do, in order
+        install\install.ps1             VERBATIM COPY - not a second installer
+        install\uninstall.ps1           VERBATIM COPY
+        src\native\wordtab.h            the CLSID that install.ps1 checks itself against
+        src\native\build\WordTab.dll    the build
+
+  **The scripts are copied, never rewritten.** A package with its own installer would be a second
+  implementation of "how WordTab is registered", and the two would agree right up until the day one
+  of them was fixed. install.ps1 recognises a package by its PAYLOAD.txt and skips the build.
+
+  Everything the package does on the far machine is per-user: HKCU and %LOCALAPPDATA%, no admin.
+
+.PARAMETER SkipBuild
+  Package whatever is already in src\native\build. The manifest still records its real hash.
+
+.PARAMETER OutDir
+  Where to put the package. Defaults to dist\ beside the repo root (gitignored).
+
+.PARAMETER NoZip
+  Leave the folder without also producing a .zip.
+
+.EXAMPLE
+  pwsh -File install\package.ps1
+#>
+[CmdletBinding()]
+param(
+    [switch]$SkipBuild,
+    [string]$OutDir,
+    [switch]$NoZip
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$RepoRoot  = Split-Path -Parent $PSScriptRoot
+$NativeDir = Join-Path $RepoRoot 'src\native'
+$BuiltDll  = Join-Path $NativeDir 'build\WordTab.dll'
+if (-not $OutDir) { $OutDir = Join-Path $RepoRoot 'dist' }
+
+function Write-Step($text) { Write-Host "==> $text" -ForegroundColor Cyan }
+function Write-Ok  ($text) { Write-Host "    $text" -ForegroundColor Green }
+function Write-Note($text) { Write-Host "    $text" -ForegroundColor DarkGray }
+
+# ---- what exactly is being packaged --------------------------------------------------------------
+
+Write-Step 'Identifying the build'
+
+$commit = 'unknown'
+$dirty  = $false
+try {
+    $commit = (& git -C $RepoRoot rev-parse --short HEAD 2>$null)
+    $status = @(& git -C $RepoRoot status --porcelain 2>$null)
+    $dirty  = ($status.Count -gt 0)
+} catch { }
+
+# A package is a thing that leaves the machine and comes back as a bug report. "Which build is that?"
+# has to have an answer, and "the tip of main, probably" is not one.
+if ($dirty) {
+    Write-Warning "The working tree has uncommitted changes. The package will be labelled ${commit}+dirty, and nobody will be able to reconstruct it from that label."
+    $commit = "$commit+dirty"
+}
+
+if (-not $SkipBuild) {
+    Write-Step 'Building'
+    & (Join-Path $NativeDir 'build.ps1')
+    if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE)." }
+} else {
+    Write-Step 'Skipping build (-SkipBuild)'
+}
+
+if (-not (Test-Path $BuiltDll)) { throw "No build output at $BuiltDll" }
+
+# The staleness check install.ps1 does in a source tree, done here instead - because the package is
+# where it stops being checkable. Past this point the DLL travels without its sources.
+$newestSource = Get-ChildItem -Path $NativeDir -Include '*.cpp', '*.h', '*.def' -File -Recurse |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($newestSource -and (Get-Item $BuiltDll).LastWriteTime -lt $newestSource.LastWriteTime) {
+    throw "WordTab.dll is older than $($newestSource.Name). Packaging that would ship a build nobody can identify as stale once it is on another machine. Build it first (drop -SkipBuild)."
+}
+
+$sha256 = (Get-FileHash -Path $BuiltDll -Algorithm SHA256).Hash
+$md5    = (Get-FileHash -Path $BuiltDll -Algorithm MD5).Hash
+$size   = (Get-Item $BuiltDll).Length
+$stamp  = Get-Date -Format 'yyyyMMdd'
+
+Write-Ok "commit $commit"
+Write-Ok ("WordTab.dll  {0:N0} bytes  SHA256 {1}" -f $size, $sha256)
+Write-Note "MD5 $md5"
+
+# ---- lay it out -----------------------------------------------------------------------------------
+
+$name    = "WordTab-$stamp-$($commit -replace '[^0-9a-zA-Z]', '')"
+$payload = Join-Path $OutDir $name
+
+Write-Step "Assembling $payload"
+if (Test-Path $payload) { Remove-Item -Path $payload -Recurse -Force }
+New-Item -ItemType Directory -Path (Join-Path $payload 'install')          -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $payload 'src\native\build') -Force | Out-Null
+
+Copy-Item (Join-Path $PSScriptRoot 'install.ps1')   (Join-Path $payload 'install\install.ps1')
+Copy-Item (Join-Path $PSScriptRoot 'uninstall.ps1') (Join-Path $payload 'install\uninstall.ps1')
+Copy-Item (Join-Path $NativeDir 'wordtab.h')        (Join-Path $payload 'src\native\wordtab.h')
+Copy-Item $BuiltDll                                 (Join-Path $payload 'src\native\build\WordTab.dll')
+Write-Ok 'install.ps1 and uninstall.ps1 copied verbatim'
+
+# The Word this was built and checked against. A package that turns up on a machine with a different
+# Word is still worth trying, but the difference is the first thing to look at.
+$wordVersion = 'unknown'
+try {
+    $exe = Join-Path $env:ProgramFiles 'Microsoft Office\root\Office16\WINWORD.EXE'
+    if (Test-Path $exe) { $wordVersion = (Get-Item $exe).VersionInfo.ProductVersion }
+} catch { }
+
+@"
+WordTab package
+Commit: $commit
+Built:  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+Sha256: $sha256
+Md5:    $md5
+Bytes:  $size
+BuiltOnWord: $wordVersion
+
+install.ps1 reads the Sha256 line and refuses to install a DLL that does not match it. That check
+replaces the source-timestamp check it does in a repo, which cannot work here: a package has no
+sources, and a zip, an email or a git clone rewrites file times anyway.
+"@ | Set-Content -Path (Join-Path $payload 'PAYLOAD.txt') -Encoding ASCII
+
+# ---- the note for whoever runs it ------------------------------------------------------------------
+
+@"
+WordTab - tabbed documents for Word
+Package $name  (commit $commit)
+
+WHAT THIS IS
+  Several Word documents in one window with a tab for each, instead of one window per document.
+  It installs entirely under your own user account: no admin rights, no UAC prompt, nothing written
+  to Program Files, HKLM, or the machine certificate store.
+
+    binaries    %LOCALAPPDATA%\Programs\WordTab\
+    settings    HKCU\Software\WordTab
+    log         %LOCALAPPDATA%\WordTab\wordtab.log
+
+WHAT TO DO, IN ORDER
+
+  1. CLOSE WORD. All of it. The installer refuses to run while any WINWORD process is up, because
+     Word holds the installed DLL open.
+
+  2. Open PowerShell - 64-BIT, which is what you get by default. The installer refuses to run from a
+     32-bit host, because that would register into a view 64-bit Word never reads.
+
+  3. cd into this folder and run:
+
+         powershell -ExecutionPolicy Bypass -File install\install.ps1
+
+     (Windows PowerShell 5.1 is fine. So is pwsh 7 if you have it.)
+
+     It will print what it did, then activate the class outside Word as a smoke test. If that smoke
+     test fails, Word will not load it either, and the message says so.
+
+  4. Start Word and open two documents.
+
+     EXPECTED: one Word window with two tabs, each named after its document. A dialog saying
+     "WordTab is loaded inside Word" comes up first - that is the load banner, and it is on by
+     default so that the first run proves itself. Turn it off with:
+
+         New-ItemProperty HKCU:\Software\WordTab ShowLoadBanner -Value 0 -PropertyType DWord -Force
+
+IF SOMETHING IS WRONG
+
+  The add-in writes %LOCALAPPDATA%\WordTab\wordtab.log from the moment it loads. That file is the
+  evidence for almost anything that can go wrong - send it.
+
+  Nothing in the log at all means Word never loaded the add-in. Check, in this order:
+    - HKCU\Software\Microsoft\Office\Word\Addins\WordTab.Connect  - LoadBehavior should be 3.
+      Word rewrites it to 2 when a load fails, so a 2 there means it tried and gave up.
+    - File > Options > Add-ins > Manage: Disabled Items. Word parks add-ins there after a crash and
+      that beats LoadBehavior=3.
+
+  Another tabbed-Word add-in (Office Tab and similar) is NOT known to be a problem - they have
+  coexisted through every check suite on the development machine - but they do drive the same part of
+  Word, so if the tab row looks doubled or the document jumps, turn the other one off first. The
+  installer prints the exact command if it finds one.
+
+TO REMOVE IT
+
+         powershell -ExecutionPolicy Bypass -File install\uninstall.ps1
+
+  That removes the registration, the files, the settings and the log directory. Word then starts
+  exactly as it did before - no strip, and the document back flush under the ribbon. Add -KeepLog to
+  keep the log for diagnosis.
+"@ | Set-Content -Path (Join-Path $payload 'README.txt') -Encoding ASCII
+
+Write-Ok 'PAYLOAD.txt and README.txt written'
+
+# ---- zip -------------------------------------------------------------------------------------------
+
+if (-not $NoZip) {
+    $zip = "$payload.zip"
+    if (Test-Path $zip) { Remove-Item $zip -Force }
+    Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $zip
+    Write-Ok ("{0}  ({1:N0} bytes)" -f $zip, (Get-Item $zip).Length)
+}
+
+Write-Host ''
+Write-Host 'Packaged.' -ForegroundColor Green
+Write-Host "  Folder: $payload" -ForegroundColor Gray
+if (-not $NoZip) { Write-Host "  Zip:    $payload.zip" -ForegroundColor Gray }
+Write-Host '  Copy it to the target machine, then follow README.txt.' -ForegroundColor Gray

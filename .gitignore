@@ -6,5 +6,8 @@ obj/
 # native build output
 src/native/build/
 
+# packages produced by install\package.ps1 - the DLL inside is a build output like any other
+dist/
+
 # per-machine Claude Code settings
 .claude/settings.local.json
