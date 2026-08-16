@@ -77,7 +77,6 @@ Add-Type -Namespace WordTabCheck -Name Wheel -MemberDefinition @'
 [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, int data, System.UIntPtr extra);
 '@
 
-$LogPath  = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
 $SwitchKey = 'HKCU:\Software\WordTab'
 
 $script:Failures = 0
@@ -145,19 +144,9 @@ function Wait-For($predicate, $seconds = 20) {
     return $false
 }
 
-function Get-LogMark { if (Test-Path $LogPath) { return (Get-Item $LogPath).Length } else { return 0 } }
-function Get-LogSince($offset, $pattern) {
-    if (-not (Test-Path $LogPath)) { return @() }
-    $stream = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
-    try {
-        if ($offset -gt $stream.Length) { $offset = 0 }
-        $stream.Seek([int64]$offset, 'Begin') | Out-Null
-        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-        $text = $reader.ReadToEnd()
-    } finally { $stream.Dispose() }
-    return @(($text -split "`r?`n") | Where-Object { $_ -like "*$pattern*" })
-}
-function Get-LogCount($offset, $pattern) { return @(Get-LogSince $offset $pattern).Count }
+# Set-LogMark, Get-LogSince and Get-LogCount come from WordTabHarness.ps1 now. The copy that used to
+# live here silently read from offset 0 after the add-in rolled the log, so the negative check below
+# - that the + did not close anything - could pass having read a file the evidence was deleted from.
 
 function Save-StripShot($name) {
     if (-not $Screenshot) { return }
@@ -426,7 +415,7 @@ foreach ($at in @(0, [int]($L.MaxScroll / 2), $L.MaxScroll)) {
 }
 
 Write-Step 'Clicking the drawn + adds a document rather than closing one'
-$mark   = Get-LogMark
+Set-LogMark
 $before = Get-FrameCount
 Move-RowTo 'end' | Out-Null            # the worst case: the row is as far right as it goes
 Set-WordForeground | Out-Null
@@ -440,8 +429,8 @@ Assert (Invoke-ConfirmedClick -What 'clicking the + on an overflowing row' `
        'the click on + landed on the strip'
 Assert (Wait-For { (Get-FrameCount) -eq ($before + 1) } 45) `
        "a document appeared: $before -> $(Get-FrameCount)"
-Assert ((Get-LogCount $mark 'new-document button clicked') -ge 1) 'the add-in logged it as the + being clicked'
-Assert ((Get-LogCount $mark 'close clicked') -eq 0) 'and nothing was closed - which is what used to happen here'
+Assert ((Get-LogCount 'new-document button clicked') -ge 1) 'the add-in logged it as the + being clicked'
+Assert ((Get-LogCount 'close clicked') -eq 0) 'and nothing was closed - which is what used to happen here'
 Start-Sleep -Seconds 2
 Save-StripShot 'overflowing'
 
@@ -587,7 +576,7 @@ $y = [int](($t.Top + $t.Bottom) / 2)
 $grabX = [int]($t.Left + ($t.Right - $t.Left) * 0.4)
 $edgeX = $row.Layout.Track.Right - 6
 
-$mark = Get-LogMark
+Set-LogMark
 # Confirmed before the button goes down, and not again until it is up. If the grab misses, "the drag
 # was recognised" fails for a reason that has nothing to do with edge-scrolling.
 $onWhat = Get-ClassAt $grabX $y
@@ -597,8 +586,8 @@ Start-Sleep -Milliseconds 2500          # holding still against the edge: the ti
 [WordLayout]::DragRelease($edgeX, $y)
 Start-Sleep -Seconds 1
 
-Assert ((Get-LogCount $mark 'drag started') -ge 1) 'the drag was recognised'
-Assert ((Get-LogCount $mark 'row scrolled') -ge 1) 'and holding at the edge scrolled the row'
+Assert ((Get-LogCount 'drag started') -ge 1) 'the drag was recognised'
+Assert ((Get-LogCount 'row scrolled') -ge 1) 'and holding at the edge scrolled the row'
 
 $row = Get-Row 1000000
 $max = $row.Layout.MaxScroll
@@ -642,7 +631,6 @@ try {
     Open-Documents $squeezeDocs
     Assert ((Get-FrameCount) -eq $squeezeDocs) "$squeezeDocs windows ($(Get-FrameCount))"
 
-    $mark = Get-LogMark
     Set-WordForeground | Out-Null
     $frame = [WordLayout]::GetForeground()
     $frameRect = [WordLayout]::RectOf($frame)

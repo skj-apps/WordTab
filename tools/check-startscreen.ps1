@@ -80,7 +80,6 @@ Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
 # tools\WordTabHarness.ps1 for why these are not per-suite copies any more.
 . (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
 
-$LogPath = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
 $VK_W        = 0x57
 $SW_MINIMIZE = 6
 
@@ -133,24 +132,10 @@ function Test-HasDocument($frame) {
     return ([WordLayout]::FirstChild($wwf.Hwnd) -ne [IntPtr]::Zero)
 }
 
-function Get-LogMark { if (Test-Path $LogPath) { return (Get-Item $LogPath).Length } else { return 0 } }
-
-function Get-LogSince($offset, $pattern) {
-    if (-not (Test-Path $LogPath)) { return @() }
-    $stream = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
-    try {
-        # The add-in deletes the log when it passes half a megabyte. If that happened mid-run the
-        # offset points past the end of a smaller file, and reading from the start is the honest
-        # answer rather than an exception.
-        if ($offset -gt $stream.Length) { $offset = 0 }
-        $stream.Seek([int64]$offset, 'Begin') | Out-Null
-        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-        $text = $reader.ReadToEnd()
-    } finally { $stream.Dispose() }
-    return @(($text -split "`r?`n") | Where-Object { $_ -like "*$pattern*" })
-}
-
-function Get-LogCount($offset, $pattern) { return @(Get-LogSince $offset $pattern).Count }
+# Set-LogMark, Get-LogSince and Get-LogCount come from WordTabHarness.ps1 now. The copy that used to
+# live here read from offset 0 whenever the mark was past the end of the file - which is what a log
+# that rolled looks like - so every "the log says nothing since the mark" check here could pass
+# having lost the evidence that would have failed it.
 
 # Where the + is when the row has $count tabs. Recomputed at every use, never held: the strip moves
 # whenever Word relays the window out, and this suite changes the row on purpose.
@@ -218,7 +203,7 @@ New-Item -ItemType Directory -Path $scratch -Force | Out-Null
 # ---- 1. Word launched with no document at all -------------------------------------------------------
 
 Write-Step 'Word launched with no document at all'
-$mark = Get-LogMark
+Set-LogMark
 Start-Process -FilePath 'winword.exe'
 if (-not (Wait-For { (Get-FrameCount) -ge 1 } 45)) { throw 'Word did not put a window up.' }
 Start-Sleep -Seconds 8
@@ -232,7 +217,7 @@ Assert ($null -ne $parts.Wwf) 'it has a _WwF - the old test would have called th
 Assert (-not (Test-HasDocument $startFrame)) 'and the _WwF is empty, which is what "no document" actually looks like'
 Assert ($null -ne $parts.Strip) 'the strip is bound anyway, so the band is carved before any document arrives'
 Assert (-not [WordLayout]::IsToolWindow($startFrame)) 'it is still in Alt+Tab - nothing has made it harder to reach'
-Assert ((Get-LogCount $mark 'joined') -eq 0) "it did not join the stack ($(Get-LogCount $mark 'joined') join lines)"
+Assert ((Get-LogCount 'joined') -eq 0) "it did not join the stack ($(Get-LogCount 'joined') join lines)"
 
 # What the user is actually looking at here is Word's own Start screen, which covers the whole client
 # area - our strip included, exactly as Backstage does. Worth asserting rather than assuming: it is
@@ -255,7 +240,7 @@ Write-Step 'Opening a document while the Start screen is up'
 # does not looks exactly like the add-in failing to notice a document. Opening a file needs no
 # focus and no injected input at all, and it is the path a user takes far more often anyway.
 
-$mark = Get-LogMark
+Set-LogMark
 $path = Join-Path $scratch 'wordtab-startscreen-1.rtf'
 "{\rtf1\ansi WordTab start-screen check.\par}" | Set-Content -Path $path -Encoding Ascii
 Start-Process -FilePath 'winword.exe' -ArgumentList "`"$path`""
@@ -264,7 +249,7 @@ Start-Sleep -Seconds 3
 
 Assert ((Get-FrameCount) -eq 1) "Word used the Start-screen window rather than opening another ($(Get-FrameCount))"
 Assert ((Get-TheFrame) -eq $startFrame) 'literally the same window handle - so no empty tab is left behind'
-Assert (Wait-For { (Get-LogCount $mark 'joined') -ge 1 } 10) 'and now that it has a document it joins the stack by itself'
+Assert (Wait-For { (Get-LogCount 'joined') -ge 1 } 10) 'and now that it has a document it joins the stack by itself'
 
 # ---- 3. a second document, so the row is a real row --------------------------------------------------
 
@@ -308,7 +293,7 @@ Assert (Test-HasDocument $survivor) 'the surviving window still has its document
 Assert (-not [WordLayout]::IsToolWindow($survivor)) 'and the last window is back in Alt+Tab'
 
 Write-Step "Word's own Ctrl+W on the LAST document"
-$mark = Get-LogMark
+Set-LogMark
 Assert (Invoke-ConfirmedKeyOn -Hwnd $survivor -Vk $VK_W -What 'Ctrl+W on the last document' -Ctrl) `
        'Ctrl+W went to the last document, not to whatever else was in front'
 Start-Sleep -Seconds 8
@@ -323,8 +308,8 @@ Write-Note "title now '$($emptyParts.Title)'"
 
 Assert ($null -ne $emptyParts.Wwf) 'it still has a _WwF - which is exactly why the old test got this wrong'
 Assert (-not (Test-HasDocument $empty)) 'but the _WwF is empty again: no document'
-Assert ((Get-LogCount $mark 'no document open') -ge 1) `
-    "it left the stack, and the log says why: 'no document open' ($(Get-LogCount $mark 'no document open') lines)"
+Assert ((Get-LogCount 'no document open') -ge 1) `
+    "it left the stack, and the log says why: 'no document open' ($(Get-LogCount 'no document open') lines)"
 Assert (-not [WordLayout]::IsToolWindow($empty)) 'it is back in Alt+Tab - a window nobody can reach is the one thing forbidden'
 Assert ($null -ne $emptyParts.Strip) 'its strip is still there, so nothing will jump when a document comes back'
 
@@ -367,14 +352,14 @@ Assert (-not (Test-HasDocument (Get-TheFrame))) 'and it certainly does not conju
 # ---- 6. + brings a document back, into this same window ----------------------------------------------
 
 Write-Step 'Pressing + to come back from empty'
-$mark = Get-LogMark
+Set-LogMark
 Assert (Invoke-ConfirmedClick -What 'clicking the + on an empty row' -Point {
             Get-PlusAt (Get-StripOf (Get-TheFrame)) 0
         }) 'the click on + landed on the strip'
 Assert (Wait-For { Test-HasDocument (Get-TheFrame) } 25) 'a document is back - so that really was the +, and the row really was empty'
 Start-Sleep -Seconds 3
 Assert ((Get-FrameCount) -eq 1) "Word put it in this same window rather than opening another ($(Get-FrameCount) windows)"
-Assert (Wait-For { (Get-LogCount $mark 'joined') -ge 1 } 10) 'and it rejoins the stack'
+Assert (Wait-For { (Get-LogCount 'joined') -ge 1 } 10) 'and it rejoins the stack'
 Save-StripShot (Get-StripOf (Get-TheFrame)) 'startscreen-back-to-one-tab'
 
 # ---- 6b. and the same round trip through the path a user is most likely to take ----------------------
@@ -389,7 +374,7 @@ Assert (Invoke-ConfirmedKeyOn -Hwnd (Get-TheFrame) -Vk $VK_W -What 'Ctrl+W to em
 Assert (Wait-For { -not (Test-HasDocument (Get-TheFrame)) } 20) 'empty again'
 Start-Sleep -Seconds 2
 
-$mark = Get-LogMark
+Set-LogMark
 $path2 = Join-Path $scratch 'wordtab-startscreen-2.rtf'
 "{\rtf1\ansi WordTab start-screen check, second file.\par}" | Set-Content -Path $path2 -Encoding Ascii
 Start-Process -FilePath 'winword.exe' -ArgumentList "`"$path2`""
@@ -397,7 +382,7 @@ Assert (Wait-For { Test-HasDocument (Get-TheFrame) } 45) 'the file opened'
 Start-Sleep -Seconds 3
 Assert ((Get-FrameCount) -eq 1) "into the window that was already there, leaving no stray tab ($(Get-FrameCount) windows)"
 Assert ((Get-TheFrame) -eq $empty) 'the very window whose document had been closed'
-Assert (Wait-For { (Get-LogCount $mark 'joined') -ge 1 } 10) 'and it joins the row'
+Assert (Wait-For { (Get-LogCount 'joined') -ge 1 } 10) 'and it joins the row'
 
 # ---- 7. the predicate must survive a minimise ---------------------------------------------------------
 #

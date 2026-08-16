@@ -165,14 +165,13 @@ function Format-Rect($r) { "({0},{1} {2}x{3})" -f $r.Left, $r.Top, ($r.Right - $
 # "the batch stopped" and "the batch stopped *because the user declined*" look identical from
 # outside, and the first version of this code stopped for the wrong reason - a second after posting
 # WM_CLOSE, before the prompt was even on screen - while every outside-visible assertion passed.
-$LogPath = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
-function Get-LogTail($pattern, $count = 1) {
-    if (-not (Test-Path $LogPath)) { return @() }
-    return @(Get-Content -Path $LogPath -Tail 600 |
-             Select-String -Pattern $pattern -SimpleMatch |
-             Select-Object -Last $count |
-             ForEach-Object { $_.Line.Trim() })
-}
+#
+# **That reading is now taken from a mark, and it was not before.** The version here searched the
+# last 600 lines of the whole file and took the last match, so it could answer with a line from a
+# PREVIOUS run - and whether it did depended on how much the add-in happened to have logged since.
+# Under the most safety-critical assertion in this project, that is a coin toss dressed as evidence.
+# Set-LogMark / Get-LogLast come from WordTabHarness.ps1; the mark is taken immediately before the
+# gesture, so a line found after it can only have been written by this batch.
 
 function Get-MenuWindow { return Get-WordMenu }
 
@@ -703,6 +702,9 @@ if ($count -ge 3) {
     Start-Sleep -Milliseconds 1200
     Write-Note ("keeping `"{0}`", {1} tabs in total" -f [WordLayout]::TitleOf([WordLayout]::GetForeground()), $count)
 
+    # From here on, anything in the log was written by this batch and by nothing before it.
+    Set-LogMark
+
     $menu = Open-TabMenu 'label' $keep
     if ($menu.Window -ne [IntPtr]::Zero) {
         Invoke-ConfirmedKey -Vk $VK.O -What "the menu's Close Others mnemonic" | Out-Null
@@ -727,16 +729,16 @@ if ($count -ge 3) {
         # ...and stopped for the right reason. Every assertion above is also satisfied by a batch
         # that gave up before Word had even asked - which is exactly what the first version of this
         # code did, one second after posting WM_CLOSE, while passing all of them.
-        $reason = @(Get-LogTail 'close batch' 1)
-        if ($reason.Count -eq 1) { Write-Note $reason[0] }
-        Assert (($reason.Count -eq 1) -and ($reason[0] -match 'declined')) `
+        $reason = Get-LogLast 'close batch'
+        if ($reason) { Write-Note $reason }
+        Assert (($null -ne $reason) -and ($reason -match 'declined')) `
             'the add-in stopped it because the user declined, not because it ran out of patience'
 
         # And it noticed the question at all. A prompt that goes up and comes down between two
         # janitor ticks is invisible to anything that polls, which is why this is heard as an event.
-        $sawIt = @(Get-LogTail 'Word is asking the user about this document' 1)
-        if ($sawIt.Count -eq 1) { Write-Note $sawIt[0] }
-        Assert ($sawIt.Count -eq 1) 'the add-in saw the question go up before it saw it come down'
+        $sawIt = Get-LogLast 'Word is asking the user about this document'
+        if ($sawIt) { Write-Note $sawIt }
+        Assert ($null -ne $sawIt) 'the add-in saw the question go up before it saw it come down'
     }
 } else {
     Write-Note "only $count window(s) - skipping the cancelled-batch check"

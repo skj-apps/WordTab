@@ -108,24 +108,12 @@ function Get-Parts($frame) {
 # Without that, the TabTitleTrim=0 section can match the line the TabTitleTrim=1 section wrote for a
 # handle that has since been recycled, and it would pass by reading its own predecessor's evidence.
 
-$LogPath = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
-$script:LogMark = 0
-
-function Set-LogMark {
-    $script:LogMark = if (Test-Path $LogPath) { (Get-Item $LogPath).Length } else { 0 }
-}
-
-function Get-LogSince($pattern) {
-    if (-not (Test-Path $LogPath)) { return @() }
-    $stream = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
-    try {
-        $offset = [Math]::Min([int64]$script:LogMark, $stream.Length)
-        $stream.Seek([int64]$offset, 'Begin') | Out-Null
-        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-        $text = $reader.ReadToEnd()
-    } finally { $stream.Dispose() }
-    return @(($text -split "`r?`n") | Where-Object { $_ -like "*$pattern*" })
-}
+# Set-LogMark and Get-LogSince come from WordTabHarness.ps1 now, and the copy that used to live here
+# is the reason this whole primitive was hoisted. **It clamped with [Math]::Min($mark, $length)**,
+# so once the add-in rolled the log - which it did, in the middle of this very suite, during the
+# battery that found it - every read came from the END of the fresh file and returned nothing. Every
+# "the log says nothing since the mark" check passed, and every "the log says X" check went red for
+# a reason that was not the product.
 
 # The add-in's own account of the name it computed, for one window, since the mark. Returns the
 # computed name and the raw window title it came from, so an assertion can show both.

@@ -213,28 +213,14 @@ function Test-SameOrder($a, $b) {
 
 # ---- the add-in's own log ------------------------------------------------------------------------
 #
-# Read from a byte offset taken just before the gesture, never from the whole file: a search over
-# everything would find the *previous* run's reorder and report a gesture that did nothing as having
-# worked. The add-in appends UTF-8 and closes the file after each line, sharing it for read and
-# write, so this can read it while Word is running.
-
-$LogPath = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
-function Get-LogMark { if (Test-Path $LogPath) { return (Get-Item $LogPath).Length } else { return 0 } }
-
-function Get-LogSince($offset, $pattern) {
-    if (-not (Test-Path $LogPath)) { return @() }
-    $stream = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
-    try {
-        # The add-in deletes the log when it passes half a megabyte. If that happened mid-run the
-        # offset points past the end of a smaller file, and reading from the start is the honest
-        # answer rather than an exception.
-        if ($offset -gt $stream.Length) { $offset = 0 }
-        $stream.Seek([int64]$offset, 'Begin') | Out-Null
-        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-        $text = $reader.ReadToEnd()
-    } finally { $stream.Dispose() }
-    return @(($text -split "`r?`n") | Where-Object { $_ -like "*$pattern*" })
-}
+# Set-LogMark and Get-LogSince come from WordTabHarness.ps1 now. Read from a mark taken just before
+# the gesture, never from the whole file: a search over everything would find the *previous* run's
+# reorder and report a gesture that did nothing as having worked.
+#
+# The copy that used to live here read from offset 0 when the mark was past the end of the file -
+# which is what a log that rolled looks like - so "nothing was logged since the mark" could pass
+# having lost the evidence. It is now a stopped run with an explanation. See the log section of
+# WordTabHarness.ps1.
 
 # ---- photographs ---------------------------------------------------------------------------------
 
@@ -341,7 +327,7 @@ Assert (Test-SameOrder $baseline $again) 'reading the row twice gives the same o
 # The threshold is 4 logical pixels, so 2 physical pixels is under it at every DPI this can run at.
 
 Write-Step 'Pressing a tab and moving two pixels'
-$mark = Get-LogMark
+Set-LogMark
 Set-WordForeground | Out-Null
 $spot = Get-TabSpot 0
 # Confirmed BEFORE the button goes down, never during. This is one continuous button-down gesture and
@@ -352,8 +338,8 @@ Assert ($onWhat -eq 'WordTabStrip') "the press starts on the strip, not on `"$on
 [WordLayout]::DragTo($spot.X, $spot.Y, ($spot.X + 2), $spot.Y, 2, 150)
 Start-Sleep -Milliseconds 800
 
-Assert (@(Get-LogSince $mark 'drag started').Count -eq 0) 'no drag started - it was a click'
-Assert (@(Get-LogSince $mark 'tab moved').Count -eq 0) 'nothing moved in the row'
+Assert (@(Get-LogSince 'drag started').Count -eq 0) 'no drag started - it was a click'
+Assert (@(Get-LogSince 'tab moved').Count -eq 0) 'nothing moved in the row'
 $after = Get-Order
 Assert (Test-SameOrder $baseline $after) "the order is untouched: $(Format-Order $after)"
 
@@ -367,7 +353,7 @@ Assert (Test-SameOrder $baseline $after) "the order is untouched: $(Format-Order
 
 Write-Step 'Carrying a tab a third of a slot'
 Set-WordForeground | Out-Null
-$mark = Get-LogMark
+Set-LogMark
 $mover = $baseline[0]
 
 # Select it and hover it, so both photographs have the same tab selected and the same one hot. Both
@@ -397,8 +383,8 @@ try {
     [WordLayout]::DragHold($spot.X, $spot.Y, $step1, $spot.Y, 8, 70)
     $lifted = Get-StripShot $top.Strip.Hwnd
 
-    Assert (@(Get-LogSince $mark 'drag started').Count -ge 1) 'the add-in reports a drag in progress'
-    Assert (@(Get-LogSince $mark 'tab moved').Count -eq 0) 'a third of a slot is not far enough to reorder anything'
+    Assert (@(Get-LogSince 'drag started').Count -ge 1) 'the add-in reports a drag in progress'
+    Assert (@(Get-LogSince 'tab moved').Count -eq 0) 'a third of a slot is not far enough to reorder anything'
 
     # Stage two: on to the third slot, still without letting go. The row must rearrange now, while
     # the button is down - a design that waited for the drop would log nothing here.
@@ -406,7 +392,7 @@ try {
     $carriedTo = $target.X
     [WordLayout]::DragMoveTo($step1, $spot.Y, $target.X, $target.Y, 12, 60)
 
-    $moves = @(Get-LogSince $mark 'tab moved')
+    $moves = @(Get-LogSince 'tab moved')
     Assert ($moves.Count -ge 1) "the row rearranged while the tab was being carried ($($moves.Count) move(s))"
     foreach ($line in $moves) { Write-Note $line.Trim() }
 }
@@ -436,7 +422,7 @@ if ($Screenshot) {
 }
 $rest.Bitmap.Dispose(); $lifted.Bitmap.Dispose()
 
-Assert (@(Get-LogSince $mark 'drag ended').Count -ge 1) 'the drop was recorded'
+Assert (@(Get-LogSince 'drag ended').Count -ge 1) 'the drop was recorded'
 
 # ---- where it landed --------------------------------------------------------------------------------
 
@@ -457,7 +443,7 @@ Test-OneRectangle 'After a reorder'
 
 Write-Step 'Cancelling a drag with the right button'
 $before = Get-Order
-$mark = Get-LogMark
+Set-LogMark
 
 Set-WordForeground | Out-Null
 $spot = Get-TabSpot 0
@@ -466,7 +452,7 @@ try {
     $onWhat = Get-ClassAt $spot.X $spot.Y
     Assert ($onWhat -eq 'WordTabStrip') "the cancelled drag starts on the strip, not on `"$onWhat`""
     [WordLayout]::DragHold($spot.X, $spot.Y, $target.X, $target.Y, 12, 60)
-    Assert (@(Get-LogSince $mark 'tab moved').Count -ge 1) 'the row had rearranged before the cancel'
+    Assert (@(Get-LogSince 'tab moved').Count -ge 1) 'the row had rearranged before the cancel'
     [WordLayout]::RightTap($target.X, $target.Y)
 }
 finally {
@@ -474,7 +460,7 @@ finally {
 }
 Start-Sleep -Seconds 1
 
-Assert (@(Get-LogSince $mark 'drag cancelled').Count -ge 1) 'the add-in reports the drag was cancelled'
+Assert (@(Get-LogSince 'drag cancelled').Count -ge 1) 'the add-in reports the drag was cancelled'
 
 # No menu, ours or Word's. The right button during a drag means cancel, and a cancel that also opened
 # a context menu would be two answers to one gesture.

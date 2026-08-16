@@ -102,7 +102,6 @@ Add-Type -TypeDefinition $source -Language CSharp -ReferencedAssemblies @(
 # is used by every suite.
 . (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
 
-$LogPath  = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
 $StyleKey = 'HKCU:\Software\WordTab'
 $VK_W     = 0x57
 
@@ -153,18 +152,8 @@ function Get-StripOf($frame) {
     return $strip.Hwnd
 }
 
-function Get-LogMark { if (Test-Path $LogPath) { return (Get-Item $LogPath).Length } else { return 0 } }
-function Get-LogSince($offset, $pattern) {
-    if (-not (Test-Path $LogPath)) { return @() }
-    $stream = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
-    try {
-        if ($offset -gt $stream.Length) { $offset = 0 }
-        $stream.Seek([int64]$offset, 'Begin') | Out-Null
-        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-        $text = $reader.ReadToEnd()
-    } finally { $stream.Dispose() }
-    return @(($text -split "`r?`n") | Where-Object { $_ -like "*$pattern*" })
-}
+# Set-LogMark and Get-LogSince come from WordTabHarness.ps1 now - the copy that used to live here
+# read from offset 0 after a roll, which is a wrong answer wearing the clothes of a right one.
 
 # ---- photographs and the colours in them ------------------------------------------------------
 #
@@ -712,7 +701,7 @@ if ($NoThemeSwitch) {
     Show-Colour 'the well before the change' $before
 
     $flipTo = if ($script:ThemeWasLight -eq 0) { 1 } else { 0 }
-    $mark = Get-LogMark
+    Set-LogMark
     Set-ItemProperty -Path $Personalize -Name 'AppsUseLightTheme' -Value $flipTo -Type DWord
     Write-Note "flipped to AppsUseLightTheme=$flipTo; Word repaints, then the janitor has two seconds to notice"
     Start-Sleep -Seconds 9
@@ -748,7 +737,7 @@ if ($NoThemeSwitch) {
     Assert ([Math]::Abs($step2 - 26) -le 8) `
         "the derivation still holds against the new chrome ($step2 levels, expected 26)"
 
-    Assert (@(Get-LogSince $mark 'palette sampled').Count -ge 1) `
+    Assert (@(Get-LogSince 'palette sampled').Count -ge 1) `
         'and the add-in says in its log that it re-sampled rather than guessed'
 
     $afterShot.Bitmap.Dispose(); $ribbonShot.Bitmap.Dispose()

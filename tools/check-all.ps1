@@ -49,6 +49,48 @@ if ($Only) {
 if ($suites.Count -eq 0) { Write-Host 'No suites matched.' -ForegroundColor Red; exit 1 }
 Write-Host ("Running: {0}" -f ($suites -join ', ')) -ForegroundColor Cyan
 
+# The shared harness, for Reset-LogFile below. Nothing else in this runner needs it, and the log
+# primitives are the one part of it that loads without [WordLayout].
+. (Join-Path $PSScriptRoot 'WordTabHarness.ps1')
+
+<#
+  Prove the shared primitives before eleven suites are run on top of them.
+
+  One second, no Word, no desktop - and it covers the one failure that a real run cannot reach on
+  purpose: the add-in deletes its log at 512KB, which takes two whole batteries to provoke, and what
+  it produces is assertions passing having read nothing. Running the battery on a harness that
+  cannot detect that is running it on an instrument nobody checked.
+#>
+Write-Host ''
+# NOT called $selfTest. The harness declares `param([switch]$SelfTest)`, dot-sourcing it above leaves
+# that parameter in THIS scope with its [switch] type still attached, and PowerShell variable names
+# are case-insensitive - so `$selfTest = <the output>` failed with "Cannot convert System.Object[] to
+# SwitchParameter" and this gate silently reported "(no summary line)" for a self-test that passed.
+# The harness gives the name back now; the distinct name here is the belt to that braces.
+$selfOutput = & pwsh -File (Join-Path $PSScriptRoot 'WordTabHarness.ps1') -SelfTest 2>&1
+$selfCode = $LASTEXITCODE
+if ($selfCode -ne 0) {
+    $selfOutput | ForEach-Object { Write-Host $_ }
+    Write-Host ''
+    Write-Host 'The harness self-test failed. Not running any suite on top of it.' -ForegroundColor Red
+    exit 1
+}
+$selfSummary = @($selfOutput | ForEach-Object { "$_" } | Where-Object { $_ -match '\d+ checks' })
+if ($selfSummary.Count -eq 0) {
+    # A gate that cannot read its own result must not wave the run through. The first version of this
+    # printed "(no summary line)" and carried on - which is the same shape as `check-all -Only` once
+    # matching no suites and reporting "All 0 suites green."
+    $selfOutput | ForEach-Object { Write-Host $_ }
+    Write-Host ''
+    Write-Host 'The harness self-test exited 0 but said nothing this could read. Not running any suite on top of it.' -ForegroundColor Red
+    exit 1
+}
+Write-Host ("harness self-test: {0}" -f $selfSummary[$selfSummary.Count - 1].Trim()) -ForegroundColor DarkGray
+
+# Whatever was in the log before the battery started keeps its own file, rather than being deleted by
+# the first suite that pushes the total past 512KB.
+Reset-LogFile -Label 'before-battery' | Out-Null
+
 $results = @()
 foreach ($name in $suites) {
     $script = Join-Path $PSScriptRoot "check-$name.ps1"
@@ -66,6 +108,23 @@ foreach ($name in $suites) {
     $output = & pwsh @args 2>&1
     $code = $LASTEXITCODE
     $output | ForEach-Object { Write-Host $_ }
+
+    # That suite's log, under that suite's name, and the next one starts from an empty file.
+    #
+    # Two things at once. **The add-in DELETES its log once it passes 512KB** (log.cpp:42) and a
+    # battery writes about 250KB, so the second battery in a session used to roll it mid-suite - it
+    # did, inside check-title - and every assertion reading the log from a mark was then reading a
+    # file its evidence had been deleted from. From an empty start no single suite comes close:
+    # measured across a whole battery, they run 9.0KB (startscreen) to 47.8KB (scroll).
+    #
+    # And it makes the battery's own evidence survive. "The suite that reports a failure is not
+    # necessarily the suite that caused it" has cost this project two diagnoses, and until now the
+    # only record left afterwards was whichever 512KB happened to be last.
+    #
+    # **AFTER the suite, not before it.** The first version reset before each run, which named every
+    # archive after the suite that was about to start rather than the one that wrote it - a file
+    # called title.log holding scroll's output, which is worse than no file at all.
+    Reset-LogFile -Label $name | Out-Null
 
     # Not anchored: the suites do not agree on how they announce the total. Some print
     # "34 checks, all passed." at column 0, others "PASS  40 checks, 0 failures". Anchoring this

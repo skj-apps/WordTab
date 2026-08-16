@@ -114,47 +114,15 @@ function Get-Parts($frame) {
 # Without that, the TabDot=0 section would happily match the line the TabDot=1 section wrote for a
 # handle that has since been recycled, and pass by reading its predecessor's evidence.
 
-$LogPath = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
-$script:LogMark = 0
+# Set-LogMark and Get-LogSince come from WordTabHarness.ps1 now. This suite's copy was the only one
+# of the seven that reported a rolled log rather than reading past it, and the note it carried said
+# where the rest of the fix belonged: a mark that remembers the BYTES it was taken after, so a log
+# that rolled and then grew back past the offset is caught as well. That is what the shared one does,
+# and tools\WordTabHarness.ps1 -SelfTest drives both cases against a scratch file in a second.
 
-function Set-LogMark {
-    $script:LogMark = if (Test-Path $LogPath) { (Get-Item $LogPath).Length } else { 0 }
-}
-
-# **THE LOG ROLLS, AND THE OLD CLAMP HID IT.** src\native\log.cpp:42 deletes the file once it passes
-# 512KB, and a full battery generates enough to trip that about once - measured, it happened in the
-# middle of check-title during the run this guard was written for. The mark is a byte offset, so once
-# the file has been deleted and restarted the offset means nothing.
-#
-# The old line was `$offset = [Math]::Min($script:LogMark, $stream.Length)`, which silently reads from
-# the END of the fresh file. That gives EVERY log assertion in this suite a wrong answer, and the two
-# shapes fail in opposite directions: "the log says X since the mark" goes red for a reason that is
-# not the product, and "the log says nothing since the mark" goes GREEN having read nothing at all.
-# The second is the dangerous one, and section 6a's palette assertion is exactly that shape.
-#
-# So a shrunk file is reported, not clamped. Once the evidence has been deleted this suite cannot
-# answer any question about the add-in, and saying so is the only honest outcome.
-#
-# Residual hole, stated: if the log rolled AND grew back past the mark before this read, the length
-# test cannot see it. The mark is hundreds of KB by then and the read follows within seconds, so it
-# is not reachable in practice - but it is why the real fix is a marker line rather than an offset,
-# and why this belongs in the shared harness with the other five copies rather than here.
-function Get-LogSince($pattern) {
-    if (-not (Test-Path $LogPath)) { return @() }
-    $stream = [System.IO.File]::Open($LogPath, 'Open', 'Read', 'ReadWrite')
-    try {
-        if ($stream.Length -lt [int64]$script:LogMark) {
-            throw ("The add-in log rolled during this run - the mark is at {0} bytes and the file is now {1}. " -f
-                   $script:LogMark, $stream.Length) +
-                  'Everything this suite proves from the log was deleted mid-run, so nothing here can be ' +
-                  'trusted. Re-run it. (src\native\log.cpp rolls at 512KB by deleting the file.)'
-        }
-        $stream.Seek([int64]$script:LogMark, 'Begin') | Out-Null
-        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-        $text = $reader.ReadToEnd()
-    } finally { $stream.Dispose() }
-    return @(($text -split "`r?`n") | Where-Object { $_ -like "*$pattern*" })
-}
+# The section that most depends on this is 6a's palette check, which is the "the log says NOTHING
+# since the mark" shape - the one that used to pass by reading a file the evidence had been deleted
+# from.
 
 # The add-in's own account of the dot for one window, since the mark: the LAST thing it said, or
 # $null if it has never said anything about that window. "Never said anything" is a real answer here
@@ -711,7 +679,7 @@ Write-Step 'A Protected View document alongside them'
 # from here rather than from the suite's mark. Put back afterwards: everything downstream waits for
 # new lines, but a shared mark that a section quietly moved is the kind of thing that makes the next
 # failure inexplicable.
-$markBeforePv = $script:LogMark
+$markBeforePv = Get-CurrentLogMark
 Set-LogMark
 
 $pvFrame = Open-Document $downloaded $false
@@ -780,7 +748,7 @@ Assert (Invoke-StripClick 'tab 0' { Get-Spot 0 }) 'tab 0 could be clicked to bri
 $recovered = Wait-Until { @(Get-LogSince 'chrome sample: ok').Count -gt 0 } 20 500
 Assert $recovered 'the sampler reads Word''s ribbon again with an ordinary window in front - the rule did not reject every window'
 
-$script:LogMark = $markBeforePv
+Set-LogMark -Mark $markBeforePv
 
 # It is in neither Application.Windows nor Documents - measured - so it can never carry a dot. What
 # has to hold is that an unmatched window does not stop the pass answering for everything else.
