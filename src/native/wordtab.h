@@ -175,7 +175,9 @@ void StripStop(void);
 // keeps the document frame for the life of the window and empties it when the last document closes.
 BOOL StripHasDocument(HWND frame);
 BOOL StripGetNatural(HWND frame, RECT* natural);
-void StripSetNatural(HWND frame, const RECT* natural);
+// `why` names the path that asked, because this is the one writer of a window's natural rect that
+// did not come from Word laying that window out - see the note on the definition.
+void StripSetNatural(HWND frame, const RECT* natural, const wchar_t* why);
 void StripRefit(HWND frame);
 void StripRefreshTabs(void);
 

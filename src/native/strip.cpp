@@ -176,6 +176,7 @@ struct StripState
     // hides how often this happens.
     DWORD lastLogTick;
     int   suppressed;
+    LONG  lastLoggedTop;  // the throttle may drop a width change; it may not drop a top-edge move
 
     // What the pointer is over and what is being pressed, held per strip rather than in one global.
     // Only the active window's strip is on top, so only it receives mouse messages - but a strip
@@ -901,13 +902,20 @@ static void RememberClient(StripState* state)
 
 static void LogRelayout(StripState* state, const wchar_t* why)
 {
+    // The throttle may never swallow a move of the **top** edge. That edge is the entire subject of
+    // this file - the strip is drawn exactly at `natural.top` - and the one recorded occasion when it
+    // went to the wrong place, the evidence was dropped by this limit and the cause went undiagnosed
+    // for two slices. The flood the throttle exists for is a resize drag, which moves the other three
+    // edges every ~15ms and leaves the top alone, so nothing is given back by exempting it.
     DWORD now = GetTickCount();
-    if (state->lastLogTick != 0 && (now - state->lastLogTick) < 250)
+    BOOL topMoved = (state->natural.top != state->lastLoggedTop);
+    if (!topMoved && state->lastLogTick != 0 && (now - state->lastLogTick) < 250)
     {
         state->suppressed++;
         return;
     }
-    state->lastLogTick = now;
+    state->lastLogTick   = now;
+    state->lastLoggedTop = state->natural.top;
 
     wchar_t extra[64] = L"";
     if (state->suppressed > 0)
@@ -3802,28 +3810,54 @@ BOOL StripGetNatural(HWND frame, RECT* natural)
     return TRUE;
 }
 
-// Give a window the document-frame rect that Word gave the focused one. Sound only because the
-// stack has already made them the same size.
-void StripSetNatural(HWND frame, const RECT* natural)
+// Give a window the *size and shape* of the document frame Word gave the focused one - and only
+// those. Sound only because the stack has already made them the same size; the top edge is the one
+// part of that rect which belongs to the receiving window and is kept, see below.
+//
+// **This is the one writer of `natural` that Word did not propose**, so it is the one that can put a
+// number there which is right for some other window and wrong for this one. It therefore says so in
+// the log, and `why` names the path that asked - a silent writer is why a strip 38px above its own
+// ribbon could not be traced to the message that put it there.
+void StripSetNatural(HWND frame, const RECT* natural, const wchar_t* why)
 {
     StripState* state = FindByFrame(frame);
     if (!state || !state->enabled || !natural || !state->wwf || !IsWindow(state->wwf))
         return;
 
-    RECT applied = *natural;
-    applied.top = natural->top + state->stripH;
+    // **The top edge is not broadcast.** The stack holds every window at one rectangle, so the left,
+    // right and bottom edges of one window's document frame are true of all of them - but the top
+    // edge is not a property of the stack. It is the height of that window's own chrome, and Word
+    // does not give every window the same chrome.
+    //
+    // Measured, 2026-08-16, at 192 dpi: a **Protected View** window has a reduced ribbon and a
+    // message bar, and its document frame legitimately sits at 318 where a normal window's sits at
+    // 356. Opening a downloaded document alongside others made that window active, it pushed its own
+    // - correct - interior onto four windows for which it was wrong, and every one of their strips
+    // landed 38px up inside the ribbon with the `+` underneath `NetUIHWND` and unclickable. Nothing
+    // ever corrected them: the same rule that makes this broadcast necessary - Word lays out only the
+    // focused window - is what makes an error in it permanent.
+    //
+    // A window with no natural of its own has nothing better to go on and still takes what it is
+    // given; `ApplyInitial` has not run for it yet.
+    RECT want = *natural;
+    if (state->hasApplied)
+        want.top = state->natural.top;
+
+    RECT applied = want;
+    applied.top = want.top + state->stripH;
     if ((applied.bottom - applied.top) < (2 * state->stripH))
         return;
 
-    if (state->hasApplied && SameRect(natural, &state->natural) && SameRect(&applied, &state->applied))
+    if (state->hasApplied && SameRect(&want, &state->natural) && SameRect(&applied, &state->applied))
         return;
 
     // State first, then move: the WM_WINDOWPOSCHANGING this triggers then sees its own proposal as
     // already ours and leaves it alone, instead of shifting it a second time.
-    state->natural    = *natural;
+    state->natural    = want;
     state->applied    = applied;
     state->hasApplied = TRUE;
     RememberClient(state);
+    LogRelayout(state, why);
 
     SetWindowPos(state->wwf, NULL,
                  applied.left, applied.top,
@@ -3857,7 +3891,7 @@ void StripRefit(HWND frame)
     if (natural.right <= natural.left || natural.bottom <= natural.top)
         return;
 
-    StripSetNatural(frame, &natural);
+    StripSetNatural(frame, &natural, L"refit to the window's own size");
 }
 
 // One window's tab row is every window's tab row, so anything that changes it repaints them all.

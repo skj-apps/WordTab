@@ -219,7 +219,7 @@ static void MatchTo(HWND master, HWND frame)
     // background window keeps the size it had before it joined the stack.
     RECT natural;
     if (StripGetNatural(master, &natural))
-        StripSetNatural(frame, &natural);
+        StripSetNatural(frame, &natural, L"joined the stack, taking the master's interior");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -462,7 +462,8 @@ void StackOnFrameActivate(HWND frame)
     {
         for (int i = 0; i < g_memberCount; i++)
             if (g_members[i].joined && g_members[i].frame != frame)
-                StripSetNatural(g_members[i].frame, &natural);
+                StripSetNatural(g_members[i].frame, &natural,
+                                L"the active window changed and pushed its interior out");
     }
 
     StripRefreshTabs();
@@ -558,7 +559,7 @@ void StackOnActiveLayout(HWND frame, const RECT* natural)
     {
         if (!g_members[i].joined || g_members[i].frame == frame)
             continue;
-        StripSetNatural(g_members[i].frame, natural);
+        StripSetNatural(g_members[i].frame, natural, L"Word laid the active window out");
     }
 }
 
