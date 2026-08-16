@@ -298,10 +298,29 @@ function Get-Scaled($logical, $dpi) { return [int](($logical * $dpi + 48) / 96) 
 # measured for this slice - **Word's own `DropShadow` child window sits over the top twelve physical
 # pixels of our strip**, so a scan there reads Word's shadow blended over our colours. It came back
 # RGB(61,61,61) for a well that is RGB(15,15,15).
-function Get-WellColour($shot, $stripRect, $layout) {
+#
+# **The fallback samples inside a tab, and the caller has to say which one.** When the row is long
+# enough to fill the strip there is no bare well left to read - the only well-coloured pixels are
+# inside the *inactive* tabs, which are deliberately not drawn as cards at all. So the fallback needs
+# a tab that is known not to be the active one, and `inactiveIndex` is the caller promising it.
+#
+# It used to assume tab zero, and the assumption was true only by luck: on a window wide enough the
+# fallback never ran, and on a narrow one it happened to be a section where tab zero was idle. The
+# theme-change section pressed tab zero four sections earlier, so on a Word that remembered a narrow
+# window it sampled the *active card* and reported the well as Word's own chrome - a step of zero
+# levels where the code's step is twenty-six. Measured on the build before the scrolling row as well
+# as after it, so this is the suite being fragile rather than the strip being wrong.
+function Get-WellColour($shot, $stripRect, $layout, $inactiveIndex = 0) {
     $from = $layout.Plus.Right + 40
     $to   = [Math]::Min($stripRect.Right - 20, $from + 400)
-    if ($to -le $from) { $from = $stripRect.Left + 20; $to = $from + 100 }
+    if ($to -le $from) {
+        if ($layout.Tabs.Length -gt $inactiveIndex) {
+            $tab = $layout.Tabs[$inactiveIndex]
+            $from = $tab.Left + 30
+            $to   = [Math]::Min($tab.Right - 30, $from + 100)
+        }
+        if ($to -le $from) { $from = $stripRect.Left + 20; $to = $from + 100 }
+    }
     return Get-ModeColour $shot ([int](($stripRect.Top + $stripRect.Bottom) / 2)) $from $to
 }
 
@@ -635,12 +654,25 @@ if ($NoThemeSwitch) {
 
     $frame = Focus-Word
     $strip = Get-StripOf $frame
+
+    # Put the selection on the *last* tab before reading anything, so that tab zero is idle and the
+    # well sampler's fallback has somewhere honest to read. Four sections ago this suite pressed tab
+    # zero to photograph a carried tab, and on a Word that has remembered a narrow window that leaves
+    # the only readable well-coloured pixels inside the one tab that is not well-coloured. Stated
+    # here rather than left to whatever the previous section happened to do.
+    $layout = Get-Layout $strip
+    $lastTab = $layout.Tabs[$layout.Tabs.Length - 1]
+    [WordLayout]::Click([int](($lastTab.Left + $lastTab.Right) / 2), [int](($lastTab.Top + $lastTab.Bottom) / 2))
+    Start-Sleep -Seconds 2
+    $frame = Focus-Word
+    $strip = Get-StripOf $frame
+
     [WordLayout]::MouseTo(4, 4)
     Start-Sleep -Milliseconds 800
 
     $stripRect = [WordLayout]::RectOf($strip)
     $beforeShot = Get-StripShot $strip
-    $before = Get-WellColour $beforeShot $stripRect (Get-Layout $strip)
+    $before = Get-WellColour $beforeShot $stripRect (Get-Layout $strip) 0
     $beforeShot.Bitmap.Dispose()
     Show-Colour 'the well before the change' $before
 
@@ -657,7 +689,7 @@ if ($NoThemeSwitch) {
 
     $stripRect = [WordLayout]::RectOf($strip)
     $afterShot = Get-StripShot $strip
-    $after  = Get-WellColour $afterShot $stripRect (Get-Layout $strip)
+    $after  = Get-WellColour $afterShot $stripRect (Get-Layout $strip) 0
     $ribbon2 = $null
     $band2 = New-Object WordLayout+RECT
     $band2.Left = $stripRect.Left; $band2.Right = $stripRect.Right

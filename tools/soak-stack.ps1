@@ -115,7 +115,6 @@ function Open-Document($index) {
 # ---- open six documents --------------------------------------------------------------------------
 
 Write-Step 'Opening six documents'
-$startedWord = -not (Get-Process -Name WINWORD -ErrorAction SilentlyContinue)
 for ($i = 1; $i -le 6; $i++) {
     Open-Document $i
     Start-Sleep -Seconds $(if ($i -eq 1) { 14 } else { 6 })
@@ -255,11 +254,38 @@ Test-Intact 'After opening onto a reduced stack' | Out-Null
 
 # ---- done -----------------------------------------------------------------------------------------
 
-if (-not $KeepOpen -and $startedWord) {
+if (-not $KeepOpen) {
+    # Every window, one at a time, with WM_CLOSE - and never Kill.
+    #
+    # This used to be CloseMainWindow followed by Kill, and both halves were wrong. Word's "main
+    # window" is one of seven frames here, so closing it left the other six standing; and the Kill
+    # that followed is the thing this project's notes have forbidden since the first slice, because a
+    # killed Word offers to recover those documents the next time it starts.
+    #
+    # That is not theoretical. It cost a run of check-look in this slice: soak-stack finished green,
+    # killed Word, and the next suite opened three documents into a Word that had helpfully brought
+    # back four of soak's - so a suite that asserts "3 Word windows" measured seven. The same trap is
+    # written down twice in the project memory and it had a live source in this file the whole time.
+    #
+    # `$startedWord` used to guard this and no longer does: the suite opened seven documents, and
+    # leaving them behind is exactly what contaminates whatever runs next. Every other suite already
+    # closes Word unconditionally before it starts, so this is the same rule at the other end.
     Write-Step 'Closing Word'
-    foreach ($p in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $p.CloseMainWindow() | Out-Null }
-    Start-Sleep -Seconds 5
-    foreach ($p in @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)) { $p.Kill() }
+    for ($guard = 0; $guard -lt 25; $guard++) {
+        $open = @(Get-Frames)
+        if ($open.Count -eq 0) { break }
+        [WordLayout]::Close($open[0])
+        Start-Sleep -Milliseconds 1500
+    }
+    $deadline = (Get-Date).AddSeconds(25)
+    while ((Get-Date) -lt $deadline -and
+           @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue).Count -gt 0) {
+        Start-Sleep -Milliseconds 500
+    }
+    $left = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue).Count
+    if ($left -gt 0) {
+        Write-Note "Word is still running ($left process(es)) - close it by hand before the next suite."
+    }
 }
 
 Write-Host ''

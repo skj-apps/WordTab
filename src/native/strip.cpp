@@ -48,6 +48,20 @@
 #define TAB_LOGICAL_GAP     4    // between the last tab and the new-document button
 #define CLOSE_LOGICAL      16    // the close button's hit target, a square
 #define PLUS_LOGICAL       26    // the new-document button's width
+#define CHEVRON_LOGICAL    20    // one scroll button, and there are two of them
+
+// How fast the row scrolls while a tab is being carried against one end of it. Per tick of
+// DRAG_SCROLL_MS, so this is 16 logical px every 60ms - about a tab a second at the minimum width,
+// which is fast enough to cross a full row while the hand stays still and slow enough to stop on the
+// slot you meant.
+#define DRAG_SCROLL_LOGICAL 16
+#define DRAG_SCROLL_MS      60
+#define DRAG_SCROLL_EDGE    24   // how close to the end of the track counts as "against it"
+
+// The timer that does it. A drag is an event with a start and an end, so this is armed and killed by
+// the gesture rather than left running - and it is the pointer's *position* it samples, which is a
+// continuous quantity, not the kind of come-and-go state that has to be heard rather than polled.
+#define ID_DRAG_SCROLL   1
 
 // How far a press has to travel before it is a drag rather than a click. Four logical pixels is what
 // Windows itself uses (SM_CXDRAG's default), but taken as our own scaled constant rather than read
@@ -82,7 +96,7 @@
 // What the pointer is over, or what a button press is claiming. Used for both, which is why HIT_TAB
 // appears as a press kind: it means a *middle* press, since a left press on a tab acts immediately
 // and never waits for a release.
-enum { HIT_NONE = 0, HIT_TAB, HIT_CLOSE, HIT_PLUS };
+enum { HIT_NONE = 0, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_PREV, HIT_NEXT };
 
 // Posted to a strip so that a command runs after the handler that raised it has returned. Calling
 // into Word's object model from inside our own window procedure would re-enter it: Documents.Add
@@ -183,9 +197,23 @@ struct StripLayout
 {
     int  count;
     RECT tab[MAX_TABS];
-    RECT close[MAX_TABS];   // empty when the tab is too narrow to carry a button honestly
+    RECT close[MAX_TABS];   // empty when the tab is too narrow to carry a button honestly, or when
+                            // it would fall outside the track and so be drawn on nothing
     RECT plus;
     BOOL hasPlus;
+
+    // The band the tabs live in. Everything to the right of it - the two scroll buttons and the
+    // new-document button - is a fixed cluster that the row is never allowed to reach, which is the
+    // whole of this slice: `plus` and `tab[i]` cannot intersect, by construction rather than by a
+    // clamp that gives up when it runs out of room.
+    RECT track;
+    RECT prev, next;        // the scroll buttons; empty unless the row overflows
+    BOOL hasNav;
+    BOOL canPrev, canNext;  // ...and whether there is anywhere left to go in that direction
+
+    int  scroll;            // how far the row has been carried left, in pixels. 0 unless overflowing
+    int  maxScroll;
+    int  width;             // one tab's pitch, which is also one step of the scroll
 };
 
 // What a point in a strip is over.
@@ -205,6 +233,31 @@ static BOOL g_menuEnabled = TRUE;        // HKCU\Software\WordTab\TabMenu
 static BOOL g_dragEnabled = TRUE;        // HKCU\Software\WordTab\TabDrag
 static BOOL g_lookEnabled = TRUE;        // HKCU\Software\WordTab\TabStyle
 static BOOL g_sampleEnabled = TRUE;      // HKCU\Software\WordTab\TabThemeSample
+static BOOL g_scrollEnabled = TRUE;      // HKCU\Software\WordTab\TabScroll
+
+// ---------------------------------------------------------------------------------------------
+// How far the row is scrolled.
+//
+// Global, like the drag and for the same reason: every window in the stack draws the same row, and a
+// row that stood at a different scroll position in each of them would stop being one row the moment
+// there were enough documents for it to matter. One number, every strip.
+//
+// It is clamped by ComputeLayout rather than by whoever moved it, which is what makes it
+// self-healing: widen the window and the next paint discovers there is less to scroll and shortens
+// it, with nothing having to notice the resize. ComputeLayout is the only writer, and it only writes
+// when the strip it is laying out actually has tabs - a window with no document paints an empty row
+// too, and letting that one reset the number would scroll the real row back to the start every time
+// anything repainted.
+//
+// g_scrollShown is the tab that was active when the row was last scrolled to reveal one. Revealing is
+// an event - "the active document changed" - not a rule applied on every layout: applied on every
+// layout it would drag the row back to the active tab a frame after the user scrolled away from it,
+// and the wheel would appear not to work.
+// ---------------------------------------------------------------------------------------------
+
+static int  g_scroll      = 0;
+static HWND g_scrollShown = NULL;
+static int  g_scrollMax   = -1;    // the row's shape last time it was revealed against
 
 // ---------------------------------------------------------------------------------------------
 // A tab being dragged.
@@ -231,6 +284,7 @@ static int  g_dragGrabDx = 0;       // how far into the tab, so it does not jump
 static int  g_dragLeft   = 0;       // the carried tab's left edge right now
 static int  g_dragFrom   = 0;       // the position it was picked up from - the log, and the undo
 static BOOL g_dragging   = FALSE;   // past the slop: this is a drag, not a click that has not ended
+static HWND g_dragScroll = NULL;    // the strip running the auto-scroll timer, NULL when it is off
 static ATOM g_stripClass = 0;
 static UINT_PTR g_janitor = 0;
 
@@ -1111,7 +1165,28 @@ static LRESULT CALLBACK WwfSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 // what the user is looking at. tools\WordLayout.cs mirrors it for the check scripts, and if the two
 // ever drift the injected clicks miss and the assertions fail loudly - which is the intended
 // failure, rather than a test that quietly clicks the wrong tab and passes.
-static void ComputeLayout(StripState* state, const RECT* client, int count, StripLayout* out)
+//
+// There are three ways the row can be laid out, and which one is in force is decided here and
+// nowhere else:
+//
+//   FIT      Every tab is at least the minimum width and they all fit. The + sits after the last
+//            one. This is what the strip has always done, and it is unchanged to the pixel - the
+//            arithmetic below is the arithmetic that was here before, in the same order.
+//
+//   SCROLL   There are more documents than fit at the minimum width. The + is pinned to the right
+//            edge with two scroll buttons beside it, and the tabs live in a `track` that stops
+//            before them and scrolls inside it.
+//
+//   SQUEEZE  HKCU\Software\WordTab\TabScroll=0. No minimum: the tabs divide the track between them
+//            however many there are, so every document is on screen at once however narrow that
+//            makes it. See StripStart for why this exists.
+//
+// The condition separating FIT from the other two is `width * count > available` *after* the minimum
+// has been applied - which is exactly, and only, the case in which the old code clamped the + back
+// on top of the last tab. Everything this slice changes is inside that condition. That is what makes
+// it safe: the two hundred and sixty-five assertions written before it all run in FIT.
+static void ComputeLayout(StripState* state, const RECT* client,
+                          HWND* frames, int count, int activeIndex, StripLayout* out)
 {
     int pad     = Scaled(TAB_LOGICAL_PAD, state->dpi);
     int gap     = Scaled(TAB_LOGICAL_GAP, state->dpi);
@@ -1119,17 +1194,27 @@ static void ComputeLayout(StripState* state, const RECT* client, int count, Stri
     int desired = Scaled(TAB_LOGICAL_W, state->dpi);
     int plusW   = Scaled(PLUS_LOGICAL, state->dpi);
     int closeW  = Scaled(CLOSE_LOGICAL, state->dpi);
+    int chevW   = Scaled(CHEVRON_LOGICAL, state->dpi);
+    int hair    = Scaled(2, state->dpi);          // the sliver of well left between two tabs
 
     if (count > MAX_TABS)
         count = MAX_TABS;
-    out->count = count;
-    out->hasPlus = FALSE;
+    out->count     = count;
+    out->hasPlus   = FALSE;
+    out->hasNav    = FALSE;
+    out->canPrev   = FALSE;
+    out->canNext   = FALSE;
+    out->scroll    = 0;
+    out->maxScroll = 0;
     SetRectEmpty(&out->plus);
+    SetRectEmpty(&out->prev);
+    SetRectEmpty(&out->next);
 
     // The new-document button's width comes out of the space before the tabs are sized, not after.
     // Tabs shrink as documents are opened; a button does not, and a button that has been squeezed
     // off the end of the strip is a feature the user cannot reach.
-    int available = (client->right - client->left) - pad * 2 - plusW - gap;
+    int reserved = g_buttonsEnabled ? (plusW + gap) : 0;
+    int available = (client->right - client->left) - pad * 2 - reserved;
     if (available < minimum)
         available = minimum;
 
@@ -1139,38 +1224,183 @@ static void ComputeLayout(StripState* state, const RECT* client, int count, Stri
     if (width < minimum)
         width = minimum;
 
+    BOOL overflow = (count > 0 && width * count > available);
+
+    // The track. In FIT it is simply the padded strip and nothing is clipped by it; in the two
+    // overflow modes it stops short of the button cluster, and that is the line the row is not
+    // allowed to cross.
+    out->track.left   = client->left + pad;
+    out->track.right  = client->right - pad;
+    out->track.top    = client->top;
+    out->track.bottom = client->bottom;
+
+    if (overflow && g_buttonsEnabled)
+    {
+        // [ tabs ... ] gap [ ‹ ][ › ] gap [ + ]
+        //
+        // The two chevrons touch each other on purpose: they are one control with two directions,
+        // and a gap between them reads as two unrelated buttons that happen to be adjacent.
+        out->plus.right  = client->right - pad;
+        out->plus.left   = out->plus.right - plusW;
+        out->plus.top    = client->top + Scaled(6, state->dpi);
+        out->plus.bottom = client->bottom - Scaled(6, state->dpi);
+
+        out->next.right = out->plus.left - gap;
+        out->next.left  = out->next.right - chevW;
+        out->prev.right = out->next.left;
+        out->prev.left  = out->prev.right - chevW;
+
+        out->next.top    = out->prev.top    = client->top + Scaled(6, state->dpi);
+        out->next.bottom = out->prev.bottom = client->bottom - Scaled(6, state->dpi);
+
+        out->track.right = out->prev.left - gap;
+        out->hasNav = g_scrollEnabled;
+
+        if (!g_scrollEnabled)
+        {
+            // SQUEEZE. The buttons still need their space reserved - they are why the track is
+            // short - but there is nothing to scroll, so the chevrons are not drawn and the room
+            // they would have taken goes back to the tabs.
+            out->track.right = out->plus.left - gap;
+            SetRectEmpty(&out->prev);
+            SetRectEmpty(&out->next);
+        }
+    }
+    else if (overflow)
+    {
+        // Buttons switched off entirely: no cluster, so the track is the whole padded strip. The row
+        // still scrolls - the wheel is the only way to reach the far end, and that is what TabButtons
+        // being off means.
+        out->hasNav = FALSE;
+    }
+
+    int trackW = out->track.right - out->track.left;
+    if (trackW < 0)
+        trackW = 0;
+
+    if (overflow && !g_scrollEnabled)
+    {
+        // SQUEEZE has no minimum and therefore cannot overflow at any count: the row is exactly as
+        // wide as the track by construction. A tab can end up narrower than its own close button,
+        // which is why that button drops out below three times its width - the tab becomes a colour
+        // with a name in it, and it is still there, still clickable, still yours to switch to.
+        width = (count > 0) ? (trackW / count) : desired;
+        if (width < 1)
+            width = 1;
+        overflow = FALSE;
+    }
+
+    if (overflow)
+    {
+        out->maxScroll = count * width - trackW;
+        if (out->maxScroll < 0)
+            out->maxScroll = 0;
+    }
+
+    // The scroll position. Written back to the global rather than merely read, so that a window
+    // widened until the row fits does not keep a scroll offset that no longer means anything - and
+    // only when this strip has tabs, because an empty row belongs to a window that is not in the
+    // stack and its layout must not speak for the row every other window is showing.
+    if (count > 0)
+    {
+        if (g_scroll > out->maxScroll) g_scroll = out->maxScroll;
+        if (g_scroll < 0)              g_scroll = 0;
+
+        // Reveal the active tab. A tab row whose selected tab is off screen has stopped answering
+        // the one question it exists to answer, so this is not optional - but it cannot be done on
+        // every layout either, or the row would snap back to the active tab a frame after the wheel
+        // moved it and the wheel would appear not to work at all.
+        //
+        // So it fires on the two things that can put the active tab off screen without the user
+        // having asked for it:
+        //
+        //   the active document changed - a new one appends a tab at the far end and switches to it,
+        //   Ctrl+F6 walks the windows, closing a tab moves the selection;
+        //
+        //   the shape of the row changed - `maxScroll` is a function of the tab count and the width
+        //   of the track, so it moves when a document opens or closes and on every step of a resize
+        //   drag. Narrowing the window until three tabs fit used to leave the user looking at tabs
+        //   one to three with tab six selected and nothing on screen saying so. Photographed.
+        //
+        // Neither is a poll: both are quantities this function has already computed, compared with
+        // what they were the last time it did. A wheel scroll changes neither of them, which is
+        // exactly the property that makes the wheel work.
+        HWND activeFrame = (frames && activeIndex >= 0 && activeIndex < count)
+                           ? frames[activeIndex] : NULL;
+        if (activeFrame && (activeFrame != g_scrollShown || out->maxScroll != g_scrollMax))
+        {
+            g_scrollShown = activeFrame;
+            g_scrollMax   = out->maxScroll;
+
+            int left  = activeIndex * width;
+            int right = left + width;
+            if (left < g_scroll)
+                g_scroll = left;
+            if (right > g_scroll + trackW)
+                g_scroll = right - trackW;
+
+            if (g_scroll > out->maxScroll) g_scroll = out->maxScroll;
+            if (g_scroll < 0)              g_scroll = 0;
+        }
+
+        out->scroll = g_scroll;
+    }
+
+    out->width   = width;
+    out->canPrev = (out->scroll > 0);
+    out->canNext = (out->scroll < out->maxScroll);
+
     for (int i = 0; i < count; i++)
     {
         RECT* tab = &out->tab[i];
-        tab->left   = client->left + pad + i * width;
-        tab->right  = tab->left + width - Scaled(2, state->dpi);   // a hairline between tabs
+        tab->left   = out->track.left + i * width - out->scroll;
+        tab->right  = tab->left + width - hair;                    // a hairline between tabs
+        if (tab->right <= tab->left)
+            tab->right = tab->left + 1;
         tab->top    = client->top + Scaled(3, state->dpi);
         tab->bottom = client->bottom;
 
         // A close button, but only where there is honestly room for one. A tab narrow enough that
         // the button covers the name is a tab whose button closes a document the user cannot
         // identify, so below that width the name wins and there is no button at all.
+        //
+        // ...and only where the whole of it is inside the track. A close button on a tab that is
+        // half scrolled under the buttons beside it is a target the user cannot see the edges of,
+        // and this is the second half of the defect this slice is about: the first half was a +
+        // drawn over a tab, and both come from the same habit of clamping a rectangle instead of
+        // deciding it does not belong.
         SetRectEmpty(&out->close[i]);
         if (g_buttonsEnabled && (tab->right - tab->left) >= closeW * 3)
         {
+            RECT close;
             int middle = (tab->top + tab->bottom) / 2;
-            out->close[i].right  = tab->right - Scaled(6, state->dpi);
-            out->close[i].left   = out->close[i].right - closeW;
-            out->close[i].top    = middle - closeW / 2;
-            out->close[i].bottom = out->close[i].top + closeW;
+            close.right  = tab->right - Scaled(6, state->dpi);
+            close.left   = close.right - closeW;
+            close.top    = middle - closeW / 2;
+            close.bottom = close.top + closeW;
+
+            if (close.left >= out->track.left && close.right <= out->track.right)
+                out->close[i] = close;
         }
     }
 
     if (!g_buttonsEnabled)
         return;
 
-    // After the last tab while there is room for it, pinned to the right edge once the tabs have
-    // filled the strip. Either way it ends up inside the strip and clickable, which is the only
-    // property it has to have.
+    if (overflow)
+    {
+        // Already placed with the cluster above: pinned, and the track was cut short to clear it.
+        out->hasPlus = (out->plus.right <= client->right && out->plus.bottom > out->plus.top);
+        return;
+    }
+
+    // FIT and SQUEEZE: after the last tab. There is no clamp here any more, and its absence is the
+    // fix. It used to exist for the overflowing case and it answered by putting the + on top of a
+    // tab - a button drawn over a target that was hit-tested first, so the user pressed one thing
+    // and got another. Overflow is now a layout of its own and never arrives here.
     int after = (count > 0) ? (out->tab[count - 1].right + gap) : (client->left + pad);
-    int limit = client->right - pad - plusW;
-    if (after > limit)
-        after = limit;
+    if (after > client->right - pad - plusW)
+        after = client->right - pad - plusW;
     if (after < client->left + pad)
         after = client->left + pad;
 
@@ -1181,8 +1411,24 @@ static void ComputeLayout(StripState* state, const RECT* client, int count, Stri
     out->hasPlus = (out->plus.right <= client->right && out->plus.bottom > out->plus.top);
 }
 
+// The row's layout for this strip, tabs and all. Every caller wanted the same four lines before it
+// could call ComputeLayout, and one of them - the hit test - used to pass NULL for the active tab and
+// so could not have revealed it. Returns the number of tabs; `frames` must have room for MAX_STRIPS.
+static int LayoutOf(StripState* state, const RECT* client, HWND* frames, StripLayout* out)
+{
+    int activeIndex = 0;
+    int count = StackTabs(state->frame, frames, MAX_STRIPS, &activeIndex);
+    ComputeLayout(state, client, frames, count, activeIndex, out);
+    return count;
+}
+
 // What a point is over. The close button is tested before the tab it sits on: they overlap by
 // definition, and the smaller target is the more specific intent.
+//
+// Tabs are tested against the part of them that is inside the track, never against the whole
+// rectangle. In an overflowing row a tab runs on underneath the scroll buttons and the +, and testing
+// the whole thing would put a tab's hit area under a button that is drawn on top of it - which is the
+// defect this slice exists to remove, arriving from the other direction.
 static StripHit HitTestStrip(StripState* state, HWND hwnd, POINT point)
 {
     StripHit hit;
@@ -1196,13 +1442,15 @@ static StripHit HitTestStrip(StripState* state, HWND hwnd, POINT point)
         return hit;
 
     HWND frames[MAX_STRIPS];
-    int count = StackTabs(state->frame, frames, MAX_STRIPS, NULL);
-
     StripLayout layout;
-    ComputeLayout(state, &client, count, &layout);
+    LayoutOf(state, &client, frames, &layout);
 
     for (int i = 0; i < layout.count; i++)
     {
+        RECT visible;
+        if (!IntersectRect(&visible, &layout.tab[i], &layout.track))
+            continue;
+
         if (!IsRectEmpty(&layout.close[i]) && PtInRect(&layout.close[i], point))
         {
             hit.kind  = HIT_CLOSE;
@@ -1211,7 +1459,7 @@ static StripHit HitTestStrip(StripState* state, HWND hwnd, POINT point)
             hit.tab   = layout.tab[i];
             return hit;
         }
-        if (PtInRect(&layout.tab[i], point))
+        if (PtInRect(&visible, point))
         {
             hit.kind  = HIT_TAB;
             hit.frame = frames[i];
@@ -1221,10 +1469,67 @@ static StripHit HitTestStrip(StripState* state, HWND hwnd, POINT point)
         }
     }
 
-    if (layout.hasPlus && PtInRect(&layout.plus, point))
+    // A scroll button with nowhere to go is not a target. It is drawn dimmed, and a dimmed button
+    // that lights up under the pointer and then does nothing when pressed is worse than one that
+    // ignores the pointer entirely.
+    if (layout.hasNav && layout.canPrev && PtInRect(&layout.prev, point))
+        hit.kind = HIT_PREV;
+    else if (layout.hasNav && layout.canNext && PtInRect(&layout.next, point))
+        hit.kind = HIT_NEXT;
+    else if (layout.hasPlus && PtInRect(&layout.plus, point))
         hit.kind = HIT_PLUS;
 
     return hit;
+}
+
+// Move the row, and say whether it actually moved. The clamp is ComputeLayout's, not this function's:
+// everything here does is offer a number, and the next layout decides how much of it was possible.
+static BOOL ScrollBy(StripState* state, HWND hwnd, int delta)
+{
+    RECT client;
+    if (!GetClientRect(hwnd, &client))
+        return FALSE;
+
+    HWND frames[MAX_STRIPS];
+    StripLayout layout;
+    LayoutOf(state, &client, frames, &layout);
+
+    if (layout.maxScroll <= 0)
+        return FALSE;
+
+    int want = layout.scroll + delta;
+    if (want > layout.maxScroll) want = layout.maxScroll;
+    if (want < 0)                want = 0;
+    if (want == layout.scroll)
+        return FALSE;
+
+    g_scroll = want;
+
+    // Throttled the same way a relayout is, and for the same reason: the auto-scroll timer comes
+    // through here sixteen times a second. The two positions that always get a line are the ends,
+    // because "it will not scroll any further" is the complaint this log would be read to answer.
+    {
+        static DWORD lastTick = 0;
+        static int   suppressed = 0;
+        DWORD now = GetTickCount();
+        BOOL atEnd = (want == 0 || want == layout.maxScroll);
+
+        if (!atEnd && lastTick != 0 && (now - lastTick) < 250)
+        {
+            suppressed++;
+        }
+        else
+        {
+            lastTick = now;
+            LogWrite(L"strip  hwnd=0x%p  row scrolled to %d of %d%s", (void*)hwnd, want,
+                     layout.maxScroll,
+                     suppressed ? L" (+ steps not logged)" : L"");
+            suppressed = 0;
+        }
+    }
+
+    StripRefreshTabs();
+    return TRUE;
 }
 
 static POINT PointOf(LPARAM lParam)
@@ -1289,11 +1594,56 @@ struct Surface
     BYTE* bits;      // BGRA, top-down
     int   w, h;
     HDC   dc;        // the same pixels, for the text
+
+    // Nothing outside this is written. It is the whole surface except while the tabs are being
+    // drawn, when it is the track - which is how a tab that is half scrolled off the end comes out
+    // cut square at the edge rather than with a rounded corner in the middle of the row. Clipping
+    // the *rectangle* instead would round the corners of the cut, and a tab that appears to end
+    // neatly where it has in fact been truncated is a tab that hides the fact there is more of it.
+    RECT clip;
 };
+
+static void SurfClip(Surface* s, const RECT* box)
+{
+    if (box)
+    {
+        s->clip = *box;
+        if (s->clip.left   < 0)    s->clip.left   = 0;
+        if (s->clip.top    < 0)    s->clip.top    = 0;
+        if (s->clip.right  > s->w) s->clip.right  = s->w;
+        if (s->clip.bottom > s->h) s->clip.bottom = s->h;
+    }
+    else
+    {
+        s->clip.left = s->clip.top = 0;
+        s->clip.right = s->w;
+        s->clip.bottom = s->h;
+    }
+
+    // The text is GDI's, so GDI needs telling separately. The DC outlives the paint - it belongs to
+    // the strip, not to this drawing pass - so a clip left behind here would silently truncate the
+    // next one.
+    if (s->dc)
+    {
+        if (box)
+        {
+            HRGN region = CreateRectRgn(s->clip.left, s->clip.top, s->clip.right, s->clip.bottom);
+            SelectClipRgn(s->dc, region);
+            if (region)
+                DeleteObject(region);
+        }
+        else
+        {
+            SelectClipRgn(s->dc, NULL);
+        }
+    }
+}
 
 static inline void Blend(Surface* s, int x, int y, COLORREF color, int alpha)
 {
     if (alpha <= 0 || x < 0 || y < 0 || x >= s->w || y >= s->h)
+        return;
+    if (x < s->clip.left || x >= s->clip.right || y < s->clip.top || y >= s->clip.bottom)
         return;
 
     BYTE* p = s->bits + ((size_t)y * (size_t)s->w + (size_t)x) * 4;
@@ -1444,14 +1794,16 @@ static void SurfStroke(Surface* s, float ax, float ay, float bx, float by,
     }
 }
 
-// The two glyphs, drawn as strokes rather than as characters. A font is not guaranteed to have a
+// The glyphs, drawn as strokes rather than as characters. A font is not guaranteed to have a
 // multiplication sign or a heavy plus at any particular weight, and one that substitutes silently
 // gives a close button that looks like a lowercase x. Two strokes cannot be substituted.
 //
 // The stroke used to be exactly one physical pixel at every DPI, which is how a 150% rig ended up
 // with a hairline x on a full-size button. It scales now, and it is anti-aliased, which for a
 // diagonal is most of the difference.
-static void DrawGlyph(Surface* s, const RECT* box, COLORREF color, int dpi, BOOL cross)
+enum { GLYPH_CROSS = 0, GLYPH_PLUS, GLYPH_PREV, GLYPH_NEXT };
+
+static void DrawGlyph(Surface* s, const RECT* box, COLORREF color, int dpi, int kind)
 {
     float thickness = (float)(GLYPH_LOGICAL_STROKE_TENTHS * dpi) / 960.0f;
     if (thickness < 1.0f) thickness = 1.0f;
@@ -1460,15 +1812,32 @@ static void DrawGlyph(Surface* s, const RECT* box, COLORREF color, int dpi, BOOL
     float cy = (float)(box->top + box->bottom) * 0.5f;
     float arm = (float)Scaled(4, dpi);
 
-    if (cross)
+    // A chevron is drawn narrower than it is tall - the arms are the same length as the + 's, but
+    // half as far apart horizontally. Square, it reads as a "greater than" sign rather than as a
+    // direction.
+    float half = arm * 0.55f;
+
+    switch (kind)
     {
-        SurfStroke(s, cx - arm, cy - arm, cx + arm, cy + arm, thickness, color);
-        SurfStroke(s, cx + arm, cy - arm, cx - arm, cy + arm, thickness, color);
-    }
-    else
-    {
+    case GLYPH_PLUS:
         SurfStroke(s, cx - arm, cy, cx + arm, cy, thickness, color);
         SurfStroke(s, cx, cy - arm, cx, cy + arm, thickness, color);
+        break;
+
+    case GLYPH_PREV:
+        SurfStroke(s, cx + half, cy - arm, cx - half, cy, thickness, color);
+        SurfStroke(s, cx - half, cy, cx + half, cy + arm, thickness, color);
+        break;
+
+    case GLYPH_NEXT:
+        SurfStroke(s, cx - half, cy - arm, cx + half, cy, thickness, color);
+        SurfStroke(s, cx + half, cy, cx - half, cy + arm, thickness, color);
+        break;
+
+    default:
+        SurfStroke(s, cx - arm, cy - arm, cx + arm, cy + arm, thickness, color);
+        SurfStroke(s, cx + arm, cy - arm, cx - arm, cy + arm, thickness, color);
+        break;
     }
 }
 
@@ -1570,7 +1939,7 @@ static void DrawOneTab(StripState* state, Surface* s, HWND frame,
         BOOL downClose = (state->pressKind == HIT_CLOSE && state->pressFrame == frame);
         DrawChip(s, &close, hotClose, downClose, dpi);
         DrawGlyph(s, &close, hotClose || downClose ? g_palette.glyphHot : g_palette.glyph,
-                  dpi, TRUE);
+                  dpi, GLYPH_CROSS);
     }
 }
 
@@ -1591,7 +1960,7 @@ static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
     int  count = StackTabs(state->frame, frames, MAX_STRIPS, &activeIndex);
 
     StripLayout layout;
-    ComputeLayout(state, client, count, &layout);
+    ComputeLayout(state, client, frames, count, activeIndex, &layout);
 
     HGDIOBJ oldFont = SelectObject(s->dc, state->font ? (HGDIOBJ)state->font
                                                       : GetStockObject(DEFAULT_GUI_FONT));
@@ -1611,16 +1980,21 @@ static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
                 carried = i;
     }
 
+    // Everything from here to the matching SurfClip(s, NULL) is confined to the track. A tab is
+    // drawn at its full width and the pixels past the end are discarded, which is what a scrolled
+    // row looks like: the tab at the edge is *cut*, not shortened.
+    SurfClip(s, &layout.track);
+
     for (int i = 0; i < layout.count; i++)
     {
         if (i == carried)
             continue;
 
         RECT tab = layout.tab[i];
-        if (tab.right <= tab.left || tab.left >= client->right)
+        if (tab.right <= tab.left || tab.left >= layout.track.right)
             break;
-        if (tab.right > client->right)
-            tab.right = client->right;
+        if (tab.right <= layout.track.left)
+            continue;                       // scrolled off the left-hand end
 
         // A tab with its context menu open is drawn hot for as long as the menu is up, which is
         // the only thing on screen saying which document those commands are about.
@@ -1628,14 +2002,21 @@ static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
                        (state->hotKind == HIT_TAB || state->hotKind == HIT_CLOSE)) ||
                       (state->menuFrame && state->menuFrame == frames[i]);
 
+        // `first` suppresses the separator rule on the leftmost tab. In a scrolled row the leftmost
+        // tab on screen is not tab zero, and a rule drawn against the edge of the track reads as a
+        // border on the strip rather than as a divider between two tabs.
+        BOOL first = (i == 0) || (tab.left <= layout.track.left);
+
         DrawOneTab(state, s, frames[i], tab, layout.close[i],
-                   (i == activeIndex), hotTab, FALSE, (i == 0));
+                   (i == activeIndex), hotTab, FALSE, first);
 
         if (i == activeIndex)
         {
             int inset = Scaled(TAB_LOGICAL_INSET, state->dpi);
             skipLeft  = tab.left + inset;
             skipRight = tab.right - inset;
+            if (skipLeft  < layout.track.left)  skipLeft  = layout.track.left;
+            if (skipRight > layout.track.right) skipRight = layout.track.right;
         }
     }
 
@@ -1654,10 +2035,8 @@ static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
         if (!IsRectEmpty(&close))
             OffsetRect(&close, shift, 0);
 
-        if (tab.left < client->right && tab.right > tab.left)
+        if (tab.left < layout.track.right && tab.right > tab.left)
         {
-            if (tab.right > client->right)
-                tab.right = client->right;
             DrawOneTab(state, s, g_dragFrame, tab, close,
                        (carried == activeIndex), TRUE, TRUE, FALSE);
 
@@ -1666,7 +2045,49 @@ static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
                 int inset = Scaled(TAB_LOGICAL_INSET, state->dpi);
                 skipLeft  = tab.left + inset;
                 skipRight = tab.right - inset;
+                if (skipLeft  < layout.track.left)  skipLeft  = layout.track.left;
+                if (skipRight > layout.track.right) skipRight = layout.track.right;
             }
+        }
+    }
+
+    // Out of the track: the buttons beside it are drawn on the strip itself, and they are the one
+    // thing in this row that a scroll can never move.
+    SurfClip(s, NULL);
+
+    if (layout.hasNav)
+    {
+        // A direction with nowhere left to go is drawn faint and is not a target - see HitTestStrip.
+        // Half way to the well is enough to read as unavailable without the button disappearing,
+        // which would make the row jump sideways every time it reached an end.
+        COLORREF dim = Mix(g_palette.glyph, g_palette.back, 55);
+
+        BOOL hotPrev  = (state->hotKind == HIT_PREV);
+        BOOL downPrev = (state->pressKind == HIT_PREV);
+        BOOL hotNext  = (state->hotKind == HIT_NEXT);
+        BOOL downNext = (state->pressKind == HIT_NEXT);
+
+        GdiFlush();
+        if (layout.canPrev)
+        {
+            DrawChip(s, &layout.prev, hotPrev, downPrev, state->dpi);
+            DrawGlyph(s, &layout.prev, (hotPrev || downPrev) ? g_palette.glyphHot : g_palette.glyph,
+                      state->dpi, GLYPH_PREV);
+        }
+        else
+        {
+            DrawGlyph(s, &layout.prev, dim, state->dpi, GLYPH_PREV);
+        }
+
+        if (layout.canNext)
+        {
+            DrawChip(s, &layout.next, hotNext, downNext, state->dpi);
+            DrawGlyph(s, &layout.next, (hotNext || downNext) ? g_palette.glyphHot : g_palette.glyph,
+                      state->dpi, GLYPH_NEXT);
+        }
+        else
+        {
+            DrawGlyph(s, &layout.next, dim, state->dpi, GLYPH_NEXT);
         }
     }
 
@@ -1689,7 +2110,7 @@ static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
         GdiFlush();
         DrawChip(s, &layout.plus, hotPlus, downPlus, state->dpi);
         DrawGlyph(s, &layout.plus, hotPlus || downPlus ? g_palette.glyphHot : g_palette.glyph,
-                  state->dpi, FALSE);
+                  state->dpi, GLYPH_PLUS);
     }
 
     // The empty row, which since the last slice is a state rather than an accident: this window has
@@ -1763,19 +2184,29 @@ static void DrawStripFlat(StripState* state, HDC dc, const RECT* client)
     int  count = StackTabs(state->frame, frames, MAX_STRIPS, &activeIndex);
 
     StripLayout layout;
-    ComputeLayout(state, client, count, &layout);
+    ComputeLayout(state, client, frames, count, activeIndex, &layout);
 
     HGDIOBJ oldFont = SelectObject(dc, state->font ? (HGDIOBJ)state->font
                                                    : GetStockObject(DEFAULT_GUI_FONT));
     SetBkMode(dc, TRANSPARENT);
 
+    // The same rule as the composited renderer: a scrolled row is cut off at the track, and the
+    // buttons beside it are drawn afterwards on the unclipped device context. GDI does this for us -
+    // this is the one place where having a real DC is simpler than owning the pixels.
+    // Applied only if the state could be saved first. A clip left on a device context that is not
+    // ours - WM_PRINTCLIENT arrives with somebody else's - would truncate whatever they drew next.
+    int savedDc = SaveDC(dc);
+    if (savedDc)
+        IntersectClipRect(dc, layout.track.left, layout.track.top,
+                          layout.track.right, layout.track.bottom);
+
     for (int i = 0; i < layout.count; i++)
     {
         RECT tab = layout.tab[i];
-        if (tab.right <= tab.left || tab.left >= client->right)
+        if (tab.right <= tab.left || tab.left >= layout.track.right)
             break;
-        if (tab.right > client->right)
-            tab.right = client->right;
+        if (tab.right <= layout.track.left)
+            continue;
 
         BOOL selected = (i == activeIndex);
         BOOL hotTab = ((state->hotFrame == frames[i]) &&
@@ -1824,6 +2255,39 @@ static void DrawStripFlat(StripState* state, HDC dc, const RECT* client)
                 SelectObject(dc, oldPen);
                 DeleteObject(glyph);
             }
+        }
+    }
+
+    if (savedDc)
+        RestoreDC(dc, savedDc);
+
+    if (layout.hasNav)
+    {
+        // Two chevrons, in the flat renderer's idiom: aliased lines from a pen, no chip, and dim
+        // rather than absent at the ends of the row.
+        for (int which = 0; which < 2; which++)
+        {
+            RECT box = which ? layout.next : layout.prev;
+            BOOL live = which ? layout.canNext : layout.canPrev;
+
+            HPEN glyph = CreatePen(PS_SOLID, Scaled(1, state->dpi),
+                                   live ? g_palette.glyph : Mix(g_palette.glyph, g_palette.back, 55));
+            if (!glyph)
+                continue;
+
+            int cx  = (box.left + box.right) / 2;
+            int cy  = (box.top + box.bottom) / 2;
+            int arm = Scaled(4, state->dpi);
+            int half = Scaled(2, state->dpi);
+            int tip = which ? (cx + half) : (cx - half);
+            int back = which ? (cx - half) : (cx + half);
+
+            HGDIOBJ oldPen = SelectObject(dc, glyph);
+            MoveToEx(dc, back, cy - arm, NULL);
+            LineTo(dc, tip, cy);
+            LineTo(dc, back, cy + arm + 1);
+            SelectObject(dc, oldPen);
+            DeleteObject(glyph);
         }
     }
 
@@ -1919,8 +2383,10 @@ static void DrawStrip(StripState* state, HDC dc, const RECT* client)
         surface.w    = w;
         surface.h    = h;
         surface.dc   = state->memDc;
+        SurfClip(&surface, NULL);          // and the drawing narrows it to the track and back again
 
         DrawStripSoft(state, &surface, client);
+        SurfClip(&surface, NULL);          // the DC belongs to the strip, not to this paint
         BitBlt(dc, client->left, client->top, w, h, state->memDc, 0, 0, SRCCOPY);
         return;
     }
@@ -2347,10 +2813,17 @@ static HWND MenuTargetAt(StripState* state, HWND hwnd, POINT point)
 // from is kept for the whole gesture.
 // ---------------------------------------------------------------------------------------------
 
+// The auto-scroll timer, defined with the rest of the drag below. Declared here because the two
+// functions that end a gesture come first, and the timer has to stop when the gesture does - all
+// three ways it can end.
+static void DragScrollStart(HWND hwnd);
+static void DragScrollStop(void);
+
 // Forget the gesture without touching the row: a drop that was agreed to, or a strip destroyed
 // underneath one.
 static void DragForget(void)
 {
+    DragScrollStop();
     g_dragStrip = NULL;
     g_dragFrame = NULL;
     g_dragging  = FALSE;
@@ -2374,6 +2847,7 @@ static void DragUndo(HWND hwnd, const wchar_t* why)
 
     g_dragFrame = NULL;
     g_dragging  = FALSE;
+    DragScrollStop();
 
     if (!was || !frame || !IsWindow(frame))
         return;
@@ -2396,6 +2870,7 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
         BOOL was = g_dragging;
         g_dragFrame = NULL;
         g_dragging  = FALSE;
+        DragScrollStop();
         if (was)
         {
             LogWrite(L"strip  hwnd=0x%p  drag abandoned - that tab is no longer in the row",
@@ -2418,6 +2893,7 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
             return;
 
         g_dragging = TRUE;
+        DragScrollStart(hwnd);
         LogWrite(L"strip  hwnd=0x%p  drag started on 0x%p (tab %d)",
                  (void*)hwnd, (void*)g_dragFrame, g_dragFrom);
     }
@@ -2427,10 +2903,8 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
         return;
 
     HWND frames[MAX_STRIPS];
-    int count = StackTabs(state->frame, frames, MAX_STRIPS, NULL);
-
     StripLayout layout;
-    ComputeLayout(state, &client, count, &layout);
+    LayoutOf(state, &client, frames, &layout);
 
     // The row this gesture is happening *in* can empty underneath it. The drag state is global and
     // the strip holding the capture is usually not the strip on screen, so `g_dragFrame` above can
@@ -2445,27 +2919,102 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
     }
 
     // Where the tab is now: carried from the point inside it that was grabbed, so it does not jump
-    // under the pointer when it is picked up, and never past either end of the row - there is
-    // nowhere further to go, and a tab drawn off the strip is one being aimed blind.
+    // under the pointer when it is picked up, and never past either end of the *track* - a tab
+    // carried out over the scroll buttons is one being aimed blind, and in an overflowing row the
+    // end of the track is not the end of the row.
     int left = point.x - g_dragGrabDx;
-    if (left < layout.tab[0].left)
-        left = layout.tab[0].left;
-    if (left > layout.tab[layout.count - 1].left)
-        left = layout.tab[layout.count - 1].left;
+    if (left > layout.track.right - layout.width)
+        left = layout.track.right - layout.width;
+    if (left < layout.track.left)
+        left = layout.track.left;
     g_dragLeft = left;
 
     // Which slot it belongs in: the one containing the carried tab's own centre. Measured from the
     // tab rather than from the pointer, so the row swaps when the tab is visibly half way past its
     // neighbour - the pointer can be anywhere along it, and swapping on the pointer makes a tab
     // grabbed by its right-hand edge jump a place the instant it is picked up.
-    int centre = left + (layout.tab[0].right - layout.tab[0].left) / 2;
-    int target = 0;
-    for (int i = 0; i < layout.count; i++)
-        if (layout.tab[i].left <= centre)
-            target = i;
+    //
+    // Worked in the row's own coordinates rather than by scanning the rectangles on screen, because
+    // in a scrolled row the slots either side of the visible ones are real places a tab can be put
+    // and there is no rectangle to find them by.
+    int centre  = left + layout.width / 2;
+    int virtual_ = centre - layout.track.left + layout.scroll;
+    int target  = (layout.width > 0) ? (virtual_ / layout.width) : 0;
+    if (target < 0)                 target = 0;
+    if (target > layout.count - 1)  target = layout.count - 1;
 
     StackMoveTab(g_dragFrame, target);   // free, and silent, while the tab is already there
     StripRefreshTabs();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Carrying a tab past the end of a scrolled row.
+//
+// Without this, a drag in an overflowing row can only rearrange the tabs that happen to be on
+// screen: the pointer reaches the edge of the track and there is nowhere further to go. With it, the
+// row moves under the carried tab while the hand holds still at the end - the same thing a file
+// manager does when a drag reaches the edge of a list.
+//
+// Driven by a timer rather than by mouse movement, because the gesture that needs it is the one
+// where the pointer has *stopped*. The timer runs for the length of the drag and each tick decides
+// whether anything is needed, which is one place to start it and one place to stop it rather than
+// four of each.
+// ---------------------------------------------------------------------------------------------
+
+static void DragScrollStop(void)
+{
+    if (g_dragScroll)
+    {
+        if (IsWindow(g_dragScroll))
+            KillTimer(g_dragScroll, ID_DRAG_SCROLL);
+        g_dragScroll = NULL;
+    }
+}
+
+static void DragScrollStart(HWND hwnd)
+{
+    if (g_dragScroll == hwnd)
+        return;
+    DragScrollStop();
+    if (SetTimer(hwnd, ID_DRAG_SCROLL, DRAG_SCROLL_MS, NULL))
+        g_dragScroll = hwnd;
+}
+
+static void DragScrollTick(StripState* state, HWND hwnd)
+{
+    if (!g_dragging || g_dragStrip != hwnd || !g_dragFrame)
+    {
+        DragScrollStop();
+        return;
+    }
+
+    RECT client;
+    POINT cursor;
+    if (!GetClientRect(hwnd, &client) || !GetCursorPos(&cursor) || !ScreenToClient(hwnd, &cursor))
+        return;
+
+    HWND frames[MAX_STRIPS];
+    StripLayout layout;
+    LayoutOf(state, &client, frames, &layout);
+    if (layout.maxScroll <= 0)
+        return;
+
+    int edge = Scaled(DRAG_SCROLL_EDGE, state->dpi);
+    int step = Scaled(DRAG_SCROLL_LOGICAL, state->dpi);
+    int by   = 0;
+
+    if (cursor.x <= layout.track.left + edge)
+        by = -step;
+    else if (cursor.x >= layout.track.right - edge)
+        by = step;
+
+    if (by == 0 || !ScrollBy(state, hwnd, by))
+        return;
+
+    // The row has moved, so where the carried tab belongs has moved with it. Re-run the same code
+    // the pointer would have run had it twitched, rather than a second copy of it that could
+    // disagree about which slot the tab is over.
+    DragMove(state, hwnd, cursor);
 }
 
 static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -2526,12 +3075,59 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         break;
 
+    // The wheel over the tab row scrolls it, which is how every other overflowing row of tabs
+    // behaves. A vertical wheel doing a horizontal thing is the convention rather than a liberty -
+    // a strip 32 pixels tall has nothing to scroll vertically, and the alternative is a row most
+    // mice cannot move at all.
+    //
+    // Whether this message arrives here is Windows' decision, not ours: WM_MOUSEWHEEL goes to the
+    // focused window, and the strip is WS_EX_NOACTIVATE and never has focus. What delivers it is
+    // "scroll inactive windows when I hover over them", which is on by default and routes the wheel
+    // to the window under the pointer. The scroll buttons exist partly because that is a setting and
+    // settings can be off.
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+        if (state)
+        {
+            int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+            if (notches == 0)
+                break;
+
+            RECT client;
+            HWND frames[MAX_STRIPS];
+            StripLayout layout;
+            if (!GetClientRect(hwnd, &client))
+                break;
+            LayoutOf(state, &client, frames, &layout);
+            if (layout.maxScroll <= 0)
+                break;
+
+            // A wheel forward is up, and up is left. A *horizontal* wheel is the other way round:
+            // its positive direction is already right.
+            int by = layout.width * notches;
+            if (msg == WM_MOUSEWHEEL)
+                by = -by;
+
+            ScrollBy(state, hwnd, by);
+            return 0;
+        }
+        break;
+
+    case WM_TIMER:
+        if (state && wParam == ID_DRAG_SCROLL)
+        {
+            DragScrollTick(state, hwnd);
+            return 0;
+        }
+        break;
+
     case WM_LBUTTONDOWN:
         if (state)
         {
             StripHit hit = HitTestStrip(state, hwnd, PointOf(lParam));
 
-            if (hit.kind == HIT_CLOSE || hit.kind == HIT_PLUS)
+            if (hit.kind == HIT_CLOSE || hit.kind == HIT_PLUS ||
+                hit.kind == HIT_PREV  || hit.kind == HIT_NEXT)
             {
                 // Press and release on the same button, the way every other button in Windows
                 // behaves: pressing one and sliding off cancels it. Acting on the press would mean
@@ -2547,6 +3143,14 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 // clicking the tab you came from, and waiting for the release makes it feel slow.
                 LogWrite(L"strip  hwnd=0x%p  tab clicked -> 0x%p",
                          (void*)state->frame, (void*)hit.frame);
+
+                // Claimed as already revealed *before* it is activated. A tab at the end of a
+                // scrolled row can be half off the track, and the reveal that follows an activation
+                // would slide the row under a pointer that is still holding the button down - the
+                // tab would move out from under the hand between the press and the drag, and the
+                // carried tab would sit a scroll's width from the pointer for the rest of it. The
+                // user can see the tab: they just clicked it.
+                g_scrollShown = hit.frame;
                 StackActivate(hit.frame);
 
                 // ...and the same press may turn out to be a drag. Nothing is committed here: the
@@ -2617,6 +3221,22 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                     LogWrite(L"strip  hwnd=0x%p  close clicked on 0x%p",
                              (void*)state->frame, (void*)frame);
                     StackCloseTab(frame);
+                }
+                else if (kind == HIT_PREV || kind == HIT_NEXT)
+                {
+                    // One tab per click. A page per click gets to the far end of a long row sooner
+                    // and overshoots the tab you were looking for every time, and the wheel is
+                    // already the way to cross a row quickly.
+                    RECT client;
+                    HWND frames[MAX_STRIPS];
+                    StripLayout layout;
+                    int step = Scaled(TAB_LOGICAL_MIN_W, state->dpi);
+                    if (GetClientRect(hwnd, &client))
+                    {
+                        LayoutOf(state, &client, frames, &layout);
+                        step = layout.width;
+                    }
+                    ScrollBy(state, hwnd, (kind == HIT_NEXT) ? step : -step);
                 }
                 else
                 {
@@ -3282,6 +3902,18 @@ void StripStart(void)
     // is out of the way rather than merely inert.
     g_dragEnabled = WordTabReadFlag(L"TabDrag", TRUE);
 
+    // The scrolling tab row. This one is not "off gives back what it did before", because what it
+    // did before was draw the + on top of the last tab and hit-test the tab first - the user pressed
+    // a + and closed a document. A switch whose only effect is to reproduce that would exist to
+    // reproduce it.
+    //
+    // What it gives instead is the other honest answer to too many documents: no minimum width at
+    // all, so the tabs divide the row between them however many there are and every one of them is
+    // on screen. That is a worse row to read and a better one to be *sure* of, which makes it the
+    // thing to reach for if the scrolling row ever strands somebody's document off the end of a
+    // strip on a machine this has not run on.
+    g_scrollEnabled = WordTabReadFlag(L"TabScroll", TRUE);
+
     // The look. Off, the strip is what it was before this slice: flat rectangles with a full border,
     // an aliased one-pixel x and +, a bare empty row, and a context menu drawn by the system in the
     // system's colours. The palette is still derived rather than hand-picked, because that is a
@@ -3319,13 +3951,14 @@ void StripStart(void)
         g_janitor = SetTimer(NULL, 0, 500, JanitorProc);
 
     LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s  "
-             L"tab menu=%s  tab drag=%s  tab style=%s  theme sample=%s",
+             L"tab menu=%s  tab drag=%s  tab scroll=%s  tab style=%s  theme sample=%s",
              g_stripClass ? L"registered" : L"FAILED",
              g_janitor ? L"running" : L"FAILED", STRIP_LOGICAL_H,
              g_palette.dark ? L"dark" : L"light",
              g_buttonsEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabButtons=0)",
              g_menuEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabMenu=0)",
              g_dragEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabDrag=0)",
+             g_scrollEnabled ? L"on" : L"squeeze (HKCU\\Software\\WordTab\\TabScroll=0)",
              g_lookEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabStyle=0)",
              g_sampleEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabThemeSample=0)");
 }
@@ -3427,6 +4060,14 @@ void StripStop(void)
         KillTimer(NULL, g_janitor);
         g_janitor = 0;
     }
+
+    // The scroll position is module state, not window state, so it has to be put back by hand.
+    // Switching the add-in off and on again inside one Word session would otherwise start the new
+    // row scrolled to where the old one happened to be.
+    DragScrollStop();
+    g_scroll      = 0;
+    g_scrollShown = NULL;
+    g_scrollMax   = -1;
 
     for (int i = 0; i < g_stripCount; i++)
         Restore(&g_strips[i]);

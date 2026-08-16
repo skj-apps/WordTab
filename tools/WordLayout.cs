@@ -405,17 +405,48 @@ public static class WordLayout
         public RECT[] Close;     // the X on each; empty when the tab is too narrow to carry one
         public RECT Plus;        // the new-document button
         public bool HasPlus;
+
+        // The scrolling row. Track is the band the tabs live in and are clipped to; everything to
+        // the right of it is the fixed cluster the row can never reach.
+        public RECT Track;
+        public RECT Prev, Next;  // the scroll buttons, empty unless the row overflows
+        public bool HasNav;
+        public bool CanPrev, CanNext;
+        public int Scroll;       // as clamped, which may be less than what was asked for
+        public int MaxScroll;
+        public int Width;        // one tab's pitch, which is also one click of a scroll button
     }
 
     // MulDiv's rounding, which is to nearest with ties away from zero - not Math.Round's, which is
     // to even and would put a tab boundary one pixel out at some DPIs and not others.
     static int Sc(int logical, int dpi) { return (logical * dpi + 48) / 96; }
 
+    // The same scaling, for a script that has to work out how narrow a window must be before a
+    // given number of tabs stops fitting. Hard-coding a pixel count there would make the suite
+    // silently measure nothing on a rig at a different DPI.
+    public static int Scale(int logical, int dpi) { return Sc(logical, dpi); }
+
     static bool Empty(RECT r) { return r.Right <= r.Left || r.Bottom <= r.Top; }
     public static bool IsEmptyRect(RECT r) { return Empty(r); }
     public static POINT Center(RECT r) { POINT p; p.X = (r.Left + r.Right) / 2; p.Y = (r.Top + r.Bottom) / 2; return p; }
 
-    public static TabLayout Tabs(IntPtr strip, int count)
+    // The row as it looks with the scroll at zero, which is where it always is unless the tabs
+    // overflow - so this is the whole of it for every suite that does not deliberately overflow one.
+    public static TabLayout Tabs(IntPtr strip, int count) { return Tabs(strip, count, 0, true); }
+
+    public static TabLayout Tabs(IntPtr strip, int count, int scroll) { return Tabs(strip, count, scroll, true); }
+
+    // `scroll` has to be supplied because there is no way to ask: it is state inside Word's process,
+    // and the add-in does not publish it. What makes that workable is that it is knowable at the two
+    // positions worth testing - a row that has just overflowed is at 0, and a row scrolled harder
+    // than it can move is at MaxScroll - and that everywhere else it is exactly 0, because a row
+    // that fits cannot be scrolled at all.
+    //
+    // `scrollEnabled` mirrors HKCU\Software\WordTab\TabScroll: false is the squeeze layout, where
+    // the tabs divide the track between them with no minimum width.
+    //
+    // Both this and ComputeLayout in src\native\strip.cpp assume the buttons are switched on.
+    public static TabLayout Tabs(IntPtr strip, int count, int scroll, bool scrollEnabled)
     {
         RECT s = RectOf(strip);
         int dpi = Dpi(strip);
@@ -424,7 +455,8 @@ public static class WordLayout
 
         int pad = Sc(6, dpi), gap = Sc(4, dpi);
         int minimum = Sc(70, dpi), desired = Sc(220, dpi);
-        int plusW = Sc(26, dpi), closeW = Sc(16, dpi);
+        int plusW = Sc(26, dpi), closeW = Sc(16, dpi), chevW = Sc(20, dpi);
+        int hair = Sc(2, dpi);
 
         int available = w - pad * 2 - plusW - gap;
         if (available < minimum) available = minimum;
@@ -433,15 +465,68 @@ public static class WordLayout
         if (count > 0 && width * count > available) width = available / count;
         if (width < minimum) width = minimum;
 
+        bool overflow = (count > 0 && width * count > available);
+
         TabLayout layout = new TabLayout();
         layout.Tabs = new RECT[count];
         layout.Close = new RECT[count];
 
+        RECT track;
+        track.Left = pad; track.Right = w - pad; track.Top = 0; track.Bottom = h;
+
+        RECT prev, next, p;
+        prev.Left = prev.Top = prev.Right = prev.Bottom = 0;
+        next.Left = next.Top = next.Right = next.Bottom = 0;
+        p.Left = p.Top = p.Right = p.Bottom = 0;
+        bool hasNav = false;
+
+        if (overflow)
+        {
+            p.Right = w - pad; p.Left = p.Right - plusW;
+            p.Top = Sc(6, dpi); p.Bottom = h - Sc(6, dpi);
+
+            next.Right = p.Left - gap; next.Left = next.Right - chevW;
+            prev.Right = next.Left; prev.Left = prev.Right - chevW;
+            next.Top = prev.Top = Sc(6, dpi);
+            next.Bottom = prev.Bottom = h - Sc(6, dpi);
+
+            track.Right = prev.Left - gap;
+            hasNav = scrollEnabled;
+
+            if (!scrollEnabled)
+            {
+                track.Right = p.Left - gap;
+                prev.Left = prev.Top = prev.Right = prev.Bottom = 0;
+                next.Left = next.Top = next.Right = next.Bottom = 0;
+            }
+        }
+
+        int trackW = track.Right - track.Left;
+        if (trackW < 0) trackW = 0;
+
+        if (overflow && !scrollEnabled)
+        {
+            width = (count > 0) ? (trackW / count) : desired;
+            if (width < 1) width = 1;
+            overflow = false;
+        }
+
+        int maxScroll = 0;
+        if (overflow)
+        {
+            maxScroll = count * width - trackW;
+            if (maxScroll < 0) maxScroll = 0;
+        }
+
+        if (scroll > maxScroll) scroll = maxScroll;
+        if (scroll < 0) scroll = 0;
+
         for (int i = 0; i < count; i++)
         {
             RECT t;
-            t.Left = pad + i * width;
-            t.Right = t.Left + width - Sc(2, dpi);
+            t.Left = track.Left + i * width - scroll;
+            t.Right = t.Left + width - hair;
+            if (t.Right <= t.Left) t.Right = t.Left + 1;
             t.Top = Sc(3, dpi);
             t.Bottom = h;
 
@@ -450,11 +535,16 @@ public static class WordLayout
             if ((t.Right - t.Left) >= closeW * 3)
             {
                 int middle = (t.Top + t.Bottom) / 2;
-                c.Right = t.Right - Sc(6, dpi);
-                c.Left = c.Right - closeW;
-                c.Top = middle - closeW / 2;
-                c.Bottom = c.Top + closeW;
-                c.Left += s.Left; c.Right += s.Left; c.Top += s.Top; c.Bottom += s.Top;
+                int cr = t.Right - Sc(6, dpi);
+                int cl = cr - closeW;
+                if (cl >= track.Left && cr <= track.Right)
+                {
+                    c.Right = cr;
+                    c.Left = cl;
+                    c.Top = middle - closeW / 2;
+                    c.Bottom = c.Top + closeW;
+                    c.Left += s.Left; c.Right += s.Left; c.Top += s.Top; c.Bottom += s.Top;
+                }
             }
 
             t.Left += s.Left; t.Right += s.Left; t.Top += s.Top; t.Bottom += s.Top;
@@ -462,17 +552,38 @@ public static class WordLayout
             layout.Close[i] = c;
         }
 
-        int after = (count > 0) ? (layout.Tabs[count - 1].Right - s.Left + gap) : pad;
-        int limit = w - pad - plusW;
-        if (after > limit) after = limit;
-        if (after < pad) after = pad;
+        if (!overflow)
+        {
+            int after = (count > 0) ? (layout.Tabs[count - 1].Right - s.Left + gap) : pad;
+            int limit = w - pad - plusW;
+            if (after > limit) after = limit;
+            if (after < pad) after = pad;
 
-        RECT p;
-        p.Left = after; p.Right = after + plusW;
-        p.Top = Sc(6, dpi); p.Bottom = h - Sc(6, dpi);
+            p.Left = after; p.Right = after + plusW;
+            p.Top = Sc(6, dpi); p.Bottom = h - Sc(6, dpi);
+        }
+
         layout.HasPlus = p.Right <= w && p.Bottom > p.Top;
+        layout.HasNav = hasNav;
+        layout.CanPrev = hasNav && scroll > 0;
+        layout.CanNext = hasNav && scroll < maxScroll;
+        layout.Scroll = scroll;
+        layout.MaxScroll = maxScroll;
+        layout.Width = width;
+
         p.Left += s.Left; p.Right += s.Left; p.Top += s.Top; p.Bottom += s.Top;
         layout.Plus = p;
+
+        if (hasNav)
+        {
+            prev.Left += s.Left; prev.Right += s.Left; prev.Top += s.Top; prev.Bottom += s.Top;
+            next.Left += s.Left; next.Right += s.Left; next.Top += s.Top; next.Bottom += s.Top;
+        }
+        layout.Prev = prev;
+        layout.Next = next;
+
+        track.Left += s.Left; track.Right += s.Left; track.Top += s.Top; track.Bottom += s.Top;
+        layout.Track = track;
 
         return layout;
     }
