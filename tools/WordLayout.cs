@@ -830,4 +830,58 @@ public static class WordLayout
     {
         SHChangeNotify(SHCNE_ASSOCCHANGED, 0, IntPtr.Zero, IntPtr.Zero);
     }
+
+    // ---- where a keystroke actually goes, and the two-modifier chord ---------------------------
+    //
+    // Both of these are additions only; nothing above changed. All eleven suites compile against
+    // this file, so it may only ever grow.
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GUITHREADINFO
+    {
+        public int cbSize;
+        public int flags;
+        public IntPtr hwndActive;
+        public IntPtr hwndFocus;
+        public IntPtr hwndCapture;
+        public IntPtr hwndMenuOwner;
+        public IntPtr hwndMoveSize;
+        public IntPtr hwndCaret;
+        public RECT rcCaret;
+    }
+
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info);
+
+    // The KEYBOARD focus inside another process, which GetForegroundWindow cannot tell you.
+    //
+    // This matters because a WM_KEYDOWN is delivered to the focus window and to nothing else -
+    // keyboard messages do not travel up to parents the way a WM_CONTEXTMENU does. So "which window
+    // does Word give the keyboard to" decides whether a subclass can ever see a keystroke, and it is
+    // a measurement rather than a thing to reason about. hwndFocus comes back IntPtr.Zero when the
+    // asked-about thread does not own the foreground, which is itself the answer to a different
+    // question and must not be read as "no focus window".
+    public static GUITHREADINFO ThreadGui(IntPtr hwnd)
+    {
+        uint pid;
+        uint thread = GetWindowThreadProcessId(hwnd, out pid);
+        GUITHREADINFO gui = new GUITHREADINFO();
+        gui.cbSize = Marshal.SizeOf(typeof(GUITHREADINFO));
+        if (!GetGUIThreadInfo(thread, ref gui)) { gui.hwndActive = IntPtr.Zero; gui.hwndFocus = IntPtr.Zero; }
+        return gui;
+    }
+
+    // Ctrl+Shift+key. Word's own "previous window" is Ctrl+Shift+F6, and a chord with two modifiers
+    // cannot be built by calling CtrlPress with a shifted key: both modifiers have to be down across
+    // the whole of the target key's down-and-up, or Word sees a different chord.
+    public static void CtrlShiftPress(ushort vk)
+    {
+        Key(0x11, false);                       // VK_CONTROL
+        Key(0x10, false);                       // VK_SHIFT
+        Thread.Sleep(60);
+        Key(vk, false); Thread.Sleep(60); Key(vk, true);
+        Thread.Sleep(60);
+        Key(0x10, true);
+        Key(0x11, true);
+        Thread.Sleep(150);
+    }
 }

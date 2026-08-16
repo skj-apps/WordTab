@@ -864,11 +864,19 @@ function Invoke-ConfirmedKey {
         [uint16]$Vk,
         [string]$What,
         [switch]$Ctrl,
+        [switch]$Shift,
         [int]$Tries = 3
     )
+    # -Shift is only meaningful with -Ctrl: it exists for Word's own Ctrl+Shift+F6, and building that
+    # chord by hand in a caller would be a second copy of the confirmation above it, which is the one
+    # thing this module exists to prevent. A bare -Shift is a caller mistake and says so rather than
+    # quietly sending an unshifted key.
+    if ($Shift -and -not $Ctrl) { throw "Invoke-ConfirmedKey: -Shift needs -Ctrl ($What)." }
     for ($try = 1; $try -le $Tries; $try++) {
         if (Test-WordHasFocus) {
-            if ($Ctrl) { [WordLayout]::CtrlPress($Vk) } else { [WordLayout]::Press($Vk) }
+            if ($Ctrl -and $Shift) { [WordLayout]::CtrlShiftPress($Vk) }
+            elseif ($Ctrl)         { [WordLayout]::CtrlPress($Vk) }
+            else                   { [WordLayout]::Press($Vk) }
             return $true
         }
         Write-HarnessNote ("{0}: the foreground is `"{1}`" ({2}), not Word - taking it back" -f
