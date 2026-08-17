@@ -585,6 +585,12 @@ try {
     [WordLayout]::DragHold($spot.X, $spot.Y, $slot2.X, $spot.Y, 10, 70)
     $dropAt = $slot2.X
     Assert (@(Get-LogSince 'drag started').Count -ge 1) 'the add-in reports a drag in progress'
+
+    # The control for every carried-tab assertion below. "A ghost is on screen" proves nothing unless
+    # there is a moment in the same gesture where there is not one - and a ghost that appeared the
+    # instant a tab was picked up would satisfy every check further down while being the wrong
+    # feature. This is that moment: the drag is real, the row is rearranging, the tab is still in it.
+    Assert ($null -eq (Get-WordTabGhost)) 'nothing is carried under the pointer while the tab is still in the row'
     # A slot at a time, not one jump: the row swaps as the carried tab's centre crosses each
     # neighbour, so this is "0 -> 1" and then "1 -> 2". The count is the claim; the return below is
     # the one worth naming exactly.
@@ -611,6 +617,62 @@ try {
     Assert ($cursorTorn -ne $cursorInRow) 'the pointer changes shape when the tab comes out of the row'
     Assert ($cursorTorn -eq [WordLayout]::SystemCursor(32646)) 'and it is IDC_SIZEALL - Windows'' own "you are relocating this"'
 
+    # ---- and the tab itself, carried under the pointer --------------------------------------------
+    #
+    # The gap both halves of the tear-off writeup named: out here the tab is drawn in the row, in the
+    # slot it came from, NOT MOVING, so the cursor was the only thing that followed the hand. This is
+    # the picture that follows it now.
+    #
+    # Geometry is asserted against numbers this suite already knows - the tab's own width and the
+    # point inside it that was grabbed - rather than against measurements taken from the ghost. A
+    # check that reads a window's size and then asserts that size passes on any window at all.
+    $ghostUp = Wait-WordTabGhost -Present $true
+    Assert $ghostUp.Ok 'the row letting go puts a picture of the tab under the pointer'
+
+    if ($ghostUp.Ghost) {
+        $ghost  = $ghostUp.Ghost
+        $dpi    = [WordLayout]::Dpi($spot.Strip)
+        # LIFT_LOGICAL_SPREAD in src\native\strip.cpp: the card's shadow reaches 4 logical px past it,
+        # so the window has to be that much wider on each side or the lift is drawn into pixels it
+        # does not own - which is the one part of the card that says it is off the row.
+        $spread = [int][Math]::Round(4 * $dpi / 96.0)
+        $tabW   = $spot.Rect.Right - $spot.Rect.Left
+
+        Write-Note ("carried tab ({0},{1} {2}x{3})  from a {4}px tab at {5} dpi, shadow {6}px" -f `
+                    $ghost.Left, $ghost.Top, $ghost.Width, $ghost.Height, $tabW, $dpi, $spread)
+
+        Assert ($ghost.Width -eq ($tabW + $spread * 2)) `
+            "and it is the width of the tab it came from plus the shadow ($($ghost.Width) vs $($tabW + $spread * 2))"
+        Assert ([WordLayout]::IsToolWindow($ghost.Hwnd)) `
+            'and it is a tool window, so carrying a tab can never add a taskbar button or an Alt+Tab entry'
+
+        # Held at the point it was grabbed by. This is the assertion that the card does not jump under
+        # the hand at the moment the row lets go - which is already the instant when the most changes
+        # at once, and the one where a jump would be read as the drag having gone wrong.
+        $at    = [WordLayout]::Cursor()
+        $grab  = $spot.X - $spot.Rect.Left
+        $held  = $at.X - $ghost.Left - $spread
+        Write-Note ("grabbed {0}px into the tab; the pointer is holding the card {1}px in" -f $grab, $held)
+        Assert ([Math]::Abs($held - $grab) -le 2) 'and the pointer is holding it where the tab was grabbed'
+
+        # Follows. Asserted as a DELTA against the pointer's own delta rather than as a position, so
+        # a ghost parked at a fixed offset from the strip cannot pass it.
+        $wasAt = [WordLayout]::Cursor()
+        $wasL  = $ghost.Left
+        [WordLayout]::DragMoveTo($wasAt.X, $wasAt.Y, $wasAt.X + 180, $wasAt.Y, 6, 40)
+        $now   = Get-WordTabGhost
+        $nowAt = [WordLayout]::Cursor()
+        if ($now) {
+            Write-Note ("pointer moved {0}px, the card moved {1}px" -f ($nowAt.X - $wasAt.X), ($now.Left - $wasL))
+            Assert (($nowAt.X - $wasAt.X) -ne 0) 'the pointer really moved, so the next check can fail'
+            Assert ([Math]::Abs(($now.Left - $wasL) - ($nowAt.X - $wasAt.X)) -le 2) `
+                'and the card follows the pointer, pixel for pixel'
+        } else {
+            Assert $false 'the carried tab survived a mouse move'
+        }
+        [WordLayout]::DragMoveTo($nowAt.X, $nowAt.Y, $slot2.X, $wayBelow, 6, 40)
+    }
+
     # Back into the row, at less than the outward threshold. If the two thresholds were the same
     # number this would still be out, and the gesture would be back to flickering on the boundary.
     #
@@ -630,6 +692,11 @@ try {
     Assert $back.Ok 'coming back inside 0.3 of a row picks the tab up again'
     Assert ($cursorBack -eq [WordLayout]::SystemCursor(32512)) 'and the pointer is an ordinary arrow again'
 
+    # The row has it back, so the carried copy has to go - or there are two pictures of one tab, one
+    # in the row moving with the hand and one over the document doing the same thing.
+    $ghostGone = Wait-WordTabGhost -Present $false
+    Assert $ghostGone.Ok 'and the carried card goes away, because the tab is in the row again'
+
     # And out again, which is where it is let go of.
     [WordLayout]::DragMoveTo($slot2.X, $justBelow, $slot2.X, $wayBelow, 8, 60)
     $at = [WordLayout]::Cursor()
@@ -639,6 +706,9 @@ try {
     $out2 = Wait-Logged 'drag left the row' 2
     Write-Note "and leave again $($out2.Ms)ms later"
     Assert $out2.Ok 'and it can leave the row a second time'
+
+    $ghostBack = Wait-WordTabGhost -Present $true
+    Assert $ghostBack.Ok 'and the carried card comes back with it - both directions, not just the first'
     $dropAt = $slot2.X
 }
 finally {
@@ -647,6 +717,12 @@ finally {
 
 Wait-Until { ([WordLayout]::RectOf($victim)).Left -ne $stackRect.Left } 8 | Out-Null
 Start-Sleep -Milliseconds 1200
+
+# Nothing left behind. A carried card that outlived the gesture would be a window of ours sitting
+# over the user's document with nothing to take it away - and it is WS_EX_TRANSPARENT, so they could
+# not even click it to find out what it was.
+$ghostAfter = Wait-WordTabGhost -Present $false
+Assert $ghostAfter.Ok 'letting go leaves no carried card behind'
 
 Assert (@(Get-LogSince 'drag dropped out of the row').Count -eq 1) 'letting go outside the row is recorded as a tear-off, once'
 $said = @(Get-LogSince 'torn off, now its own window')
@@ -1168,6 +1244,114 @@ if (-not $KeepOpen) {
         $restored = Get-ItemProperty -Path $switchKey -Name 'TabTearOff' -ErrorAction SilentlyContinue
         $nowIs = if ($restored -and ($restored.PSObject.Properties.Name -contains 'TabTearOff')) { $restored.TabTearOff } else { '(absent)' }
         Write-Note "TabTearOff restored to $nowIs"
+    }
+}
+
+# ---- TabGhost=0 keeps the gesture and drops only the picture -----------------------------------------
+#
+# The switch has to be driven on its own restart rather than folded into the section above, and the
+# reason is the trap this project keeps meeting: with TabTearOff=0 the tab never leaves the row at
+# all, so "no card is carried" is true there for a reason that has nothing to do with TabGhost. It
+# would be a check that passes whatever this switch does.
+#
+# So the assertion is a PAIR, and both halves are needed. The tab still comes out of the row - the
+# gesture is untouched, which is the whole claim of this switch - AND nothing is carried under the
+# pointer while it is out. Either alone is satisfied by something being broken.
+
+if (-not $KeepOpen) {
+    Write-Step 'TabGhost=0 keeps the tear-off and drops only the carried card'
+
+    $switchKey  = 'HKCU:\Software\WordTab'
+    $hadGhost   = $false
+    $oldGhost   = $null
+    if (Test-Path $switchKey) {
+        $existing = Get-ItemProperty -Path $switchKey -Name 'TabGhost' -ErrorAction SilentlyContinue
+        if ($existing -and ($existing.PSObject.Properties.Name -contains 'TabGhost')) {
+            $hadGhost = $true
+            $oldGhost = $existing.TabGhost
+        }
+    }
+
+    try {
+        $end = Close-AllWord
+        if (-not $end.Closed) {
+            Write-Note ("Word would not close ({0}) - skipping the TabGhost=0 check" -f $end.Reason)
+        } else {
+            if (-not (Test-Path $switchKey)) { New-Item -Path $switchKey | Out-Null }
+            Set-ItemProperty -Path $switchKey -Name 'TabGhost' -Value 0 -Type DWord
+            Start-Sleep -Seconds 2
+
+            Set-LogMark
+            foreach ($n in @('Alpha', 'Bravo')) {
+                $path = Join-Path $scratch ("wordtab-noghost-{0}.rtf" -f $n)
+                "{\rtf1\ansi WordTab TabGhost=0 check - $n.\par}" | Set-Content -Path $path -Encoding Ascii
+                Start-Process -FilePath 'winword.exe' -ArgumentList "`"$path`""
+                Wait-WordReady (@('Alpha', 'Bravo').IndexOf($n) + 1) 45 | Out-Null
+            }
+            Start-Sleep -Seconds 2
+
+            # Read off the line StripStart writes, not inferred from nothing appearing. "The switch
+            # was off" and "the feature silently did not run" are different facts.
+            $start = @(Get-LogSince 'StripStart  class=')
+            foreach ($line in $start) { Write-Note "  log: $($line.Trim())" }
+            Assert (@($start | Where-Object { $_ -like '*ghost=off*' }).Count -ge 1) `
+                'the add-in started with the carried card switched off'
+
+            $noGhostFrames = @(Get-Frames)
+            if ($noGhostFrames.Count -ne 2) {
+                Write-Note "expected two windows for the TabGhost=0 check, found $($noGhostFrames.Count) - skipping"
+            } else {
+                Set-WordForeground | Out-Null
+                Set-LogMark
+                $spot     = Get-TabSpot 0
+                $slot1    = Get-TabSpot 1
+                $stripH   = $spot.Band.Bottom - $spot.Band.Top
+                $wayBelow = $spot.Band.Bottom + [int]($stripH * 1.6)
+
+                $onWhat = Get-ClassAt $spot.X $spot.Y
+                Assert ($onWhat -eq 'WordTabStrip') "the TabGhost=0 drag starts on the strip, not on `"$onWhat`""
+
+                $sawGhost  = $true
+                $cursorOut = [IntPtr]::Zero
+                try {
+                    [WordLayout]::DragHold($spot.X, $spot.Y, $slot1.X, $spot.Y, 10, 70)
+                    [WordLayout]::DragMoveTo($slot1.X, $spot.Y, $slot1.X, $wayBelow, 10, 60)
+                    Start-Sleep -Milliseconds 400
+                    $sawGhost  = ($null -ne (Get-WordTabGhost))
+                    $cursorOut = [WordLayout]::CursorShape()
+                }
+                finally {
+                    [WordLayout]::DragRelease($slot1.X, $wayBelow)
+                }
+                Start-Sleep -Milliseconds 1500
+
+                # Half one: the gesture is exactly what it was. Both of these have to hold, or the
+                # section below is asserting the absence of a card in a drag that did nothing.
+                Assert (@(Get-LogSince 'drag left the row').Count -ge 1) `
+                    'the tab still comes out of the row with the card switched off'
+                Assert ($cursorOut -eq [WordLayout]::SystemCursor(32646)) `
+                    'and the pointer still says so - IDC_SIZEALL, unchanged'
+
+                # Half two: and the only thing missing is the picture.
+                Assert (-not $sawGhost) 'and nothing at all is carried under the pointer'
+                Assert (@(Get-LogSince 'ghost').Count -eq 0) 'the add-in never even made the window'
+
+                # Put the torn-off window back, so this section leaves the same two-window fixture it
+                # found. A leftover window here would be the last thing the suite does before Word is
+                # closed, and Word persists what it is left with.
+                $tornOff = @(Get-Frames)
+                Write-Note "windows after the TabGhost=0 tear-off: $($tornOff.Count)"
+            }
+        }
+    } finally {
+        if ($hadGhost) {
+            Set-ItemProperty -Path $switchKey -Name 'TabGhost' -Value $oldGhost -Type DWord
+        } elseif (Test-Path $switchKey) {
+            Remove-ItemProperty -Path $switchKey -Name 'TabGhost' -ErrorAction SilentlyContinue
+        }
+        $restored = Get-ItemProperty -Path $switchKey -Name 'TabGhost' -ErrorAction SilentlyContinue
+        $nowIs = if ($restored -and ($restored.PSObject.Properties.Name -contains 'TabGhost')) { $restored.TabGhost } else { '(absent)' }
+        Write-Note "TabGhost restored to $nowIs"
     }
 }
 

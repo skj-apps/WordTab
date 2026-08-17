@@ -61,6 +61,7 @@ $Switches = @(
     @{ Name = 'TabDot';         Does = 'Show a dot instead of the x on a document with unsaved changes. Off, WordTab never asks Word about your documents.' }
     @{ Name = 'TabKeys';        Does = 'Ctrl+Tab and Ctrl+Shift+Tab step along the tab row. TURN THIS OFF if you need Ctrl+Tab to type a tab inside a table.' }
     @{ Name = 'TabTip';         Does = 'Resting the pointer on a tab shows the document''s full name and the folder it is in. Off, WordTab never asks Word where your documents live.' }
+    @{ Name = 'TabGhost';       Does = 'While a tab is dragged clear of the row, carry a picture of it under the pointer. Off, the row letting go and the cursor are the only feedback.' }
     @{ Name = 'ShowLoadBanner'; Does = 'A dialog at Word startup confirming WordTab loaded. Off by default from the installer.' }
 )
 

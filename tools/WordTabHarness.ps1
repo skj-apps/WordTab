@@ -430,6 +430,7 @@ $script:WordChromeClasses = @(
 # Close-AllWord uses to decide whether it may keep closing windows.
 $script:WordTabClasses = @(
     'WordTabTip',      # the hover tooltip: a document's full name and the folder it is in
+    'WordTabGhost',    # the tab card carried under the pointer while one is out of the row
     'WordTabStrip'     # a child today, but it is ours and the answer must not depend on that
 )
 
@@ -495,17 +496,41 @@ function Get-WordDialog {
   one is created on the first hover of a frame and then hidden and re-shown for the rest of the
   session. A test that asked whether the window existed would pass forever after the first hover.
 #>
-function Get-WordTabTip {
+
+# The add-in's own visible top-level window of a given class, or $null.
+#
+# Shared by the tooltip and the carried-tab ghost rather than written twice. They ask the same
+# question of the same enumeration and differ only in what is worth reading off the answer - and a
+# second copy of "find our window" is the shape this project has already been bitten by three times
+# over (see one-copy-of-what-decides-truth). Geometry only: anything class-specific is added by the
+# caller on top of this.
+function Get-OurTopLevel($class) {
     foreach ($id in @(Get-WordPidList)) {
         foreach ($w in [WordLayout]::TopLevel($id)) {
-            if ($w.Class -ne 'WordTabTip') { continue }
+            if ($w.Class -ne $class) { continue }
             if (-not $w.Visible) { continue }
+            return [pscustomobject]@{
+                Hwnd   = $w.Hwnd
+                Pid    = $id
+                Left   = $w.Left;  Top    = $w.Top
+                Right  = $w.Right; Bottom = $w.Bottom
+                Width  = $w.Right - $w.Left
+                Height = $w.Bottom - $w.Top
+            }
+        }
+    }
+    return $null
+}
+
+function Get-WordTabTip {
+    $w = Get-OurTopLevel 'WordTabTip'
+    if ($null -eq $w) { return $null }
 
             $text  = [WordLayout]::TitleOf($w.Hwnd)
             $lines = @($text -split "`n")
             return [pscustomobject]@{
                 Hwnd   = $w.Hwnd
-                Pid    = $id
+                Pid    = $w.Pid
                 Text   = $text
                 Lines  = $lines
                 # NOT @(... | Select-Object -First 1). The array wrapper survives the assignment and
@@ -516,13 +541,15 @@ function Get-WordTabTip {
                 Folder = $(if ($lines.Count -gt 1) { $lines[1] } else { '' })
                 Left   = $w.Left;  Top    = $w.Top
                 Right  = $w.Right; Bottom = $w.Bottom
-                Width  = $w.Right - $w.Left
-                Height = $w.Bottom - $w.Top
+                Width  = $w.Width
+                Height = $w.Height
             }
-        }
-    }
-    return $null
 }
+
+# The tab card carried under the pointer while one is dragged clear of the row. Geometry only -
+# unlike the tooltip it has no text to read, because what it says it says by being a picture of a
+# tab.
+function Get-WordTabGhost { return Get-OurTopLevel 'WordTabGhost' }
 
 <#
   Wait for the tooltip to be on screen, or to be gone, and report how long it took.
@@ -546,21 +573,40 @@ function Wait-WordTabTip {
     # to be ABSENT and "$null" would then mean both "it went, as asked" and "it never went". Those are
     # a pass and a failure, and a function that returns the same value for both is the shape of test
     # that reports the wrong thing.
+    $r = Wait-OurWindow -Get { Get-WordTabTip } -Present $Present -Seconds $Seconds -What $What
+    return [pscustomobject]@{ Ok = $r.Ok; Tip = $r.Window; Ms = $r.Ms }
+}
+
+# The waiting itself, shared. See Wait-WordTabTip above for why it is bounded, why it prints the
+# latency, and why it returns a result object rather than the window - all three apply unchanged to
+# any window of ours that comes and goes.
+function Wait-OurWindow {
+    param([scriptblock]$Get, [bool]$Present, [int]$Seconds = 5, [string]$What = 'our window')
+
     $started  = Get-Date
     $deadline = $started.AddSeconds($Seconds)
     while ((Get-Date) -lt $deadline) {
-        $tip = Get-WordTabTip
-        if (($null -ne $tip) -eq $Present) {
+        $found = & $Get
+        if (($null -ne $found) -eq $Present) {
             $ms = [int]((Get-Date) - $started).TotalMilliseconds
             Write-HarnessNote ("{0}: {1} after {2}ms" -f $What, $(if ($Present) { 'up' } else { 'gone' }), $ms)
-            return [pscustomobject]@{ Ok = $true; Tip = $tip; Ms = $ms }
+            return [pscustomobject]@{ Ok = $true; Window = $found; Ms = $ms }
         }
         Start-Sleep -Milliseconds 100
     }
 
     $ms = [int]((Get-Date) - $started).TotalMilliseconds
     Write-HarnessNote ("{0}: still {1} after {2}ms" -f $What, $(if ($Present) { 'absent' } else { 'up' }), $ms)
-    return [pscustomobject]@{ Ok = $false; Tip = (Get-WordTabTip); Ms = $ms }
+    return [pscustomobject]@{ Ok = $false; Window = (& $Get); Ms = $ms }
+}
+
+# The ghost has no appearance delay of its own - it is put up in the same message that decides the
+# tab has left the row - so the default here is short on purpose. A ghost that needs three seconds
+# to appear is a defect, not a slow machine, and a generous timeout would hide it.
+function Wait-WordTabGhost {
+    param([bool]$Present, [int]$Seconds = 3, [string]$What = 'the carried tab')
+    $r = Wait-OurWindow -Get { Get-WordTabGhost } -Present $Present -Seconds $Seconds -What $What
+    return [pscustomobject]@{ Ok = $r.Ok; Ghost = $r.Window; Ms = $r.Ms }
 }
 
 <#
@@ -1310,6 +1356,15 @@ if ($script:HarnessSelfTest) {
     # nothing but the class name keeps it out of `question`.
     Check ((Get-WordWindowKind 'WordTabTip' 917 92) -eq 'ours')  "WordTab's tooltip is ours, not a question"
     Check ((Get-WordWindowKind 'WordTabStrip' 1400 48) -eq 'ours') "WordTab's strip is ours, not a question"
+
+    # The carried tab, at the two sizes that bracket it: a full-width card at 200%, and a card in a
+    # row squeezed to its minimum. **The second one is the point.** It is 78x72 here, UNDER the
+    # 150x60 floor on its width, so it would be called `chrome` rather than `question` and the run
+    # would not stop - but it would be called chrome for the wrong reason, and the day the floor
+    # moves it becomes a question in the middle of every tear-off drag. The class name is what keeps
+    # it out, at every size, which is exactly the lesson the tooltip cost.
+    Check ((Get-WordWindowKind 'WordTabGhost' 448 72) -eq 'ours') "WordTab's carried tab is ours, not a question"
+    Check ((Get-WordWindowKind 'WordTabGhost' 78 72) -eq 'ours')  'and it is still ours when the row has squeezed it below the size floor'
 
     $total = $script:selfPass + $script:selfFail
     Write-Host ''

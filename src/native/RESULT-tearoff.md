@@ -454,3 +454,124 @@ the menu to put it back, and a drag onto another window's tab row is not somethi
 - **Rejoining is gated on stacking being on, not on `TabTearOff`.** With tearing off switched off
   nothing can be outside the stack in the first place, so the case cannot arise — but it is a
   reasoned answer rather than a measured one.
+
+---
+
+# The tab you are carrying
+
+**Passed 2026-08-17.** `check-reorder` 102 → 118 checks, harness self-test 30 → 32. **No new suite
+and no new probe** — the tear-off section already drove the gesture out of the row, back into it, and
+out again, which is exactly the three states this has.
+
+## The gap this closes, in the words both halves of this file used
+
+The mechanism half said it, and the gesture half said it again:
+
+> The feedback is the row letting go plus `IDC_SIZEALL`, and the honest limitation is stated: a tab
+> out of the row is over Word's document where the strip may not paint, so there is **no floating
+> window preview** the way a browser does it.
+
+It is worse than "no preview", and the code says so plainly. Out past the threshold the carried tab
+is drawn **in the row, in the slot it came from, and deliberately not moving** — the torn branch of
+`DragMove` stops updating `g_dragLeft` and stops repainting. So the pointer walks away from a picture
+of the tab it is supposedly holding, and the only thing that moves with the hand is a cursor shape.
+
+Now a card comes with it: one tab, painted by the same `DrawOneTab` the row paints a lifted tab with,
+in a small popup owned by the frame.
+
+## Decisions worth not re-deriving
+
+- **A WINDOW, NOT SOMETHING DRAWN INTO THE STRIPS, AND THE REASON IS A MEASUREMENT THIS FILE ALREADY
+  CONTAINS.** A carried tab *inside* the row repaints every strip in the stack on every mouse-move,
+  which the gesture slice measured leaving the add-in a second behind the pointer — and which is
+  precisely why the torn branch stopped doing that work. Moving a popup is one `SetWindowPos` that
+  repaints nothing: not the strips, not Word. **The feedback that was missing went on the side of the
+  gesture that had spare time, not the side that did not.** Had it been drawn into the row, this
+  feature would have re-created the defect the last slice removed.
+- **`WS_EX_TRANSPARENT` is load-bearing here, not tidiness.** The tooltip wants it so the pointer can
+  pass through; this window is *under the pointer for the whole gesture*, and **the drop is resolved
+  with `WindowFromPoint`**. A card that answered for itself would make every tear-off and every
+  rejoin land on the thing being dragged rather than on what it was aimed at. Same three flags as the
+  tooltip — `TOOLWINDOW | NOACTIVATE | TRANSPARENT` — for what turns out to be a sharper reason.
+- **It is the width of the tab it came from, including a squeezed one.** The card is built from
+  `layout.tab[home]`, so in an overflowing row it is as narrow as the row made it. A fixed size would
+  look wrong in exactly the case where the user is most likely to be reorganising: too many documents
+  open.
+- **Held at the point it was grabbed by** — the same `g_dragGrabDx` the row carries a tab with, and
+  `g_dragPressY` for the other axis. The moment the row lets go is already the instant when the most
+  changes at once; a card that also jumped under the hand would read as the drag having gone wrong.
+  Asserted rather than assumed: grabbed 51px in, holding the card 51px in.
+- **Its own DIB per paint, not the strip's.** `EnsureSurface` keeps exactly one buffer per strip and
+  rebuilds it whenever the size asked for changes, so borrowing it at a different size would throw
+  the row's buffer away and rebuild it on every paint for the length of the drag. A card is painted
+  when it appears and not again — moving a window does not repaint its contents — so a per-paint DIB
+  is the cheaper of the two.
+- **An opaque window with the strip's own background around the card, and that is a choice.** The
+  margin exists because `SurfLift`'s shadow reaches 4 logical px past the card and would otherwise be
+  drawn into pixels the window does not own, leaving it square-edged at the bottom — the one part of
+  it that says it is off the row. Photographed over Word's workspace it reads as a piece of the row
+  being carried. **The alternative is `UpdateLayeredWindow` with per-pixel alpha**, which would let
+  the margin vanish and the shadow stay soft; it is not done because the compositing here writes
+  colour and does not track coverage, so the alpha channel would have to be threaded through
+  `SurfFill`/`Blend`/`SurfLift` — a change to the shared painter for a margin, on the day of an
+  install.
+- **No card on the REJOIN drag, deliberately.** Dragging a lone window's tab towards a stack already
+  has something on screen representing the thing being dragged: the window itself. Tear-off is the
+  case where the row has let go and *nothing* does. The card is needed in one and would be a second
+  picture of a visible window in the other.
+- **New switch `TabGhost`** (default 1), and it is the one switch here whose `0` removes feedback
+  rather than behaviour — the gesture is untouched. It exists because this draws over Word's document
+  with a window the add-in owns, which is the kind of thing that renders badly on a machine nobody
+  has tried; tear-off should not have to be given up over it.
+- **Driving `TabGhost=0` needed its own Word restart, and folding it into the `TabTearOff=0` section
+  would have been a check that passes whatever the switch does.** With tearing off refused the tab
+  never leaves the row at all, so "nothing is carried" is true there for a reason that has nothing to
+  do with this switch. The assertion is a **pair**: the tab still comes out of the row *and* the
+  pointer still shows `IDC_SIZEALL` (the gesture is untouched), **and** nothing is carried and the
+  add-in never even created the window. Either half alone is satisfied by something being broken.
+- **The control is the first assertion, not the last.** "A card is on screen" proves nothing without
+  a moment in the same gesture where there is not one — so the suite asserts there is nothing carried
+  while the drag is still in the row, and asserts it *after* the row has been rearranged, so the drag
+  is provably real at that point.
+- **Following is asserted as a DELTA against the pointer's own delta**, not as a position. A card
+  parked at a fixed offset from the strip would satisfy a position check. Measured: pointer moved
+  180px, card moved 180px.
+- **Both harness readers are one function.** `Get-OurTopLevel` finds the add-in's own visible
+  top-level window of a class, and the tooltip and the card share it; `Wait-OurWindow` is the bounded
+  wait with the latency print, shared the same way. Two copies of "find our window" is the shape
+  [[one-copy-of-what-decides-truth]] is about, and this project has paid for it three times.
+- **THE SELF-TEST CHECKS THE CARD AT A SIZE THAT IS UNDER THE HARNESS'S SIZE FLOOR, AND THAT IS THE
+  INTERESTING ONE.** A card in a squeezed row is 78x72 here — narrower than the 150x60 floor — so it
+  would be classified `chrome` rather than `question` and would not stop a run. **But it would be
+  right for the wrong reason**, and the day that floor moves it becomes a `question` in the middle of
+  every tear-off drag, which is the exact failure the tooltip cost a slice to find. The class name is
+  what keeps it out, at every size, and now that is asserted at both.
+
+## What it measured
+
+```
+carried tab (627,783 170x66)  from a 154px tab at 192 dpi, shadow 8px
+grabbed 51px into the tab; the pointer is holding the card 51px in
+pointer moved 180px, the card moved 180px
+the carried tab: up after 8ms / gone after 4ms / up after 4ms / gone after 6ms
+```
+
+`170 = 154 + 8 * 2`, and the four latencies are the row letting go, taking it back, letting go again,
+and the release.
+
+## Two mistakes of mine, both in the drive script rather than the product
+
+Worth writing down because both produced a symptom that looked exactly like a broken threshold.
+
+1. **Client and screen coordinates mixed in one expression.** `Children()` answers in frame-client
+   space and `RectOf()` in screen space; taking the strip's bottom from the first and adding it to a
+   point aimed at the second put the pointer 180px from where it was meant to be. The add-in
+   correctly reported the tab leaving the row *upwards*, and the "come back into the row" step never
+   came back, so the card correctly never hid. **Three assertions would have been reported against
+   the product.**
+2. **The strip was taken from whichever frame enumerated first, not from the foreground one.** Every
+   stacked window has a strip and they share a rectangle — until one does not, and a leftover window
+   from an earlier run made the measured tab rect belong to a window that was not in front. The Y
+   offset it produced was 78px of nothing. [[word-lays-out-only-focused-window]], in the test rig
+   rather than the product.
+

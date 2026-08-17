@@ -169,6 +169,7 @@ enum { CMD_NEW = 1, CMD_SAVE, CMD_CLOSE, CMD_CLOSE_OTHERS, CMD_CLOSE_ALL, CMD_CL
 static const wchar_t* const kWwfClass    = L"_WwF";
 static const wchar_t* const kStripClass  = L"WordTabStrip";
 static const wchar_t* const kTipClass    = L"WordTabTip";
+static const wchar_t* const kGhostClass  = L"WordTabGhost";
 
 // Our link in `_WwF`'s subclass chain. Distinct from the frame's - see frames.cpp.
 static const UINT_PTR kWwfSubclassId = 0x57544143;   // 'WTAC'
@@ -189,6 +190,7 @@ struct StripState
     HWND  wwf;           // Word's document frame, subclassed by us
     HWND  strip;         // ours, a child of the frame
     HWND  tip;           // ours, a popup owned by the frame; created the first time one is needed
+    HWND  ghost;         // ours, the tab card carried under the pointer once the row has let go
 
     int   stripH;        // STRIP_LOGICAL_H scaled to this window's DPI
     int   dpi;
@@ -314,6 +316,7 @@ static BOOL g_scrollEnabled = TRUE;      // HKCU\Software\WordTab\TabScroll
 static BOOL g_titleTrimEnabled = TRUE;   // HKCU\Software\WordTab\TabTitleTrim
 static BOOL g_dotEnabled = TRUE;         // HKCU\Software\WordTab\TabDot
 static BOOL g_tipEnabled = TRUE;         // HKCU\Software\WordTab\TabTip
+static BOOL g_ghostEnabled = TRUE;       // HKCU\Software\WordTab\TabGhost
 
 // ---------------------------------------------------------------------------------------------
 // How far the row is scrolled.
@@ -2691,6 +2694,264 @@ static void PaintStrip(StripState* state, HWND hwnd)
 }
 
 // ---------------------------------------------------------------------------------------------
+// The carried tab, once the row has let go of it.
+//
+// Dragging a tab clear of the strip takes its document out into a window of its own, and until now
+// the only two things that said so were the row snapping back to its pick-up order and the cursor
+// becoming IDC_SIZEALL. Both halves of the tear-off writeup name the same gap in the same words: a
+// browser shows the thing being carried, and this showed a cursor. It is worse than it sounds,
+// because out there the tab is drawn *in the row, in the slot it came from, not moving* - so the
+// pointer walks away from a picture of the tab it is supposedly holding.
+//
+// This is that picture: one tab card, painted by the same DrawOneTab the row paints a lifted tab
+// with, in a small popup that follows the pointer.
+//
+// **It costs nothing per mouse-move in the strip, and that is why it is a window rather than
+// something drawn into the strips.** A carried tab INSIDE the row repaints every strip in the stack
+// on every movement - measured, in the gesture slice, leaving the add-in a second behind the hand -
+// which is exactly why the torn branch of DragMove stopped doing that work. Moving a popup is one
+// SetWindowPos that repaints nothing: not the strips, not Word. The feedback that was missing is
+// added on the side of the gesture that had spare time, not the side that did not.
+//
+// Owned by the frame, and WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW for the tooltip's
+// three reasons - no taskbar button, no Alt+Tab entry, the pointer passes through. Here the third is
+// not cosmetic: **the drop is resolved with WindowFromPoint**, and a window sitting under the cursor
+// that answered for itself would make every tear-off and every rejoin land on the thing being
+// dragged rather than on what it was aimed at.
+// ---------------------------------------------------------------------------------------------
+
+static ATOM g_ghostClass = 0;
+
+// The one ghost that can be up, and the strip carrying it. Global for the same reason the drag is:
+// there is one pointer, so there is one tab being carried. The *window* is per strip, because a
+// popup's owner is fixed at creation and each strip belongs to a different frame.
+static HWND g_ghostStrip = NULL;
+
+// Where the close button sits inside the card, so the ghost draws the same tab the row drew rather
+// than a second guess at where a close button goes. Empty when that tab had none - a tab squeezed
+// below the width that fits one, or a document with unsaved changes showing its dot instead.
+static RECT g_ghostClose = { 0, 0, 0, 0 };
+
+static void GhostStop(void)
+{
+    if (g_ghostStrip && IsWindow(g_ghostStrip))
+    {
+        StripState* state = FindByStrip(g_ghostStrip);
+        if (state && state->ghost && IsWindow(state->ghost) && IsWindowVisible(state->ghost))
+        {
+            ShowWindow(state->ghost, SW_HIDE);
+            LogWrite(L"ghost  hwnd=0x%p  put away", (void*)state->frame);
+        }
+    }
+    g_ghostStrip = NULL;
+    SetRectEmpty(&g_ghostClose);
+}
+
+static void DrawGhost(StripState* state, HDC dc, const RECT* client)
+{
+    int w = client->right - client->left;
+    int h = client->bottom - client->top;
+    if (w <= 0 || h <= 0 || !g_dragFrame)
+        return;
+
+    // Its own buffer rather than the strip's. EnsureSurface keeps exactly one DIB per strip and
+    // rebuilds it whenever the size asked for changes, so borrowing it here - at a different size -
+    // would throw the row's buffer away and rebuild it on every paint for the length of the drag.
+    // This one is made and destroyed per paint, which is affordable because a ghost is painted when
+    // it appears and not again: moving a window does not repaint its contents.
+    BITMAPINFO info;
+    memset(&info, 0, sizeof(info));
+    info.bmiHeader.biSize        = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth       = w;
+    info.bmiHeader.biHeight      = -h;             // top-down, so row 0 is the top one
+    info.bmiHeader.biPlanes      = 1;
+    info.bmiHeader.biBitCount    = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    HDC mem = CreateCompatibleDC(dc);
+    if (!mem)
+        return;
+
+    void*   bits = NULL;
+    HBITMAP dib  = CreateDIBSection(mem, &info, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!dib || !bits)
+    {
+        if (dib) DeleteObject(dib);
+        DeleteDC(mem);
+        return;
+    }
+    HBITMAP oldBitmap = (HBITMAP)SelectObject(mem, dib);
+
+    Surface surface;
+    surface.bits = (BYTE*)bits;
+    surface.w    = w;
+    surface.h    = h;
+    surface.dc   = mem;
+    SurfClip(&surface, NULL);
+
+    // The strip's own background, so what is carried reads as a piece of the row rather than as a
+    // card floating on nothing. It is also what the lifted card's shadow is composited against, and
+    // the shadow is the only thing here that says the tab has been picked up.
+    SurfFill(&surface, client, g_palette.back);
+
+    HGDIOBJ oldFont = SelectObject(mem, state->font ? (HGDIOBJ)state->font
+                                                    : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(mem, TRANSPARENT);
+
+    int spread = Scaled(LIFT_LOGICAL_SPREAD, state->dpi);
+
+    RECT card;
+    card.left   = client->left + spread;
+    card.right  = client->right - spread;
+    card.top    = client->top;
+    card.bottom = client->bottom - spread;
+
+    RECT close = g_ghostClose;
+    if (!IsRectEmpty(&close))
+        OffsetRect(&close, card.left, card.top);
+
+    // Exactly the arguments the row uses for the tab it is carrying - selected, hot, lifted, and
+    // `first` so no separator rule is drawn against an edge that has no neighbour. Index -1: the
+    // name-was-cut record is a fact about a slot in the row, and this card is not in one.
+    DrawOneTab(state, &surface, g_dragFrame, -1, card, close,
+               TRUE, TRUE, TRUE, TRUE, FrameModified(g_dragFrame));
+
+    SelectObject(mem, oldFont);
+
+    GdiFlush();
+    BitBlt(dc, client->left, client->top, w, h, mem, 0, 0, SRCCOPY);
+
+    SelectObject(mem, oldBitmap);
+    DeleteObject(dib);
+    DeleteDC(mem);
+}
+
+static LRESULT CALLBACK GhostWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    StripState* state = (StripState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    switch (msg)
+    {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+        if (state)
+        {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            if (dc)
+            {
+                RECT client;
+                GetClientRect(hwnd, &client);
+                DrawGhost(state, dc, &client);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        break;
+
+    // Photographable, for the same reason the strip and the tooltip are: a check script takes its
+    // pictures with PrintWindow, and DefWindowProc's answer to WM_PRINTCLIENT is an empty rectangle.
+    case WM_PRINTCLIENT:
+        if (state && wParam)
+        {
+            RECT client;
+            GetClientRect(hwnd, &client);
+            DrawGhost(state, (HDC)wParam, &client);
+            return 0;
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static BOOL GhostEnsure(StripState* state)
+{
+    if (state->ghost && IsWindow(state->ghost))
+        return TRUE;
+
+    state->ghost = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                                   kGhostClass, L"", WS_POPUP,
+                                   0, 0, 10, 10, state->frame, NULL, g_module, NULL);
+    if (!state->ghost)
+    {
+        LogWrite(L"ghost  hwnd=0x%p  CreateWindowEx FAILED (lastError=%lu)",
+                 (void*)state->frame, GetLastError());
+        return FALSE;
+    }
+
+    SetWindowLongPtrW(state->ghost, GWLP_USERDATA, (LONG_PTR)state);
+    return TRUE;
+}
+
+// Put the ghost under the pointer, creating and showing it the first time.
+//
+// `tab` and `close` are the rectangles the row would have drawn that tab with, in strip client
+// coordinates, so the card carried away is the size the card in the row was - including the squeezed
+// width of an overflowing row, which is the case where a fixed size would look most wrong.
+static void GhostFollow(StripState* state, HWND strip, const RECT* tab, const RECT* close)
+{
+    if (!g_ghostEnabled || !state || !tab)
+        return;
+
+    POINT cursor;
+    if (!GetCursorPos(&cursor))
+        return;
+
+    int spread = Scaled(LIFT_LOGICAL_SPREAD, state->dpi);
+    int cardW  = tab->right - tab->left;
+    int cardH  = tab->bottom - tab->top;
+    if (cardW <= 0 || cardH <= 0)
+        return;
+
+    // Wider and taller than the card by the shadow's reach, or the lift is drawn into pixels the
+    // window does not own and the card comes out square-edged at the bottom - which is the one part
+    // of it that says it is off the row rather than in it.
+    int w = cardW + spread * 2;
+    int h = cardH + spread;
+
+    BOOL fresh = (g_ghostStrip != strip);
+    if (fresh)
+    {
+        if (!GhostEnsure(state))
+            return;
+        g_ghostStrip = strip;
+    }
+
+    if (close && !IsRectEmpty(close))
+    {
+        g_ghostClose = *close;
+        OffsetRect(&g_ghostClose, -tab->left, -tab->top);
+    }
+    else
+    {
+        SetRectEmpty(&g_ghostClose);
+    }
+
+    // Carried from the point inside the tab that was grabbed - the same g_dragGrabDx the row uses,
+    // and g_dragPressY for the other axis - so the card does not jump under the hand at the moment
+    // the row lets go of it. That instant is already the one where the most changes at once.
+    int x = cursor.x - g_dragGrabDx - spread;
+    int y = cursor.y - g_dragPressY;
+
+    SetWindowPos(state->ghost, HWND_TOP, x, y, w, h,
+                 SWP_NOACTIVATE | (fresh ? SWP_SHOWWINDOW : 0));
+
+    if (fresh)
+    {
+        // Once per gesture, not per movement. The position is deliberately absent: it changes with
+        // every mouse message and the log is read by eye.
+        LogWrite(L"ghost  hwnd=0x%p  carrying 0x%p  (%dx%d, grabbed %dpx in)",
+                 (void*)state->frame, (void*)g_dragFrame, w, h, g_dragGrabDx);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The context menu, owner-drawn.
 //
 // A Win32 popup menu is a system menu. It takes its colours from the system, and on Windows 11 the
@@ -3171,6 +3432,7 @@ static void DragCursor(const wchar_t* which)
 static void DragForget(void)
 {
     DragScrollStop();
+    GhostStop();
     if (g_dragTorn || g_dragJoin)
         DragCursor(IDC_ARROW);
     g_dragStrip = NULL;
@@ -3208,6 +3470,7 @@ static void DragUndo(HWND hwnd, const wchar_t* why)
     g_dragOnto  = NULL;
     g_dragOntoKnown = FALSE;
     DragScrollStop();
+    GhostStop();
 
     if (!was || !frame || !IsWindow(frame))
         return;
@@ -3439,6 +3702,9 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
         }
         else
         {
+            // The row has taken it back, so the thing following the pointer would now be a second
+            // copy of a tab that is in the row again and moving with the hand by itself.
+            GhostStop();
             DragScrollStart(hwnd);
             LogWrite(L"strip  hwnd=0x%p  drag back in the row - letting go now reorders 0x%p"
                      L"  (%dpx outside a %dpx strip, threshold %d)",
@@ -3473,6 +3739,13 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
             g_dragLeft = layout.tab[home].left;
             StripRefreshTabs();
         }
+
+        // ...and the one thing out here that DOES move with the pointer. Every move, because that is
+        // the whole of what it is for - and it is one SetWindowPos, which is why the paragraph above
+        // can go on refusing to repaint the row.
+        if (home >= 0)
+            GhostFollow(state, hwnd, &layout.tab[home], &layout.close[home]);
+
         return;
     }
 
@@ -4973,6 +5246,19 @@ static void Restore(StripState* state)
         state->tip = NULL;
     }
 
+    // Same order and the same reason as the tooltip above: GhostStop reaches its state through the
+    // strip handle. DragForget a few lines up has already called it for the drag that was running,
+    // but a ghost can be up on a strip that is not the one holding the capture - every window in the
+    // stack has one - so this is not the same test.
+    if (state->strip && g_ghostStrip == state->strip)
+        GhostStop();
+
+    if (state->ghost && IsWindow(state->ghost))
+    {
+        DestroyWindow(state->ghost);
+        state->ghost = NULL;
+    }
+
     if (state->strip && IsWindow(state->strip))
     {
         DestroyWindow(state->strip);
@@ -5407,6 +5693,13 @@ void StripStart(void)
     // that objects to being asked has to be able to stop the asking without giving up the tabs.
     g_tipEnabled = WordTabReadFlag(L"TabTip", TRUE);
 
+    // The card carried under the pointer while a tab is out of the row. Off, the gesture is exactly
+    // what it was before - the row lets go and the cursor changes - so this is the one switch here
+    // whose `0` removes feedback rather than behaviour. It exists because it draws over Word's
+    // document with a window this add-in owns, and that is the kind of thing a machine somewhere
+    // will render badly; the tear-off itself should not have to be given up over it.
+    g_ghostEnabled = WordTabReadFlag(L"TabGhost", TRUE);
+
     if (!g_stripClass)
     {
         WNDCLASSEXW wc;
@@ -5437,6 +5730,29 @@ void StripStart(void)
         g_tipClass = RegisterClassExW(&wc);
     }
 
+    // No CS_DROPSHADOW: the carried card draws its own lift, and a system shadow under it would be a
+    // second shadow at a different offset. No CS_SAVEBITS either - that trades memory for the repaint
+    // of what is underneath, and this window moves continuously, so what is underneath is never the
+    // same twice.
+    //
+    // CS_HREDRAW | CS_VREDRAW, though, and it is not copied from the strip's class without thinking.
+    // The card is followed by SetWindowPos on every mouse-move at the SAME size, which invalidates
+    // nothing - so these cost nothing in the case that happens thousands of times. They matter in the
+    // one that is rare and silent: the row can re-lay out mid-drag, a tab's width with it, and
+    // without them the pixels the card gains are whatever was in the backing store.
+    if (!g_ghostClass)
+    {
+        WNDCLASSEXW wc;
+        memset(&wc, 0, sizeof(wc));
+        wc.cbSize        = sizeof(wc);
+        wc.style         = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc   = GhostWndProc;
+        wc.hInstance     = g_module;
+        wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+        wc.lpszClassName = kGhostClass;
+        g_ghostClass = RegisterClassExW(&wc);
+    }
+
     // Something has to be on the palette before the first paint. The registry answer, which is the
     // one available this early: no window of Word's exists yet to take a colour off. The janitor
     // replaces it with the sampled one within two seconds, and ApplyPalette does nothing at all if
@@ -5450,7 +5766,7 @@ void StripStart(void)
 
     LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s  "
              L"tab menu=%s  tab drag=%s  tab scroll=%s  tab style=%s  theme sample=%s  "
-             L"title trim=%s  dot=%s  tip=%s",
+             L"title trim=%s  dot=%s  tip=%s  ghost=%s",
              g_stripClass ? L"registered" : L"FAILED",
              g_janitor ? L"running" : L"FAILED", STRIP_LOGICAL_H,
              g_palette.dark ? L"dark" : L"light",
@@ -5462,7 +5778,8 @@ void StripStart(void)
              g_sampleEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabThemeSample=0)",
              g_titleTrimEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTitleTrim=0)",
              g_dotEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabDot=0)",
-             g_tipEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTip=0)");
+             g_tipEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTip=0)",
+             g_ghostEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabGhost=0)");
 }
 
 void StripAttachFrame(HWND frame)
