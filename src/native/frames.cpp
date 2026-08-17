@@ -271,7 +271,10 @@ static void TraceFlush(void)
 // ---------------------------------------------------------------------------------------------
 // Declared in wordtab.h and shared with strip.cpp: every switch WordTab has is a DWORD under the
 // same key, and one reader for all of them is one place for the "absent means default" rule.
-BOOL WordTabReadFlag(const wchar_t* name, BOOL defaultValue)
+// The numeric form, and the only one that touches the registry. Every switch WordTab has lives under
+// this one key, so the key and the absent-means-default rule are written once here rather than once
+// per return type - two entry points is the point (see the header), two reads would not be.
+DWORD WordTabReadNumber(const wchar_t* name, DWORD defaultValue)
 {
     DWORD value = 0;
     DWORD size = sizeof(value);
@@ -280,7 +283,15 @@ BOOL WordTabReadFlag(const wchar_t* name, BOOL defaultValue)
     {
         return defaultValue;
     }
-    return value != 0;
+    return value;
+}
+
+BOOL WordTabReadFlag(const wchar_t* name, BOOL defaultValue)
+{
+    // A value that is present and 0 is OFF even when the default is on - which is the whole point of
+    // every TabSomething=0 escape hatch - so the default is passed down as the number to return when
+    // the value is ABSENT, and the != 0 is applied to whatever comes back either way.
+    return WordTabReadNumber(name, defaultValue ? 1u : 0u) != 0;
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -327,3 +327,9 @@ void StackCloseToRight(HWND from);
 // fresh install behaves like a configured one. Used for the switches that must be flippable
 // without a rebuild.
 BOOL WordTabReadFlag(const wchar_t* name, BOOL defaultValue);
+
+// The same key and the same "absent means the default" rule, but the value kept as a number rather
+// than flattened to on/off. Separate from WordTabReadFlag rather than a parameter on it, because
+// every existing caller wants the boolean and a shared reader returning DWORD would put a
+// `!= 0` at seventeen call sites.
+DWORD WordTabReadNumber(const wchar_t* name, DWORD defaultValue);

@@ -379,6 +379,172 @@ if ($frames.Count -gt 1) {
     }
 }
 
+# ---- the same strip at four different scales -----------------------------------------------------
+#
+# Until this section existed, every scaled size in the add-in had only ever been computed at ONE
+# number. The dev rig runs at 192 and Windows offers its display exactly one scale factor - measured
+# with the private DisplayConfig scaling packet, which answers min == cur == max - so 96, 120 and 144
+# were unreachable here. The work rig is a laptop plus a 40" second monitor, which is where a second
+# DPI first happens, and it is the machine nobody here can reach.
+#
+# What this drives that nothing else did: `StripOnFrameDpiChanged`. That function had never executed,
+# on any rig, in the life of the project. It re-derives the height, the font, the corner radius, the
+# glyph stroke and the back buffer, takes down a tooltip measured at the old scale, and un-applies
+# the shift it made to `_WwF` at the old scale so the next layout can re-apply at the new one. All of
+# it was reasoned and none of it was run.
+#
+# WHAT THIS DOES NOT TEST, stated rather than discovered later: the trigger. In production the
+# trigger is WM_DPICHANGED arriving from Windows, and that message cannot be synthesised from another
+# process - it carries a suggested RECT by pointer and the frame proc chains it on to Word, which
+# would dereference an address from the wrong address space. So the override is the way in, and what
+# is covered is everything downstream of the two lines in frames.cpp that receive the message.
+#
+# It owns its own Word because the override has to be in the registry BEFORE StripStart reads it, and
+# it puts the machine back the same way it found it - the value removed, Word restarted, the strip
+# asserted to be at the scale Windows actually says. That last restart is not tidying; it is the
+# check that the restore worked, which is the only reason to run this before the closing section
+# rather than after it.
+
+Write-Step 'The strip at scales this machine does not run at'
+
+$dpiKey     = 'HKCU:\Software\WordTab'
+$realDpi    = [WordLayout]::Dpi($target)     # asked BEFORE any override is written
+$dpiDoc     = Join-Path $scratch 'wordtab-check-dpi.rtf'
+'{\rtf1\ansi WordTab DPI check.\par}' | Set-Content -Path $dpiDoc -Encoding Ascii
+
+Write-Note ("this display reports $realDpi dpi, and offers no other scale factor")
+
+try {
+    # Word has to go down and come back with the value already set. Close-AllWord rather than Kill,
+    # for the reason the closing section gives.
+    $down = Close-AllWord
+    if (-not $down.Closed) {
+        Assert $false ("DPI section - Word would not close ({0}), so this section cannot establish its own Word" -f $down.Reason)
+    } else {
+        # Start at the DPI the machine really is. Nothing about the strip differs from an ordinary
+        # run at this point, which is what makes the first measurement a control rather than a
+        # restatement of the override.
+        New-ItemProperty -Path $dpiKey -Name TabDpi -Value $realDpi -PropertyType DWord -Force | Out-Null
+
+        Set-LogMark
+        Start-Process -FilePath 'winword.exe' -ArgumentList "`"$dpiDoc`""
+        if (-not (Wait-WordReady 1 45)) {
+            Assert $false 'DPI section - Word did not come back up with a strip within 45s'
+        } else {
+            $dpiTarget = @(Get-WordFrameList)[0]
+            [WordLayout]::Focus($dpiTarget) | Out-Null
+            Start-Sleep -Milliseconds 1500
+
+            # The add-in must SAY it is overridden. Without this the whole section could pass by
+            # measuring a strip that was never overridden at all - every assertion below compares a
+            # height against a number computed from the same DPI, so an override that silently did
+            # nothing at $realDpi would look identical to one that worked.
+            Assert (@(Get-LogSince 'DPI FORCED to').Count -ge 1) `
+                ("DPI section - the add-in reports the override in force (TabDpi={0})" -f $realDpi)
+
+            # 32 logical px is STRIP_LOGICAL_H, and MulDiv rounds to nearest - the same rounding
+            # WordLayout::Scale uses, which is why the harness and the add-in can be compared at all.
+            function Get-ExpectedStripHeight($dpi) { return [int][Math]::Round(32.0 * $dpi / 96.0) }
+
+            $steps = @($realDpi, 96, 120, 144, $realDpi)
+            $previous = $null
+
+            foreach ($dpi in $steps) {
+                Set-ItemProperty -Path $dpiKey -Name TabDpi -Value $dpi
+
+                # The janitor is on a 500ms cadence and re-reads the override only when one was set
+                # at startup. Bounded wait on the thing itself rather than a sleep long enough to be
+                # safe: a fixed sleep hides the difference between reacting and being seconds behind.
+                $want = Get-ExpectedStripHeight $dpi
+                $arrived = Wait-Until {
+                    $l = Get-Layout $dpiTarget
+                    $l.Strip -and ($l.Strip.Bottom - $l.Strip.Top) -eq $want
+                } 8 200
+
+                $layout = Get-Layout $dpiTarget
+                $height = if ($layout.Strip) { $layout.Strip.Bottom - $layout.Strip.Top } else { -1 }
+
+                Assert $arrived ("{0} dpi - the strip re-scaled to {1}px (STRIP_LOGICAL_H 32 x {0}/96), measured {2}" -f `
+                                 $dpi, $want, $height)
+
+                # The harness has to agree with the add-in about the scale, and this is the ONLY
+                # place in the battery that can find out. WordLayout::Dpi carries its own copy of the
+                # override read - it must, because every slot it computes for a click is derived from
+                # it - and two copies of "what DPI is this" agree right up until one of them is
+                # wrong. Nothing else ever runs with TabDpi set, so without this line that second
+                # copy is never executed at all.
+                #
+                # It fails SILENTLY if it is ever broken, which is why it gets an assertion rather
+                # than trust: a bad RegGetValueW p/invoke returns non-zero, ForcedDpi answers 0, and
+                # Dpi falls through to asking Windows - which on this rig returns 192, the same
+                # number the override is set to for two of these five steps. Only the 96, 120 and 144
+                # steps can tell a working read from a dead one.
+                Assert ([WordLayout]::Dpi($dpiTarget) -eq $dpi) `
+                    ("{0} dpi - the harness reads the same override the add-in did (WordLayout::Dpi says {1})" -f `
+                     $dpi, [WordLayout]::Dpi($dpiTarget))
+
+                # The transition had to be REPORTED, and by the function under test. A height that
+                # happens to be right because Word rebuilt the window is a different thing from
+                # StripOnFrameDpiChanged having run.
+                if ($null -ne $previous -and $previous -ne $dpi) {
+                    $line = "DPI $previous -> $dpi, re-scaling the strip"
+                    Assert (@(Get-LogSince $line).Count -ge 1) `
+                        ("{0} -> {1} dpi - StripOnFrameDpiChanged ran and said so" -f $previous, $dpi)
+                }
+
+                # The seams. This is the assertion that a wrong scale would actually show up in: the
+                # strip has to still meet the document frame exactly and still sit directly under
+                # Word's ribbon, with no gap and no overlap, at every one of these sizes.
+                if ($layout.Strip -and $layout.Wwf) {
+                    Assert ($layout.Strip.Bottom -eq $layout.Wwf.Top) `
+                        ("{0} dpi - strip bottom {1} still meets document top {2}" -f $dpi, $layout.Strip.Bottom, $layout.Wwf.Top)
+                }
+                $place = Get-StripPlacement (@(Get-WordFrameList))
+                Assert ($place.Ok -and $place.Measured -ge 1) `
+                    ("{0} dpi - every strip still sits under Word's chrome ({1} measured){2}" -f `
+                     $dpi, $place.Measured, $place.Text)
+
+                $previous = $dpi
+            }
+        }
+    }
+}
+finally {
+    # The value goes whatever happened above, including a throw. A TabDpi left behind would make
+    # every suite after this one in the battery run against a strip built at a scale the machine is
+    # not at - and it would do it silently, because the add-in only mentions the override on the
+    # startup line nobody downstream reads.
+    Remove-ItemProperty -Path $dpiKey -Name TabDpi -ErrorAction SilentlyContinue
+}
+
+# And the restore, asserted rather than assumed. Word comes back with no override at all: the strip
+# must be at the scale Windows reports, and the add-in must have stopped claiming otherwise.
+$down = Close-AllWord
+if ($down.Closed) {
+    Set-LogMark
+    Start-Process -FilePath 'winword.exe' -ArgumentList "`"$dpiDoc`""
+    if (Wait-WordReady 1 45) {
+        $restored = @(Get-WordFrameList)[0]
+        [WordLayout]::Focus($restored) | Out-Null
+        Start-Sleep -Milliseconds 1500
+
+        $layout = Get-Layout $restored
+        $height = if ($layout.Strip) { $layout.Strip.Bottom - $layout.Strip.Top } else { -1 }
+        $want   = [int][Math]::Round(32.0 * $realDpi / 96.0)
+
+        Assert ($height -eq $want) `
+            ("restored - no override, strip back to {0}px at the display's own {1} dpi (measured {2})" -f $want, $realDpi, $height)
+        Assert (@(Get-LogSince 'DPI FORCED to').Count -eq 0) `
+            'restored - the add-in no longer reports a forced DPI'
+
+        $frames = @(Get-WordFrameList)
+    } else {
+        Assert $false 'restored - Word did not come back up after the override was removed'
+    }
+} else {
+    Assert $false ("restored - Word would not close to drop the override ({0})" -f $down.Reason)
+}
+
 # ---- pictures -------------------------------------------------------------------------------------
 
 if ($Screenshot) {

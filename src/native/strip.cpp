@@ -318,6 +318,12 @@ static BOOL g_dotEnabled = TRUE;         // HKCU\Software\WordTab\TabDot
 static BOOL g_tipEnabled = TRUE;         // HKCU\Software\WordTab\TabTip
 static BOOL g_ghostEnabled = TRUE;       // HKCU\Software\WordTab\TabGhost
 
+// Set once at StripStart, and only when HKCU\Software\WordTab\TabDpi already held a usable value.
+// It makes the janitor watch for that value changing; see the janitor for why the real event cannot
+// be used on a one-monitor rig. FALSE on every machine that has never set TabDpi, which is all of
+// them, so nothing below it runs in an ordinary install.
+static BOOL g_dpiWatch = FALSE;
+
 // ---------------------------------------------------------------------------------------------
 // How far the row is scrolled.
 //
@@ -463,8 +469,40 @@ static BOOL FrameModified(HWND frame)
 
 typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
 
+// HKCU\Software\WordTab\TabDpi - absent or 0 means "ask Windows", which is every real install.
+//
+// This exists because until it did, every scaled size in this file had only ever been computed at
+// one number. The dev rig runs at 192 and Windows offers exactly one scale factor for its display,
+// so 96 and 144 were unreachable here - measured, not assumed: the private DisplayConfig scaling
+// packet answers with min == cur == max. The work rig is a laptop plus a 40" second monitor, so it
+// is the machine where a second DPI first happens, and it is the machine nobody here can reach.
+//
+// Deliberately read on every call rather than cached at StripStart like the other switches, and the
+// re-reading is the whole point rather than an accepted cost: it is what lets a value written into
+// the registry mid-run change the answer, which is the only way StripOnFrameDpiChanged can be
+// reached on a rig with one monitor. That path had never executed on any rig before this.
+//
+// Note what this does NOT do: it does not let the real message be faked. WM_DPICHANGED cannot be
+// posted from another process at all - see the janitor for why - so the override is the way in, and
+// the janitor noticing the value change is the trigger that stands in for the message.
+//
+// Three call sites: a strip being built, a DPI change, and the janitor's watch. The first two are
+// rare. The third runs twice a second per strip, but only when TabDpi was already set when Word
+// started, so no ordinary install ever reaches it and none of them pays for this read.
+static int DpiOverride(void)
+{
+    DWORD forced = WordTabReadNumber(L"TabDpi", 0);
+    if (forced >= 72 && forced <= 480)
+        return (int)forced;
+    return 0;
+}
+
 static int DpiOf(HWND hwnd)
 {
+    int forced = DpiOverride();
+    if (forced)
+        return forced;
+
     static GetDpiForWindowFn fn = NULL;
     static BOOL looked = FALSE;
     if (!looked)
@@ -980,6 +1018,12 @@ static void ApplyMetrics(StripState* state)
     state->stripH = Scaled(STRIP_LOGICAL_H, state->dpi);
     MakeFont(state);
     ReleaseSurface(state);        // its size is in physical pixels, so it is DPI-dependent too
+
+    // The two numbers every other size in this file is derived from. Logged here rather than at the
+    // call sites because this is the one place they are set, and a suite that wants to know what
+    // scale a strip was built at should not have to infer it from a rectangle.
+    LogWrite(L"strip  hwnd=0x%p  metrics: dpi=%d  stripH=%dpx (%d logical)",
+             (void*)state->frame, state->dpi, state->stripH, STRIP_LOGICAL_H);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5449,6 +5493,19 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
         if (!state->enabled || !IsWindow(state->frame))
             continue;
 
+        // Only when a DPI override is configured, and configured means "was set before Word
+        // started". A machine with no TabDpi value never reaches this line and never pays the
+        // registry read, so production behaviour and production cost are both exactly unchanged.
+        //
+        // In production the trigger for a re-scale is WM_DPICHANGED, which is the real event and
+        // arrives on its own. This is here because a rig with one monitor cannot produce that
+        // event, and a synthetic one cannot be posted from another process: WM_DPICHANGED carries a
+        // suggested RECT by pointer, and the frame proc chains it on to Word, which would
+        // dereference an address from the wrong process. So the override is the way in, and it
+        // reaches the same StripOnFrameDpiChanged that the real message reaches.
+        if (g_dpiWatch && DpiOf(state->frame) != state->dpi)
+            StripOnFrameDpiChanged(state->frame);
+
         if (!state->wwf || !IsWindow(state->wwf))
         {
             TryBind(state);
@@ -5763,6 +5820,16 @@ void StripStart(void)
     // loop dispatches it to the callback like any other.
     if (!g_janitor)
         g_janitor = SetTimer(NULL, 0, 500, JanitorProc);
+
+    // The DPI override is reported separately and only when it is set. It is the one setting here
+    // that makes the add-in disagree with the machine on purpose, so a log that mentioned it on
+    // every ordinary startup would train the reader to skip the line that matters.
+    int forcedDpi = DpiOverride();
+    g_dpiWatch = forcedDpi ? TRUE : FALSE;
+    if (forcedDpi)
+        LogWrite(L"StripStart  DPI FORCED to %d by HKCU\\Software\\WordTab\\TabDpi - "
+                 L"the strip is being built at a scale this machine is not running at, and the "
+                 L"janitor is watching that value for changes", forcedDpi);
 
     LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s  "
              L"tab menu=%s  tab drag=%s  tab scroll=%s  tab style=%s  theme sample=%s  "

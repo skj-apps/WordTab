@@ -149,6 +149,7 @@ public static class WordTabDpi {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr mon, ref MONITORINFOEX info);
   [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr mon, int type, out uint x, out uint y);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
   [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
   public struct MONITORINFOEX {
@@ -156,7 +157,30 @@ public static class WordTabDpi {
     [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string szDevice;
   }
   public static string[] All() {
-    SetProcessDPIAware();
+    // PER-MONITOR aware, not merely SetProcessDPIAware(), and the difference is this whole section.
+    //
+    // What GetDpiForMonitor reports is gated by the DPI awareness of the CALLING process.
+    // Unaware -> 96 for everything. SYSTEM aware -> the system DPI for EVERY monitor. Only
+    // per-monitor awareness gets each monitor's own number. So SetProcessDPIAware() - system
+    // awareness - would have printed the SAME dpi against both screens of a two-monitor rig and the
+    // "different scaling" line below could never have fired. That is the exact question this
+    // section exists to answer, on the exact machine it exists for.
+    //
+    // WHAT WAS MEASURED HERE AND WHAT WAS NOT, because this rig has one screen and cannot show the
+    // whole thing. MEASURED: the gating is real - the same monitor reports 96 from Windows
+    // PowerShell 5.1 (DPI-unaware) and 192 from pwsh 7 (per-monitor aware in its manifest), and 5.1
+    // is what the target machine has. NOT MEASURED HERE, and it is documented behaviour rather than
+    // something this rig can demonstrate: that a SYSTEM-aware process gets the system DPI for every
+    // monitor rather than each one's own. On one screen the two are the same number, so the old call
+    // looked correct here and could only ever have been wrong on the machine it was written for.
+    // **If you are reading this on a two-monitor rig, that is the claim to check.**
+    //
+    // PER_MONITOR_AWARE_V2 is (IntPtr)-4. It is Windows 10 1703+; SetProcessDPIAware is the fallback
+    // for older, where there is one scaling for everything anyway and system awareness is right.
+    // Either call fails harmlessly if the host already declared an awareness.
+    try { if (!SetProcessDpiAwarenessContext(new IntPtr(-4))) SetProcessDPIAware(); }
+    catch { try { SetProcessDPIAware(); } catch {} }
+
     List<string> lines = new List<string>();
     EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate(IntPtr mon, IntPtr dc, IntPtr r, IntPtr d) {
       MONITORINFOEX mi = new MONITORINFOEX();
@@ -350,6 +374,35 @@ public static class WordTabWin {
         Say ("{0,-16} {1}" -f $s.Name, $(if ($null -eq $current) { 'on (default, no value set)' } elseif ($current -eq 0) { 'OFF' } else { "on ($current)" }))
     }
 
+    # Anything under the key that is NOT one of the switches above. The list is a list of things a
+    # user is offered, not a list of everything the add-in reads - TabDpi is read and deliberately
+    # not offered - so a report that printed only the list would be silent about exactly the values
+    # nobody expects to find set. This is the report that goes to a machine nobody here can reach,
+    # and a strip built at the wrong scale must not be missing from it.
+    if (Test-Path $Key) {
+        $known = $Switches | ForEach-Object { $_.Name }
+        # @() around the WHOLE pipeline. Filtering to exactly one name yields a bare string, and
+        # `.Count` on a bare string is 1 in some hosts, $null in others and a hard error under
+        # StrictMode - so the untouched version would have skipped this section silently in the one
+        # case it exists for, a single non-switch value called TabDpi. This report is read on a
+        # machine nobody here can reach, under whatever PowerShell it happens to have.
+        $extra = @(@(Get-Item $Key).GetValueNames() | Where-Object { $_ -and ($known -notcontains $_) })
+        if ($extra.Count -gt 0) {
+            Say ''
+            Say 'Values set here that are NOT ordinary switches:'
+            foreach ($name in $extra) {
+                Say ("{0,-16} {1}" -f $name, (Get-ItemProperty -Path $Key -Name $name).$name)
+            }
+            if ($extra -contains 'TabDpi') {
+                Say ''
+                Say 'TabDpi is set. The add-in is building the tab row at that scale INSTEAD of the'
+                Say 'one this machine is running at. It is a test and diagnostic override, not a'
+                Say 'setting - if you did not set it deliberately, remove it and restart Word:'
+                Say '  Remove-ItemProperty HKCU:\Software\WordTab TabDpi'
+            }
+        }
+    }
+
     Head 'The add-in''s log, in full'
     $logFile = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
     if (Test-Path $logFile) {
@@ -381,10 +434,25 @@ public static class WordTabWin {
 
 if ($Reset) {
     if (Test-Path $Key) {
+        # Every value under the key, not just the switches offered above. "Every WordTab setting
+        # removed" has to be true when it is printed, and the switch list is what a user is offered
+        # rather than everything the add-in reads - TabDpi is read and deliberately not offered. A
+        # reset that left it behind would leave the add-in building the row at a scale the machine is
+        # not running at, having just said it had put everything back.
+        $known = $Switches | ForEach-Object { $_.Name }
+        $extra = @(@(Get-Item $Key).GetValueNames() | Where-Object { $_ -and ($known -notcontains $_) })
+
         foreach ($s in $Switches) {
             Remove-ItemProperty -Path $Key -Name $s.Name -ErrorAction SilentlyContinue
         }
+        foreach ($name in $extra) {
+            Remove-ItemProperty -Path $Key -Name $name -ErrorAction SilentlyContinue
+        }
+
         Write-Host 'Every WordTab setting removed - all of them are back to their defaults.' -ForegroundColor Green
+        if ($extra.Count -gt 0) {
+            Write-Host ("Including {0} value(s) that are not ordinary switches: {1}" -f $extra.Count, ($extra -join ', ')) -ForegroundColor Yellow
+        }
     } else {
         Write-Host 'There were no WordTab settings to remove; everything is already at its default.' -ForegroundColor Green
     }

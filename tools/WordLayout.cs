@@ -147,8 +147,49 @@ public static class WordLayout
 
     // Windows 10 1607 and later. The rig runs at 150%, so anything that mirrors a DPI-scaled
     // layout computed inside the add-in needs this rather than an assumed 96.
+    //
+    // **It must consult HKCU\Software\WordTab\TabDpi for the same reason it calls GetDpiForWindow at
+    // all.** The code below this line is a second copy of the add-in's ComputeLayout - same pad, gap,
+    // minimum, desired, plus, close and chevron constants - and its whole job is to predict where the
+    // add-in put a tab so a suite can click it. The moment the add-in is told to build itself at a
+    // DPI the window is not running at, a harness that asks Windows instead is computing slots for a
+    // strip that does not exist, and every click lands somewhere else. Which is silent: the click
+    // still hits the row, just the wrong tab.
+    //
+    // So this reads the override first, exactly as DpiOf does in strip.cpp, and falls through to the
+    // system in the ordinary case where the value is absent.
     [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hwnd);
-    public static int Dpi(IntPtr hwnd) { uint d = GetDpiForWindow(hwnd); return d >= 72 ? (int)d : 96; }
+    public static int Dpi(IntPtr hwnd)
+    {
+        int forced = ForcedDpi();
+        if (forced != 0) return forced;
+        uint d = GetDpiForWindow(hwnd);
+        return d >= 72 ? (int)d : 96;
+    }
+
+    // Read on every call rather than cached, so a suite that steps the override mid-run gets the new
+    // answer without reloading the type - which it could not do anyway, since Add-Type is once per
+    // process.
+    //
+    // RegGetValueW rather than Microsoft.Win32.Registry: naming any assembly in Add-Type replaces
+    // PowerShell's default reference set, so every suite passes its own list, and reaching for the
+    // Registry class would mean editing all of them to add one more. This is the same call the
+    // add-in makes.
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    static extern int RegGetValueW(IntPtr hkey, string subKey, string value, uint flags,
+                                   IntPtr type, ref int data, ref uint size);
+
+    public static int ForcedDpi()
+    {
+        int data = 0;
+        uint size = 4;
+        IntPtr HKEY_CURRENT_USER = new IntPtr(unchecked((int)0x80000001));
+        const uint RRF_RT_REG_DWORD = 0x00000010;
+        int rc = RegGetValueW(HKEY_CURRENT_USER, @"Software\WordTab", "TabDpi",
+                              RRF_RT_REG_DWORD, IntPtr.Zero, ref data, ref size);
+        if (rc != 0) return 0;
+        return (data >= 72 && data <= 480) ? data : 0;
+    }
 
     public static void Close(IntPtr hwnd) { PostMessage(hwnd, 0x0010, IntPtr.Zero, IntPtr.Zero); }  // WM_CLOSE
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
