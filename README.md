@@ -7,8 +7,10 @@ each named after its document, in Word's own colours. Click a tab to switch. Dra
 row, or drag it clear of the row to pull that document out into a window of its own; drag it back to
 put it in again. Close a tab with its ×, or middle-click it. Press **+** for a new document.
 Ctrl+Tab and Ctrl+Shift+Tab step along the row. A document with unsaved changes shows a dot where its
-× is. The whole stack drags, resizes, maximizes and minimises as one window, with one taskbar button
-and one Alt+Tab entry.
+× is. Rest the pointer on a tab and it gives you the document's full name and the folder it is in —
+which is the thing you want once there are enough documents open for the names to be cut short. The
+whole stack drags, resizes, maximizes and minimises as one window, with one taskbar button and one
+Alt+Tab entry.
 
 ## Why it exists
 

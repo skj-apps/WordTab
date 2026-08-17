@@ -122,6 +122,18 @@ BOOL WordTabNewDocument(void);
 // whatever it had. A tick that failed to measure must not be able to pass for a measurement.
 BOOL WordTabReadModified(const HWND* frames, int count, BOOL* modified);
 
+// The folder holding the document behind one frame, written into `out` with no trailing separator.
+//
+// The same two failure shapes as WordTabReadModified, kept apart for the same reason:
+//
+// TRUE means Word answered. `out` is the folder, or an EMPTY STRING when there genuinely is none -
+// a document that has never been saved has no path, and a frame no window in the collection claims
+// is the Protected View case. Both are determinate answers about a document with no folder.
+//
+// FALSE means Word would not answer at all and `out` is empty. The caller must not draw that as
+// "this document has no folder": it is "nobody asked successfully".
+BOOL WordTabReadDocumentPath(HWND frame, wchar_t* out, int chars);
+
 // Save the document behind a tab, through Word's own Document.Save - so an unchanged document is
 // untouched and one that has never been saved gets Word's Save As dialog, exactly as Ctrl+S would.
 //

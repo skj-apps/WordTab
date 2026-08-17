@@ -525,6 +525,232 @@ if ($Screenshot) {
     Write-Note "row photographed to $(Join-Path $ShotDir 'wordtab-title-row.png')"
 }
 
+# ---- the tooltip -----------------------------------------------------------------------------
+#
+# **This suite owns the tooltip because the tooltip is about the name**, and everything that knows
+# what a tab is called is already here. It is also the only suite that has the three cases in one
+# room at once, without authoring a single new fixture:
+#
+#   - six saved documents in a folder, in a row narrow enough that their names are cut. That is the
+#     whole reason the feature exists, and it is not a contrivance: this is Word's own default window
+#     with seven documents in it
+#   - a document in **Protected View**, which lives in no collection this add-in can reach, so Word
+#     answers "no folder" for it. The tooltip is then one line rather than two, and the difference is
+#     measurable as a height
+#   - a document that has **never been saved**, whose name fits and which has no folder - so there is
+#     nothing the tooltip could say that is not already on the tab, and it does not appear at all
+#
+# **Placed here, upstream of Close Tabs to the Right, rather than appended at the end.** Two slices
+# running have now found a real defect that way and none has been found by a section that ran last.
+# Everything below this point keeps using the same Word.
+#
+# **Every tab is hovered and the answers are matched by name afterwards**, rather than assuming which
+# tab is which. The row order is the open order today; an assertion that depends on that is an
+# assertion about the stack's member array, which is check-reorder's subject and not this one's.
+
+Write-Step 'The tooltip: hovering every tab in the row'
+
+# **The row must not be scrolled, and this suite does not otherwise care how wide Word is - which is
+# exactly why it has to say so here.**
+#
+# Seven documents overflow a 900px window: the tabs go to their 70 logical px minimum and the row
+# starts scrolling, so only the last five are on screen and the computed slots for the other two land
+# on the button cluster. Standalone this suite passes with the window Word happens to have; inside the
+# battery it inherits whatever the previous suite left, and **Word persists window placement on
+# exit**. The first run of this section found that difference the hard way: five tooltips instead of
+# seven, and two assertions failing about documents that were simply not on screen.
+#
+# So the width is made a fixture rather than an inheritance, and put back afterwards. 760 logical px
+# is comfortably more than seven tabs at their minimum plus the chevrons and the +.
+$tipFrame = (Get-TopStrip).Frame
+$tipDpi   = [WordLayout]::Dpi($tipFrame)
+$tipGeom  = [WordLayout]::RectOf($tipFrame)
+$tipWide  = [WordLayout]::Scale(760, $tipDpi)
+$tipTall  = [WordLayout]::Scale(500, $tipDpi)
+
+try {
+
+if (($tipGeom.Right - $tipGeom.Left) -lt $tipWide) {
+    Write-Note ("widening Word from {0}px to {1}px so seven tabs do not scroll" -f
+                ($tipGeom.Right - $tipGeom.Left), $tipWide)
+    [WordLayout]::Resize($tipFrame, $tipWide, [Math]::Max($tipTall, $tipGeom.Bottom - $tipGeom.Top))
+    Start-Sleep -Seconds 2
+}
+
+$stripRect = [WordLayout]::RectOf((Get-TopStrip).Strip.Hwnd)
+
+# Park the pointer clear of the row between hovers, so each one is a fresh arrival at a tab rather
+# than a panel that was already up. Below the strip, which is the document - never on the + or a
+# chevron, which are also "not a tab" but are places a press would do something.
+function Move-OffTheRow {
+    $r = [WordLayout]::RectOf((Get-TopStrip).Strip.Hwnd)
+    $ok = Set-Pointer ([int](($r.Left + $r.Right) / 2)) ([int]($r.Bottom + 120)) 'off the row'
+    Start-Sleep -Milliseconds 300
+    return $ok
+}
+
+Set-LogMark
+$tabCount = (Get-FrameCount)
+Assert ($tabCount -eq ($fixtures.Count + 1)) `
+    "the row holds all $($fixtures.Count) fixtures plus the unsaved document ($tabCount tabs)"
+
+$hovered = @()
+for ($i = 0; $i -lt $tabCount; $i++) {
+    Assert (Move-OffTheRow) "the pointer could be parked off the row before tab $i"
+
+    $spot = Get-Spot 'tab' $i
+    $onTab = Set-Pointer $spot.X $spot.Y "tab $i"
+    Assert $onTab "the pointer reached tab $i at ($($spot.X),$($spot.Y))"
+    if (-not $onTab) { continue }
+
+    # A tooltip that is absent is a real answer here - one of the tabs is supposed to produce none -
+    # so this waits for either outcome and records which, rather than failing on the wait.
+    $r = Wait-WordTabTip -Present $true -What "tab $i"
+    $hovered += [pscustomobject]@{
+        Index = $i; Tip = $r.Tip; Ms = $r.Ms
+        Rect  = $spot.Rect
+    }
+    if ($r.Ok) {
+        Write-Note ("tab {0}: |{1}| / |{2}|  {3}x{4} at {5},{6}  after {7}ms" -f
+                    $i, $r.Tip.Name, $r.Tip.Folder, $r.Tip.Width, $r.Tip.Height,
+                    $r.Tip.Left, $r.Tip.Top, $r.Ms)
+    } else {
+        Write-Note ("tab {0}: no tooltip after {1}ms" -f $i, $r.Ms)
+    }
+}
+
+$shown = @($hovered | Where-Object { $null -ne $_.Tip })
+Write-Note "$($shown.Count) of $tabCount tabs produced a tooltip"
+
+# At this width every one of the seven names is cut, so every one of them has something to add. A
+# tab that produced nothing here means a slot that was not a tab - which is what a scrolled row looks
+# like from outside, and is the failure this section's own width fixture exists to prevent.
+Assert ($shown.Count -eq $tabCount) `
+    "every one of the $tabCount tabs was reachable and produced a panel ($($shown.Count))"
+
+# ---- what it says --------------------------------------------------------------------------------
+#
+# The name on the panel is asserted against the SAME expected string the tab-name section above
+# asserts against the log. That is the point of the feature: what the tab could not fit, in full.
+#
+# Every saved fixture, not one of them: they are all in the row, they all have the same folder, and
+# checking one would pass on a build that could only ever describe the tab it was pointed at.
+
+$savedFixtures = @($fixtures | Where-Object { $_.Key -ne 'protected' })
+foreach ($f in $savedFixtures) {
+    $t = @($shown | Where-Object { $_.Tip.Name -eq $f.Expect }) | Select-Object -First 1
+    Assert ($null -ne $t) "a tooltip named it in full: |$($f.Expect)|"
+    if ($t) {
+        Assert ($t.Tip.Folder -eq $dir) "  and gave the folder it is in (|$($t.Tip.Folder)|)"
+    }
+}
+
+$plainFix = @($fixtures | Where-Object { $_.Key -eq 'docx' }) | Select-Object -First 1
+$plainTip = @($shown | Where-Object { $_.Tip.Name -eq $plainFix.Expect }) | Select-Object -First 1
+
+if ($plainTip) {
+    Assert ($plainTip.Tip.Name.Length -gt 0 -and $plainTip.Tip.Name -notlike '*...*') `
+        'and the name on the panel carries no ellipsis of its own'
+
+    # The panel hangs below the strip, and it is left-aligned with the tab it describes unless the
+    # monitor's edge moved it. Asserted as "not above the strip" plus "not further left than the
+    # tab", which is what survives the clamp - a panel pushed left by the screen edge is correct
+    # behaviour and an assertion on an exact x would call it a failure.
+    Assert ($plainTip.Tip.Top -ge $stripRect.Bottom) `
+        "it hangs below the tab row (panel top $($plainTip.Tip.Top), strip bottom $($stripRect.Bottom))"
+    Assert ($plainTip.Tip.Left -le $plainTip.Rect.Left + 4) `
+        "and it starts no further right than the tab it is about (panel $($plainTip.Tip.Left), tab $($plainTip.Rect.Left))"
+
+    # No taskbar button and no Alt+Tab entry. This project spent a slice making Word one taskbar
+    # button; a panel that appears on a hover is not allowed to add a second.
+    Assert ([WordLayout]::IsToolWindow($plainTip.Tip.Hwnd)) `
+        'the panel is a tool window, so it can never reach the taskbar or Alt+Tab'
+}
+
+# ---- Protected View: Word will not say where it is -------------------------------------------------
+#
+# A Protected View document is in none of this Application's collections, so the folder comes back
+# empty - a determinate answer about a document this add-in cannot reach, not a failure to read one.
+# The tooltip is then the name alone, and the honest test of "one line rather than two" is that the
+# panel is SHORTER: a folder line that was drawn empty would leave the height unchanged.
+
+$pvFix = @($fixtures | Where-Object { $_.Key -eq 'protected' }) | Select-Object -First 1
+$pvTip = @($shown | Where-Object { $_.Tip.Name -eq $pvFix.Expect }) | Select-Object -First 1
+
+Assert ($null -ne $pvTip) "the Protected View document still gets a tooltip with its full name: |$($pvFix.Expect)|"
+if ($pvTip) {
+    Assert ($pvTip.Tip.Folder -eq '') 'and no folder line, because Word will not place that document'
+    Assert ($pvTip.Tip.Lines.Count -eq 1) 'so the panel carries one line of text, not two'
+    if ($plainTip) {
+        Assert ($pvTip.Tip.Height -lt $plainTip.Tip.Height) `
+            "and it is measurably shorter than the two-line one ($($pvTip.Tip.Height) vs $($plainTip.Tip.Height))"
+    }
+}
+
+# Every tooltip that DID appear was on a tab whose name had been cut, and the add-in says so. That is
+# one of the two reasons a panel appears; the other one - a folder the row could not have shown at any
+# width - is driven at the end of this suite, where a single document has a tab to itself.
+#
+# **The case where the panel stays away is driven there too, and deliberately not here.** Whether a
+# name fits is a fact about the width of the row, and the width of the row is a fact about the window
+# - so an assertion here that `Document1` produces nothing would be an assertion about how wide Word
+# happened to be. It failed for exactly that reason on its first run inside the battery: at 900px the
+# name was cut, the panel was right to appear, and the suite was wrong to say it should not.
+$cut = @(Get-LogSince 'name was cut')
+Assert ($cut.Count -eq $shown.Count) `
+    "each of the $($shown.Count) panels was raised on a tab whose name had been cut ($($cut.Count) logged)"
+
+# ---- and it is not a dialog ------------------------------------------------------------------------
+#
+# **The regression test for the thing this feature broke on its first drive.** The tooltip is the
+# add-in's first top-level window, it is bigger than the harness's size floor, and the dialog
+# classifier is a denylist of Word's own chrome classes - so it called the panel a `question`. Every
+# guard in the harness stops a run when Word is asking something, including the one Close-AllWord
+# uses, so the first hover in any suite would have reported a save prompt that did not exist.
+
+Write-Step 'The tooltip is not a question'
+Assert (Move-OffTheRow) 'the pointer could be parked off the row'
+$spot = Get-Spot 'tab' 0
+Assert (Set-Pointer $spot.X $spot.Y 'tab 0') 'the pointer reached tab 0 again'
+$again = Wait-WordTabTip -Present $true -What 'tab 0'
+Assert $again.Ok 'the tooltip came back on a second hover of the same tab'
+if ($again.Ok) {
+    $dialog = Get-WordDialog
+    Assert ($null -eq $dialog) `
+        "with the panel on screen the harness sees no question ($(Format-Dialog $dialog))"
+    $kinds = @(Get-WordWindows | Where-Object { $_.Class -eq 'WordTabTip' })
+    Assert ($kinds.Count -ge 1) 'the panel is enumerated as a top-level window of Word''s process'
+    if ($kinds.Count -ge 1) {
+        Assert ($kinds[0].Kind -eq 'ours') "and it is classified as ours, not as a question ($($kinds[0].Kind))"
+    }
+}
+
+# ---- and it goes away ------------------------------------------------------------------------------
+#
+# Moving off the row takes it down, and that is a WM_MOUSELEAVE rather than a timer: the auto-hide is
+# ten times the appearance delay, so a panel that only went on the timer would still be on screen
+# here and this would pass for the wrong reason. The latency printed is the evidence for which of the
+# two it was.
+
+Write-Step 'The tooltip goes when the pointer does'
+Assert (Move-OffTheRow) 'the pointer left the row'
+$gone = Wait-WordTabTip -Present $false -What 'the tooltip'
+Assert $gone.Ok 'the panel went when the pointer left the tab'
+if ($gone.Ok) {
+    Assert ($gone.Ms -lt ([WordLayout]::DoubleClickTime() * 5)) `
+        "and it went on the pointer leaving, not on the auto-hide ($($gone.Ms)ms, auto-hide is $([WordLayout]::DoubleClickTime() * 10)ms)"
+}
+
+} finally {
+    # Word persists its window placement on exit, so a section that widened the window and left it
+    # widened would hand the next suite in the battery a Word it was not written against. The same
+    # rule, and the same `finally`, as the maximized tear-off section in check-reorder.
+    if ([WordLayout]::IsWindow2($tipFrame)) {
+        [WordLayout]::Resize($tipFrame, ($tipGeom.Right - $tipGeom.Left), ($tipGeom.Bottom - $tipGeom.Top))
+        Write-Note ("Word put back to {0}x{1}" -f ($tipGeom.Right - $tipGeom.Left), ($tipGeom.Bottom - $tipGeom.Top))
+    }
+}
+
 # ---- Close Tabs to the Right ---------------------------------------------------------------------
 #
 # Its own documents, because the section above has left a mixture of formats and one unsaved
@@ -699,6 +925,136 @@ try {
     } else {
         Set-ItemProperty -Path $Settings -Name 'TabTitleTrim' -Value $restore -Type DWord
         Write-Note "TabTitleTrim put back to $restore"
+    }
+}
+
+# ---- the tooltip on its own switch -----------------------------------------------------------------
+#
+# One document, so the tab is at its full 220 logical px and the name fits with room to spare. That
+# makes this a different branch from the section above, where every panel was raised because a name
+# had been cut: here there is nothing wrong with the tab at all, and the panel appears because the
+# FOLDER is something the row cannot say at any width. Both halves of "is there anything to add" are
+# therefore driven, and by fixtures that were going to exist anyway.
+#
+# Then the switch off, positively: not "nothing appeared" - a hover that never landed produces that
+# too - but the pointer confirmed onto the same tab, the startup line asserted to say the switch is
+# off, and the add-in's log asserted to contain nothing about a tooltip at all. TabTip is read in
+# StripStart, so it costs a Word restart.
+
+Write-Step 'The tooltip with TabTip at its default'
+Close-Word
+Set-LogMark
+$frame = Open-Document $doc.Path $true
+Assert ($frame -ne [IntPtr]::Zero) 'the .doc opened on its own again'
+Start-Sleep -Seconds 1
+
+$tipSpot = Get-Spot 'tab' 0
+Assert (Set-Pointer $tipSpot.X $tipSpot.Y 'the only tab') 'the pointer reached the only tab'
+$one = Wait-WordTabTip -Present $true -What 'the only tab'
+Assert $one.Ok 'a tooltip appeared on a tab whose name fits perfectly well'
+if ($one.Ok) {
+    Write-Note ("|{0}| / |{1}|" -f $one.Tip.Name, $one.Tip.Folder)
+    Assert ($one.Tip.Folder -eq $dir) 'and what it adds is the folder - the thing no tab width could show'
+    $fits = @(Get-LogSince 'name fits')
+    Assert ($fits.Count -ge 1) 'the add-in agrees the name was not cut, so the folder is the whole reason it appeared'
+}
+
+# ---- and the one that says nothing ------------------------------------------------------------------
+#
+# The other half of the same rule, and it is driven HERE rather than up in the seven-tab row because
+# it is the half that depends on the tab being wide. Two tabs in one window is the widest arrangement
+# this suite can produce that still has a never-saved document in it, and `Document1` fits in a tab
+# that size on any window Word will open. Up in the crowded row its name was cut, the panel was right
+# to appear, and an assertion that it should not have was an assertion about the window rather than
+# about the product.
+#
+# Both halves come from the add-in's own account as well as from the screen, because "no tooltip" is
+# also what a hover that never landed produces - and the hover itself is asserted separately, which
+# is the other half of that guard.
+
+Write-Step 'A never-saved document beside it, on a tab with room to spare'
+Set-LogMark
+$before = @(Get-Frames)
+Assert (Invoke-StripClick 'the +' {
+    $top = Get-TopStrip
+    $layout = [WordLayout]::Tabs($top.Strip.Hwnd, (Get-FrameCount))
+    [WordLayout]::Center($layout.Plus)
+}) 'the + could be clicked'
+Assert (Wait-Frames 2 30) "a second document opened ($((Get-FrameCount)) windows)"
+
+$fresh = @(Get-Frames | Where-Object { $before -notcontains $_ }) | Select-Object -First 1
+if ($fresh) {
+    $freshIndex = -1
+    $top = Get-TopStrip
+    $layout = [WordLayout]::Tabs($top.Strip.Hwnd, (Get-FrameCount))
+    # Which slot the new document is in: the row order is the open order, so it is the last one -
+    # but that is asserted by hovering and reading the panel rather than assumed, and the never-saved
+    # document is the one tab that produces no panel at all, so it is found by elimination.
+    for ($i = 0; $i -lt $layout.Tabs.Length; $i++) {
+        $spot = Get-Spot 'tab' $i
+        Assert (Set-Pointer $spot.X $spot.Y "tab $i") "the pointer reached tab $i"
+        $r = Wait-WordTabTip -Present $true -What "tab $i"
+        if (-not $r.Ok) { $freshIndex = $i; break }
+        Write-Note ("tab {0}: |{1}| / |{2}|" -f $i, $r.Tip.Name, $r.Tip.Folder)
+        Assert (Move-OffTheRow) "the pointer left the row after tab $i"
+    }
+
+    Assert ($freshIndex -ge 0) 'one of the two tabs produces no panel at all'
+    $quiet = @(Get-LogSince 'nothing to add')
+    Assert ($quiet.Count -ge 1) 'and the add-in says why it stayed away'
+    if ($quiet.Count -ge 1) {
+        $last = $quiet[$quiet.Count - 1]
+        Write-Note $last
+        Assert ($last -like '*Document*') 'the tab it stayed away from is the never-saved document'
+        Assert ($last -like '*name fits*') 'because the name fitted'
+        Assert ($last -like '*never saved*') 'and there is no folder to add - Word answered, it has none'
+    }
+} else {
+    Assert $false 'the new document has a window of its own'
+}
+
+Write-Step 'The same hover with TabTip=0'
+$restoreTip = $null
+try {
+    $existing = Get-ItemProperty -Path $Settings -Name 'TabTip' -ErrorAction SilentlyContinue
+    if ($existing -and $existing.PSObject.Properties.Name -contains 'TabTip') {
+        $restoreTip = [int]$existing.TabTip
+    }
+
+    Close-Word
+    if (-not (Test-Path $Settings)) { New-Item -Path $Settings | Out-Null }
+    Set-ItemProperty -Path $Settings -Name 'TabTip' -Value 0 -Type DWord
+    Write-Note 'TabTip=0 - no timer armed, no panel created, and Word never asked where a document lives'
+
+    Set-LogMark
+    $frame = Open-Document $doc.Path $true
+    Assert ($frame -ne [IntPtr]::Zero) 'the .doc opened with the switch off'
+    Start-Sleep -Seconds 1
+
+    # The switch is only observable from outside through this line, and a switch that reports its own
+    # default is how TabThemeSample stayed dead for two slices.
+    $start = @(Get-LogSince 'StripStart')
+    Assert ($start.Count -ge 1) 'the add-in logged its startup line'
+    if ($start.Count -ge 1) {
+        Write-Note $start[$start.Count - 1]
+        Assert ($start[$start.Count - 1] -like '*tip=off*') 'and it reads tip=off'
+    }
+
+    $offSpot = Get-Spot 'tab' 0
+    Assert (Set-Pointer $offSpot.X $offSpot.Y 'the only tab') 'the pointer reached the same tab with the switch off'
+
+    # A generous wait: with the switch on this took the double-click time, so anything up to three
+    # times that and still nothing is a real absence rather than an impatient one.
+    $none = Wait-WordTabTip -Present $false -Seconds ([int]([math]::Ceiling(([WordLayout]::DoubleClickTime() * 3) / 1000.0)) + 2) -What 'the tooltip'
+    Assert $none.Ok 'no panel appeared'
+    Assert ((Get-LogCount 'tip:') -eq 0) 'and the add-in wrote nothing about a tooltip at all - the mechanism is out of the way, not merely silent'
+} finally {
+    if ($null -eq $restoreTip) {
+        Remove-ItemProperty -Path $Settings -Name 'TabTip' -ErrorAction SilentlyContinue
+        Write-Note 'TabTip removed - back to the default'
+    } else {
+        Set-ItemProperty -Path $Settings -Name 'TabTip' -Value $restoreTip -Type DWord
+        Write-Note "TabTip put back to $restoreTip"
     }
 }
 

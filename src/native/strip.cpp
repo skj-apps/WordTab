@@ -125,6 +125,27 @@
 // that is the one the check scripts know.
 #define DOT_LOGICAL_RADIUS 3
 
+// The tooltip that appears when the pointer rests on a tab.
+//
+// It exists because the name is the only thing on a tab that identifies its document - that was the
+// finding that closed the icons slice - and the name is exactly what runs out of room first. A
+// default Word window fits five tabs; the sixth document makes every name shorter, and past that
+// point the row is full of `Qua...` and `Draf...` with nothing anywhere that says which is which.
+//
+// Two timers rather than one, and both intervals come from the system rather than from taste.
+// Windows' own tooltip delays are defined in terms of the double-click time: a tooltip appears after
+// GetDoubleClickTime() and takes itself away after ten times that. Using those means the strip's
+// tooltip arrives when the user's other tooltips arrive, on a machine whose owner may have changed
+// that setting for a reason.
+#define ID_TIP_SHOW  3
+#define ID_TIP_HIDE  4
+
+#define TIP_LOGICAL_PADX  10
+#define TIP_LOGICAL_PADY   6
+#define TIP_LOGICAL_GAP    2     // between the name and the folder under it
+#define TIP_LOGICAL_MAXW 520     // a deep path is cut in the middle, not allowed to cross the screen
+#define TIP_LOGICAL_DROP   2     // how far below the strip it hangs
+
 // What the pointer is over, or what a button press is claiming. Used for both, which is why HIT_TAB
 // appears as a press kind: it means a *middle* press, since a left press on a tab acts immediately
 // and never waits for a release.
@@ -147,6 +168,7 @@ enum { CMD_NEW = 1, CMD_SAVE, CMD_CLOSE, CMD_CLOSE_OTHERS, CMD_CLOSE_ALL, CMD_CL
 
 static const wchar_t* const kWwfClass    = L"_WwF";
 static const wchar_t* const kStripClass  = L"WordTabStrip";
+static const wchar_t* const kTipClass    = L"WordTabTip";
 
 // Our link in `_WwF`'s subclass chain. Distinct from the frame's - see frames.cpp.
 static const UINT_PTR kWwfSubclassId = 0x57544143;   // 'WTAC'
@@ -166,6 +188,7 @@ struct StripState
     HWND  frame;         // Word's OpusApp
     HWND  wwf;           // Word's document frame, subclassed by us
     HWND  strip;         // ours, a child of the frame
+    HWND  tip;           // ours, a popup owned by the frame; created the first time one is needed
 
     int   stripH;        // STRIP_LOGICAL_H scaled to this window's DPI
     int   dpi;
@@ -235,6 +258,13 @@ struct StripState
     // FALSE until Word has been asked, which is what StripAttachFrame's memset gives for free, and
     // the honest starting value: no dot is what a document that has not been measured looks like.
     BOOL modified;
+
+    // Whether each tab's name had to be cut to fit, written by the one function that draws a name
+    // and read by the tooltip. Recorded where the cutting happens rather than worked out a second
+    // time from a rectangle that might not be the same one - the tab's text box is derived from the
+    // close button's position, and a second copy of that derivation would be a second answer to
+    // "does this name fit". Indexed by position in the row, like everything else the layout knows.
+    BOOL nameCut[MAX_TABS];
 };
 
 // Where every clickable thing in a strip is, in the strip's client coordinates. One structure
@@ -283,6 +313,7 @@ static BOOL g_sampleEnabled = TRUE;      // HKCU\Software\WordTab\TabThemeSample
 static BOOL g_scrollEnabled = TRUE;      // HKCU\Software\WordTab\TabScroll
 static BOOL g_titleTrimEnabled = TRUE;   // HKCU\Software\WordTab\TabTitleTrim
 static BOOL g_dotEnabled = TRUE;         // HKCU\Software\WordTab\TabDot
+static BOOL g_tipEnabled = TRUE;         // HKCU\Software\WordTab\TabTip
 
 // ---------------------------------------------------------------------------------------------
 // How far the row is scrolled.
@@ -2026,7 +2057,39 @@ static void DrawChip(Surface* s, const RECT* box, BOOL hot, BOOL down, int dpi)
 // a dragged tab cannot end up looking like a different kind of object from a tab sitting still. The
 // lift is a parameter for the same reason - it is an argument to this function, not a second
 // drawing path for dragged tabs.
-static void DrawOneTab(StripState* state, Surface* s, HWND frame,
+// The one place a tab's name is put on a device context, and therefore the one place that knows
+// whether it fitted.
+//
+// Both renderers used to do this themselves - the same string, the same flags, two DrawTextW calls
+// eighty lines apart. That was tolerable while the answer was only ever pixels, and it stopped being
+// tolerable when the tooltip needed to know whether the name had been cut: worked out anywhere else
+// it would be a second derivation of the text box, and two derivations of one rectangle is the shape
+// of defect this project keeps finding. So the cut is recorded by the code that does the cutting.
+//
+// DT_CALCRECT measures what the string wanted; the box is what it got. Measuring is the only honest
+// test - the alternative is reading pixels back looking for an ellipsis glyph, which cannot tell an
+// ellipsis Windows added from three dots the user typed.
+static void DrawTabName(StripState* state, HDC dc, const RECT* box, int index,
+                        const wchar_t* title, COLORREF color)
+{
+    if (!dc || !box || box->right <= box->left)
+        return;
+
+    SetTextColor(dc, color);
+
+    RECT text = *box;
+    DrawTextW(dc, title, -1, &text,
+              DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+    if (state && index >= 0 && index < MAX_TABS)
+    {
+        RECT wanted = *box;
+        DrawTextW(dc, title, -1, &wanted, DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_CALCRECT);
+        state->nameCut[index] = ((wanted.right - wanted.left) > (box->right - box->left));
+    }
+}
+
+static void DrawOneTab(StripState* state, Surface* s, HWND frame, int index,
                        RECT tab, RECT close, BOOL selected, BOOL hot, BOOL lifted, BOOL first,
                        BOOL modified)
 {
@@ -2090,12 +2153,8 @@ static void DrawOneTab(StripState* state, Surface* s, HWND frame,
     // ellipsis reads as a long name; one running under a close button reads as a bug.
     text.right = hasClose ? (close.left - Scaled(4, dpi))
                           : (tab.right - Scaled(10, dpi));
-    if (text.right > text.left && s->dc)
-    {
-        SetTextColor(s->dc, (selected || lifted) ? g_palette.text : g_palette.textIdle);
-        DrawTextW(s->dc, title, -1, &text,
-                  DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
-    }
+    DrawTabName(state, s->dc, &text, index, title,
+                (selected || lifted) ? g_palette.text : g_palette.textIdle);
 
     if (hasClose)
     {
@@ -2201,7 +2260,7 @@ static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
         // border on the strip rather than as a divider between two tabs.
         BOOL first = (i == 0) || (tab.left <= layout.track.left);
 
-        DrawOneTab(state, s, frames[i], tab, layout.close[i],
+        DrawOneTab(state, s, frames[i], i, tab, layout.close[i],
                    (i == activeIndex), hotTab, FALSE, first, FrameModified(frames[i]));
 
         if (i == activeIndex)
@@ -2231,7 +2290,7 @@ static void DrawStripSoft(StripState* state, Surface* s, const RECT* client)
 
         if (tab.left < layout.track.right && tab.right > tab.left)
         {
-            DrawOneTab(state, s, g_dragFrame, tab, close,
+            DrawOneTab(state, s, g_dragFrame, carried, tab, close,
                        (carried == activeIndex), TRUE, TRUE, FALSE, FrameModified(g_dragFrame));
 
             if (carried == activeIndex)
@@ -2427,12 +2486,8 @@ static void DrawStripFlat(StripState* state, HDC dc, const RECT* client)
         text.left += Scaled(10, state->dpi);
         text.right = hasClose ? (layout.close[i].left - Scaled(4, state->dpi))
                               : (tab.right - Scaled(8, state->dpi));
-        if (text.right > text.left)
-        {
-            SetTextColor(dc, selected ? g_palette.text : g_palette.textIdle);
-            DrawTextW(dc, title, -1, &text,
-                      DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
-        }
+        DrawTabName(state, dc, &text, i, title,
+                    selected ? g_palette.text : g_palette.textIdle);
 
         if (hasClose && FrameModified(frames[i]) && !hotTab)
         {
@@ -3574,9 +3629,402 @@ static void ChevronRepeatTick(StripState* state, HWND hwnd)
     SetTimer(hwnd, ID_CHEVRON_REPEAT, CHEVRON_REPEAT_MS, NULL);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The tooltip.
+//
+// Rest the pointer on a tab and, half a second later, a small panel below it says what the tab could
+// not fit: the document's name in full, and underneath it the folder the document is in.
+//
+// **Why it exists is a measurement, not a nicety.** The icons slice ended with a finding that has
+// been true of every slice since: the name is the only thing on a tab that identifies its document.
+// And the name is the first thing the row spends when it runs short of room - Word's own default
+// window fits five tabs, so a sixth document shortens every name in the row, permanently. Past that
+// point a strip of `Qua...`, `Me...` and `Draf...` is a row of tabs that cannot be told apart, and
+// there is nowhere else in the window to look.
+//
+// **The folder is the second line because it is the thing nothing else can tell you.** Two documents
+// called `Report.docx` from two different folders draw two identical tabs, and no amount of width
+// would separate them. It is read from Word on the hover that needs it rather than polled - see
+// WordTabReadDocumentPath, which says why this one is not the dot.
+//
+// **A tooltip with nothing to add does not appear.** If the name fitted and there is no folder to
+// name - an unsaved `Document1` on a wide tab - then everything the panel would say is already on
+// screen, and showing it anyway would be half a second of the user's attention spent on a repetition.
+// The two halves of that test come from different places and both are honest: "the name was cut" is
+// recorded by the code that cut it, and "there is no folder" is Word's own answer.
+//
+// **It is a window of our own rather than a system tooltip**, for the reason every other surface here
+// is: a system tooltip is painted in the *system's* colours, and Word's theme is not Windows' theme -
+// this rig runs a dark Word on a light Windows. The panel uses the same three floating-surface
+// colours the context menu does, so a tooltip and a menu are the same object seen twice rather than
+// two guesses about what a panel over a document should look like.
+// ---------------------------------------------------------------------------------------------
+
+static ATOM g_tipClass = 0;
+
+// The one tooltip that can be up, and what it says. Global rather than per strip for the same reason
+// the drag and the scroll position are: there is one pointer, so there is one hover, and a per-strip
+// copy of the text would be several answers to a question that has one. The *window* is per strip,
+// because a popup is owned by a frame and an owner cannot be changed after it is created.
+static HWND    g_tipStrip  = NULL;    // the strip whose hover has armed or shown it
+static HWND    g_tipFrame  = NULL;    // ...and the tab it is about
+static wchar_t g_tipName[256]      = L"";
+static wchar_t g_tipFolder[MAX_PATH] = L"";
+
+// Take down anything showing and disarm anything pending. Safe to call when neither is true, which
+// is most of the times it is called.
+static void TipStop(void)
+{
+    if (g_tipStrip && IsWindow(g_tipStrip))
+    {
+        KillTimer(g_tipStrip, ID_TIP_SHOW);
+        KillTimer(g_tipStrip, ID_TIP_HIDE);
+
+        StripState* state = FindByStrip(g_tipStrip);
+        if (state && state->tip && IsWindow(state->tip) && IsWindowVisible(state->tip))
+        {
+            ShowWindow(state->tip, SW_HIDE);
+
+            // The frame the tooltip was ABOUT, not the frame whose strip is carrying the panel.
+            // Those are routinely different - every window in the stack draws every tab, so the
+            // panel for tab 3 belongs to whichever window happens to be in front - and the first
+            // version of this line logged the carrier, which made a hide look like it belonged to a
+            // document nobody had hovered.
+            LogWrite(L"tip: hwnd=0x%p  hidden", (void*)g_tipFrame);
+        }
+    }
+
+    g_tipStrip = NULL;
+    g_tipFrame = NULL;
+    g_tipName[0]   = L'\0';
+    g_tipFolder[0] = L'\0';
+}
+
+// Start the clock on a tab the pointer has arrived at.
+//
+// The early return on "already this tab" is what makes the delay mean what it says. WM_MOUSEMOVE
+// arrives on every pixel, and re-arming on each one would give a tooltip that never appears unless
+// the hand is perfectly still for half a second - which is not the same gesture at all, and is
+// notably hard to perform on a trackpad.
+static void TipArm(HWND strip, HWND frame)
+{
+    if (!g_tipEnabled || !frame || !strip)
+        return;
+    if (g_tipStrip == strip && g_tipFrame == frame)
+        return;
+
+    TipStop();
+    g_tipStrip = strip;
+    g_tipFrame = frame;
+    SetTimer(strip, ID_TIP_SHOW, GetDoubleClickTime(), NULL);
+}
+
+static void DrawTip(StripState* state, HDC dc, const RECT* client)
+{
+    HBRUSH back = CreateSolidBrush(g_palette.menuBack);
+    if (back)
+    {
+        FillRect(dc, client, back);
+        DeleteObject(back);
+    }
+
+    // A border, because this panel floats over a document rather than over the strip's own well, and
+    // white text on a white page with no edge is not a panel.
+    HBRUSH edge = CreateSolidBrush(g_palette.menuLine);
+    if (edge)
+    {
+        FrameRect(dc, client, edge);
+        DeleteObject(edge);
+    }
+
+    HGDIOBJ oldFont = SelectObject(dc, state->font ? (HGDIOBJ)state->font
+                                                   : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(dc, TRANSPARENT);
+
+    int padx = Scaled(TIP_LOGICAL_PADX, state->dpi);
+    int pady = Scaled(TIP_LOGICAL_PADY, state->dpi);
+    int gap  = Scaled(TIP_LOGICAL_GAP, state->dpi);
+
+    RECT line;
+    line.left   = client->left + padx;
+    line.right  = client->right - padx;
+    line.top    = client->top + pady;
+    line.bottom = client->bottom - pady;
+
+    RECT measured = line;
+    DrawTextW(dc, g_tipName, -1, &measured, DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_CALCRECT);
+    int lineH = measured.bottom - measured.top;
+
+    line.bottom = line.top + lineH;
+    SetTextColor(dc, g_palette.menuText);
+    DrawTextW(dc, g_tipName, -1, &line, DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+    if (g_tipFolder[0])
+    {
+        line.top    = line.bottom + gap;
+        line.bottom = client->bottom - pady;
+
+        // DT_PATH_ELLIPSIS, not DT_END_ELLIPSIS: a path cut at the end loses the folder the document
+        // is actually in, which is the only part of it anybody reads. Cut in the middle it keeps both
+        // ends, which is what every file dialog in Windows does with a path too long for its box.
+        SetTextColor(dc, g_palette.menuTextDim);
+        DrawTextW(dc, g_tipFolder, -1, &line,
+                  DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_PATH_ELLIPSIS);
+    }
+
+    SelectObject(dc, oldFont);
+}
+
+static LRESULT CALLBACK TipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    StripState* state = (StripState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    switch (msg)
+    {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+        if (state)
+        {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            if (dc)
+            {
+                RECT client;
+                GetClientRect(hwnd, &client);
+                DrawTip(state, dc, &client);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        break;
+
+    // Photographable, for the same reason the strip is: a PrintWindow of a panel DefWindowProc
+    // cannot draw comes back blank, and a screenshot that silently omits the thing under test is
+    // worse than no screenshot.
+    case WM_PRINTCLIENT:
+        if (state && wParam)
+        {
+            RECT client;
+            GetClientRect(hwnd, &client);
+            DrawTip(state, (HDC)wParam, &client);
+            return 0;
+        }
+        break;
+
+    // It never takes the focus and it never takes a click. WS_EX_TRANSPARENT means the pointer
+    // reaches the document underneath, so moving onto the panel is moving off the strip - which is
+    // what takes the panel away.
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static BOOL TipEnsure(StripState* state)
+{
+    if (state->tip && IsWindow(state->tip))
+        return TRUE;
+
+    // Owned by the frame, not a child of it. An owned popup is always above its owner without being
+    // topmost over everything else, it goes away when the frame is minimised, and - the part that
+    // matters most here - an owned WS_EX_TOOLWINDOW popup gets neither a taskbar button nor an
+    // Alt+Tab entry. This project spent a slice making Word one taskbar button; a tooltip is not
+    // allowed to add a second.
+    state->tip = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                                 kTipClass, L"", WS_POPUP,
+                                 0, 0, 10, 10, state->frame, NULL, g_module, NULL);
+    if (!state->tip)
+    {
+        LogWrite(L"tip: hwnd=0x%p  CreateWindowEx FAILED (lastError=%lu)",
+                 (void*)state->frame, GetLastError());
+        return FALSE;
+    }
+
+    SetWindowLongPtrW(state->tip, GWLP_USERDATA, (LONG_PTR)state);
+    return TRUE;
+}
+
+static void TipShow(StripState* state, HWND hwnd)
+{
+    KillTimer(hwnd, ID_TIP_SHOW);
+
+    // Where the pointer is *now*, not where it was when the timer was armed. Half a second is long
+    // enough for the row to have scrolled under a still hand, for that document to have been closed,
+    // or for the pointer to have been moved by something that sends no mouse message at all.
+    POINT cursor;
+    POINT client;
+    if (!GetCursorPos(&cursor))
+    {
+        TipStop();
+        return;
+    }
+    client = cursor;
+    if (!ScreenToClient(hwnd, &client))
+    {
+        TipStop();
+        return;
+    }
+
+    StripHit hit = HitTestStrip(state, hwnd, client);
+    if (!hit.frame || hit.frame != g_tipFrame)
+    {
+        TipStop();
+        return;
+    }
+
+    wchar_t name[256];
+    WordTabFrameTitle(hit.frame, name, 256);
+
+    wchar_t folder[MAX_PATH];
+    BOOL answered = WordTabReadDocumentPath(hit.frame, folder, MAX_PATH);
+    if (!answered)
+        folder[0] = L'\0';
+
+    BOOL cut = (hit.index >= 0 && hit.index < MAX_TABS) ? state->nameCut[hit.index] : FALSE;
+
+    if (!cut && folder[0] == L'\0')
+    {
+        // Disarmed but not forgotten: g_tipFrame stays this tab, so the pointer wandering about on
+        // it does not re-arm the timer and ask Word the same question every half second.
+        LogWrite(L"tip: hwnd=0x%p  |%s|  nothing to add (name fits; %s)",
+                 (void*)hit.frame, name,
+                 answered ? L"no folder - never saved" : L"Word would not say where it is");
+        return;
+    }
+
+    // Re-asserted, and this is not belt and braces.
+    //
+    // WordTabReadDocumentPath calls into Word, and a call into Word's object model pumps messages -
+    // the rule this add-in already follows everywhere it posts a command to itself rather than
+    // running one inside a window procedure. A janitor tick dispatched inside that pump reaches
+    // StripRefreshTabs, which calls TipStop, which clears exactly the two variables that say a
+    // tooltip is up. Without these two lines the panel below would be shown with nothing recording
+    // that it exists, and the next TipStop would find nothing to hide: a tooltip that stays on the
+    // screen until the pointer happens to arm another one.
+    g_tipStrip = hwnd;
+    g_tipFrame = hit.frame;
+
+    wcsncpy(g_tipName, name, 255);
+    g_tipName[255] = L'\0';
+    wcsncpy(g_tipFolder, folder, MAX_PATH - 1);
+    g_tipFolder[MAX_PATH - 1] = L'\0';
+
+    if (!TipEnsure(state))
+    {
+        TipStop();
+        return;
+    }
+
+    // The panel's size, measured with the strip's own font so the two agree about what a name is.
+    int width  = 0;
+    int height = 0;
+    int lineH  = 0;
+    {
+        HDC dc = GetDC(hwnd);
+        if (!dc)
+        {
+            TipStop();
+            return;
+        }
+        HGDIOBJ oldFont = SelectObject(dc, state->font ? (HGDIOBJ)state->font
+                                                       : GetStockObject(DEFAULT_GUI_FONT));
+
+        RECT m;
+        SetRect(&m, 0, 0, 0, 0);
+        DrawTextW(dc, g_tipName, -1, &m, DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_CALCRECT);
+        int w1 = m.right - m.left;
+        lineH  = m.bottom - m.top;
+
+        int w2 = 0;
+        if (g_tipFolder[0])
+        {
+            SetRect(&m, 0, 0, 0, 0);
+            DrawTextW(dc, g_tipFolder, -1, &m,
+                      DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_CALCRECT);
+            w2 = m.right - m.left;
+        }
+
+        SelectObject(dc, oldFont);
+        ReleaseDC(hwnd, dc);
+
+        // DT_CALCRECT on a single line answers what the string wants and ignores the box it was
+        // given, so the cap is applied here rather than trusted to the measurement.
+        int wide = (w1 > w2) ? w1 : w2;
+        int cap  = Scaled(TIP_LOGICAL_MAXW, state->dpi);
+        if (wide > cap)
+            wide = cap;
+
+        width  = wide + Scaled(TIP_LOGICAL_PADX, state->dpi) * 2;
+        height = lineH + Scaled(TIP_LOGICAL_PADY, state->dpi) * 2;
+        if (g_tipFolder[0])
+            height += lineH + Scaled(TIP_LOGICAL_GAP, state->dpi);
+    }
+
+    // Under the tab it describes rather than under the pointer. A tooltip that points at the thing
+    // it is about needs no arrow, and the tab is a fixed target where the pointer is not.
+    RECT anchor = hit.tab;
+    MapWindowPoints(hwnd, NULL, (POINT*)&anchor, 2);
+
+    int drop = Scaled(TIP_LOGICAL_DROP, state->dpi);
+    int x = anchor.left;
+    int y = anchor.bottom + drop;
+
+    // Clamped to the monitor the pointer is on, not to the frame: a Word window can hang off the
+    // right-hand edge of a screen, and a panel clamped to the window would then be drawn off it.
+    MONITORINFO mi;
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mi))
+    {
+        if (x + width > mi.rcWork.right)
+            x = mi.rcWork.right - width;
+        if (x < mi.rcWork.left)
+            x = mi.rcWork.left;
+        if (y + height > mi.rcWork.bottom)
+            y = anchor.top - height - drop;      // above the tab instead of below it
+        if (y < mi.rcWork.top)
+            y = mi.rcWork.top;
+    }
+
+    // The whole panel as one string, on the window itself, and it is the only text this add-in draws
+    // that anything outside the process can read. A tab name can only be asserted through the log
+    // line that says what was computed; this can be asserted by asking the window what it says.
+    wchar_t both[256 + MAX_PATH + 2];
+    wcscpy(both, g_tipName);
+    if (g_tipFolder[0])
+    {
+        wcscat(both, L"\n");
+        wcscat(both, g_tipFolder);
+    }
+    SetWindowTextW(state->tip, both);
+
+    SetWindowPos(state->tip, HWND_TOP, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(state->tip, NULL, TRUE);
+
+    // And it takes itself away, the way every tooltip in Windows does. Ten times the appearance
+    // delay is the system's own ratio.
+    SetTimer(hwnd, ID_TIP_HIDE, GetDoubleClickTime() * 10, NULL);
+
+    LogWrite(L"tip: hwnd=0x%p  |%s|  folder |%s|  at %d,%d %dx%d  (%s%s)",
+             (void*)hit.frame, g_tipName, g_tipFolder, x, y, width, height,
+             cut ? L"name was cut" : L"name fits",
+             answered ? L"" : L"; Word would not say where it is");
+}
+
 static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     StripState* state = (StripState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    // Any button anywhere in the strip takes the tooltip down: the user has stopped reading it and
+    // started doing something. Here rather than in each of the three handlers, so a fourth button
+    // cannot be added without it.
+    if (msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_RBUTTONDOWN)
+        TipStop();
 
     switch (msg)
     {
@@ -3619,6 +4067,14 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             ArmLeaveTracking(state, hwnd);
             StripHit hit = HitTestStrip(state, hwnd, PointOf(lParam));
             SetHot(state, hwnd, hit.kind, hit.frame);
+
+            // A tab under the pointer starts the clock; anything else - the +, a chevron, the bare
+            // well - stops it. Keyed on the frame rather than on the hit kind, so sliding from a
+            // tab onto its own close button is still the same tab and does not restart the wait.
+            if (hit.frame)
+                TipArm(hwnd, hit.frame);
+            else
+                TipStop();
             return 0;
         }
         break;
@@ -3628,6 +4084,7 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         {
             state->tracking = FALSE;
             SetHot(state, hwnd, HIT_NONE, NULL);
+            TipStop();
             return 0;
         }
         break;
@@ -3679,6 +4136,16 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         if (state && wParam == ID_CHEVRON_REPEAT)
         {
             ChevronRepeatTick(state, hwnd);
+            return 0;
+        }
+        if (state && wParam == ID_TIP_SHOW)
+        {
+            TipShow(state, hwnd);
+            return 0;
+        }
+        if (state && wParam == ID_TIP_HIDE)
+        {
+            TipStop();
             return 0;
         }
         break;
@@ -4415,6 +4882,13 @@ void StripRefit(HWND frame)
 // One window's tab row is every window's tab row, so anything that changes it repaints them all.
 void StripRefreshTabs(void)
 {
+    // And anything that changes the row invalidates a panel describing it. Every caller of this is
+    // a real change - a title, a dot, the stack, the scroll position - so this is the one place that
+    // has to know about the tooltip, rather than each of them. A tab that scrolls out from under its
+    // own tooltip, or closes while it is up, would otherwise leave a panel naming a document that is
+    // no longer there for as long as the auto-hide takes.
+    TipStop();
+
     for (int i = 0; i < g_stripCount; i++)
     {
         StripState* state = &g_strips[i];
@@ -4487,6 +4961,17 @@ static void Restore(StripState* state)
     // DestroyWindow releases the capture, which would otherwise arrive as a cancel.
     if (state->strip && g_dragStrip == state->strip)
         DragForget();
+
+    // Before the strip goes: TipStop reaches its state through the strip handle, so a tooltip
+    // disarmed afterwards would be disarmed through a window that no longer exists.
+    if (state->strip && g_tipStrip == state->strip)
+        TipStop();
+
+    if (state->tip && IsWindow(state->tip))
+    {
+        DestroyWindow(state->tip);
+        state->tip = NULL;
+    }
 
     if (state->strip && IsWindow(state->strip))
     {
@@ -4916,6 +5401,12 @@ void StripStart(void)
     // objects to being asked twice a second, this is the setting that stops the asking.
     g_dotEnabled = WordTabReadFlag(L"TabDot", TRUE);
 
+    // The hover tooltip. Off, no timer is ever armed, no window is ever created and Word is never
+    // asked where a document lives - the same shape of "off" as TabDot, and for a sharper version of
+    // the same reason: this one reads the object model in response to the pointer moving, so a Word
+    // that objects to being asked has to be able to stop the asking without giving up the tabs.
+    g_tipEnabled = WordTabReadFlag(L"TabTip", TRUE);
+
     if (!g_stripClass)
     {
         WNDCLASSEXW wc;
@@ -4927,6 +5418,23 @@ void StripStart(void)
         wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
         wc.lpszClassName = kStripClass;
         g_stripClass = RegisterClassExW(&wc);
+    }
+
+    // CS_DROPSHADOW is what tells a panel from the page behind it when the two are nearly the same
+    // colour, and it is the system's shadow rather than one of ours: a menu gets it for free and a
+    // tooltip that did not have it would be the one floating surface here without one. CS_SAVEBITS
+    // because it covers a document that would otherwise repaint every time it appears.
+    if (!g_tipClass)
+    {
+        WNDCLASSEXW wc;
+        memset(&wc, 0, sizeof(wc));
+        wc.cbSize        = sizeof(wc);
+        wc.style         = CS_DROPSHADOW | CS_SAVEBITS;
+        wc.lpfnWndProc   = TipWndProc;
+        wc.hInstance     = g_module;
+        wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+        wc.lpszClassName = kTipClass;
+        g_tipClass = RegisterClassExW(&wc);
     }
 
     // Something has to be on the palette before the first paint. The registry answer, which is the
@@ -4942,7 +5450,7 @@ void StripStart(void)
 
     LogWrite(L"StripStart  class=%s janitor=%s  stripH=%d logical px  theme=%s  tab buttons=%s  "
              L"tab menu=%s  tab drag=%s  tab scroll=%s  tab style=%s  theme sample=%s  "
-             L"title trim=%s  dot=%s",
+             L"title trim=%s  dot=%s  tip=%s",
              g_stripClass ? L"registered" : L"FAILED",
              g_janitor ? L"running" : L"FAILED", STRIP_LOGICAL_H,
              g_palette.dark ? L"dark" : L"light",
@@ -4953,7 +5461,8 @@ void StripStart(void)
              g_lookEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabStyle=0)",
              g_sampleEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabThemeSample=0)",
              g_titleTrimEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTitleTrim=0)",
-             g_dotEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabDot=0)");
+             g_dotEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabDot=0)",
+             g_tipEnabled ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTip=0)");
 }
 
 void StripAttachFrame(HWND frame)
@@ -4989,8 +5498,11 @@ void StripDetachFrame(HWND frame)
         state->enabled = FALSE;
         if (state->strip && g_dragStrip == state->strip)
             DragForget();
+        if (state->strip && g_tipStrip == state->strip)
+            TipStop();
         state->wwf = NULL;
         state->strip = NULL;
+        state->tip = NULL;
         if (state->font) { DeleteObject(state->font); state->font = NULL; }
         ReleaseSurface(state);
     }
@@ -5011,6 +5523,14 @@ void StripDetachFrame(HWND frame)
         }
         if (g_strips[i].strip && IsWindow(g_strips[i].strip))
             SetWindowLongPtrW(g_strips[i].strip, GWLP_USERDATA, (LONG_PTR)&g_strips[i]);
+
+        // The tooltip window carries the same pointer for the same reason and has to be re-pointed
+        // with it. It is easy to miss because it is usually not there: a frame whose tab has never
+        // been hovered has no tooltip window at all, so a version of this loop that forgot it would
+        // be right on every machine until somebody hovered a tab and then closed a different
+        // document.
+        if (g_strips[i].tip && IsWindow(g_strips[i].tip))
+            SetWindowLongPtrW(g_strips[i].tip, GWLP_USERDATA, (LONG_PTR)&g_strips[i]);
     }
 }
 
@@ -5025,6 +5545,12 @@ void StripOnFrameDpiChanged(HWND frame)
         return;
 
     LogWrite(L"strip  hwnd=0x%p  DPI %d -> %d, re-scaling the strip", (void*)frame, state->dpi, dpi);
+
+    // A panel measured at the old DPI is the wrong size for the new one, and nothing re-measures it
+    // while it is up. Taken away rather than rebuilt: the pointer has just crossed monitors, which
+    // is not a hover.
+    if (state->strip && g_tipStrip == state->strip)
+        TipStop();
 
     // One call, and it is the same one StripAttachFrame and TryBind make. Everything derived from
     // DPI - the height, the font, the size of the back buffer - is rebuilt from the new value in one

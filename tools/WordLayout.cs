@@ -154,7 +154,12 @@ public static class WordLayout
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
     public static RECT RectOf(IntPtr hwnd) { RECT r; GetWindowRect(hwnd, out r); return r; }
     public static bool Maximized(IntPtr hwnd) { return IsZoomed(hwnd); }
-    public static string TitleOf(IntPtr hwnd) { StringBuilder t = new StringBuilder(256); GetWindowText(hwnd, t, 256); return t.ToString(); }
+    // 1024 rather than 256, and the extra room is not for window titles. WordTab's tooltip carries
+    // its whole text on the window itself so a suite can read what was drawn rather than infer it,
+    // and that is a document name and a full path with a newline between them - past 256 for any
+    // document more than a few folders deep. A widened buffer is a strict superset: no caller can
+    // tell the difference on a string that already fitted.
+    public static string TitleOf(IntPtr hwnd) { StringBuilder t = new StringBuilder(1024); GetWindowText(hwnd, t, 1024); return t.ToString(); }
 
     public static void Resize(IntPtr hwnd, int cx, int cy)
     {
@@ -185,6 +190,13 @@ public static class WordLayout
     }
 
     public static IntPtr GetForeground() { return GetForegroundWindow(); }
+
+    // The tooltip's appearance delay IS this number, and its auto-hide is ten times it: the add-in
+    // asks Windows rather than carrying a constant of its own, so that WordTab's tooltip arrives when
+    // the user's other tooltips arrive. A suite that waited a hardcoded 500ms would be asserting
+    // against the default of a setting instead of against the product.
+    [DllImport("user32.dll")] static extern int GetDoubleClickTime();
+    public static int DoubleClickTime() { return GetDoubleClickTime(); }
 
     [DllImport("user32.dll")] static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
     const int GWL_EXSTYLE = -20;

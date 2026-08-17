@@ -417,9 +417,26 @@ $script:WordChromeClasses = @(
     'MSO_BORDEREFFECT_WINDOW'    # the drop shadow Word draws around its own popups
 )
 
+# The add-in's OWN top-level windows, and they are a third category rather than more chrome.
+#
+# "Word drew this and it is not asking anything" and "WordTab drew this" are different facts, and
+# folding ours into the list above would put a window this project controls into a list whose comment
+# says every entry was measured coming out of Word.
+#
+# It is not hypothetical tidiness. The tooltip is the add-in's first top-level window - the strip is a
+# child and so was never enumerated here - and it is 917x92 on this rig, comfortably past the size
+# floor. Before this existed the classifier called it a `question`, so the first hover in any suite
+# made every dialog guard in the harness report that Word was asking something, including the one
+# Close-AllWord uses to decide whether it may keep closing windows.
+$script:WordTabClasses = @(
+    'WordTabTip',      # the hover tooltip: a document's full name and the folder it is in
+    'WordTabStrip'     # a child today, but it is ours and the answer must not depend on that
+)
+
 function Get-WordWindowKind($class, $width, $height) {
     if ($class -eq 'OpusApp')  { return 'frame' }
     if ($class -eq '#32768')   { return 'menu' }
+    if ($script:WordTabClasses -contains $class)    { return 'ours' }
     if ($script:WordChromeClasses -contains $class) { return 'chrome' }
 
     # A floor, as a second filter and not as the first one. Both measured prompts are 920 wide, so
@@ -460,6 +477,90 @@ function Get-WordWindows {
 function Get-WordDialog {
     foreach ($w in @(Get-WordWindows)) { if ($w.Kind -eq 'question') { return $w } }
     return $null
+}
+
+<#
+  WordTab's own hover tooltip, or $null if none is on screen.
+
+  **This is the only text the add-in draws that can be read from outside the process.** A tab name is
+  painted and stored nowhere, which is why check-title has to assert a log line about what was
+  *computed* and then photograph the pixels separately to show it was *drawn*. The tooltip puts its
+  whole text on the window itself with SetWindowTextW for exactly that reason, so here the drawn
+  string can simply be asked for.
+
+  The two lines - the document's name, then the folder it is in - are separated by a newline, and are
+  split out here so no caller has to know that.
+
+  **Returns the VISIBLE one, and that distinction matters.** A tooltip window outlives the tooltip:
+  one is created on the first hover of a frame and then hidden and re-shown for the rest of the
+  session. A test that asked whether the window existed would pass forever after the first hover.
+#>
+function Get-WordTabTip {
+    foreach ($id in @(Get-WordPidList)) {
+        foreach ($w in [WordLayout]::TopLevel($id)) {
+            if ($w.Class -ne 'WordTabTip') { continue }
+            if (-not $w.Visible) { continue }
+
+            $text  = [WordLayout]::TitleOf($w.Hwnd)
+            $lines = @($text -split "`n")
+            return [pscustomobject]@{
+                Hwnd   = $w.Hwnd
+                Pid    = $id
+                Text   = $text
+                Lines  = $lines
+                # NOT @(... | Select-Object -First 1). The array wrapper survives the assignment and
+                # the property comes back as the string "System.Object[]", which compares unequal to
+                # every name there is and reads in a transcript like a tooltip drawing garbage. The
+                # `@()` habit that guards .Count elsewhere in this file is wrong on a scalar.
+                Name   = $lines | Select-Object -First 1
+                Folder = $(if ($lines.Count -gt 1) { $lines[1] } else { '' })
+                Left   = $w.Left;  Top    = $w.Top
+                Right  = $w.Right; Bottom = $w.Bottom
+                Width  = $w.Right - $w.Left
+                Height = $w.Bottom - $w.Top
+            }
+        }
+    }
+    return $null
+}
+
+<#
+  Wait for the tooltip to be on screen, or to be gone, and report how long it took.
+
+  Bounded, and it prints the latency, which is the shape the tear-off slice settled on after a sleep
+  cost it three false failures: a fixed wait long enough to be safe cannot tell a tooltip that
+  arrives on time from one arriving a second late, and "how long did it take" is a measurement worth
+  having in the transcript rather than a number nobody sees.
+
+  The default allows for the appearance delay, which is the system's double-click time and is a
+  setting the user can change - so it is read rather than assumed.
+#>
+function Wait-WordTabTip {
+    param([bool]$Present, [int]$Seconds = 0, [string]$What = 'the tooltip')
+
+    if ($Seconds -le 0) {
+        $Seconds = [int]([math]::Ceiling(([WordLayout]::DoubleClickTime() / 1000.0) + 3))
+    }
+
+    # A result object rather than the tooltip itself, because half the calls here are waiting for it
+    # to be ABSENT and "$null" would then mean both "it went, as asked" and "it never went". Those are
+    # a pass and a failure, and a function that returns the same value for both is the shape of test
+    # that reports the wrong thing.
+    $started  = Get-Date
+    $deadline = $started.AddSeconds($Seconds)
+    while ((Get-Date) -lt $deadline) {
+        $tip = Get-WordTabTip
+        if (($null -ne $tip) -eq $Present) {
+            $ms = [int]((Get-Date) - $started).TotalMilliseconds
+            Write-HarnessNote ("{0}: {1} after {2}ms" -f $What, $(if ($Present) { 'up' } else { 'gone' }), $ms)
+            return [pscustomobject]@{ Ok = $true; Tip = $tip; Ms = $ms }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    $ms = [int]((Get-Date) - $started).TotalMilliseconds
+    Write-HarnessNote ("{0}: still {1} after {2}ms" -f $What, $(if ($Present) { 'absent' } else { 'up' }), $ms)
+    return [pscustomobject]@{ Ok = $false; Tip = (Get-WordTabTip); Ms = $ms }
 }
 
 <#
@@ -1187,6 +1288,28 @@ if ($script:HarnessSelfTest) {
     }
 
     Remove-Item -Path $scratch -Recurse -Force -ErrorAction SilentlyContinue
+
+    # ---- what a window is, which is the other thing in here that can be wrong silently -----------
+    #
+    # Get-WordWindowKind is a pure function of a class name and a size, so it can be driven with no
+    # Word at all - and it is worth driving, because the way it fails is not a red suite. A window
+    # wrongly classified as a `question` makes every dialog guard in the harness report that Word is
+    # asking something, and the guards are what stop a run: the whole battery goes red naming a
+    # save prompt that does not exist. That is exactly what the tooltip did on its first drive.
+    Write-Host ''
+    Write-Host 'WordTabHarness self-test: what a top-level window is' -ForegroundColor Cyan
+    Write-Host ''
+
+    Check ((Get-WordWindowKind 'OpusApp' 900 700) -eq 'frame')  'a Word frame is a frame'
+    Check ((Get-WordWindowKind '#32768' 411 334) -eq 'menu')    'a popup menu is a menu'
+    Check ((Get-WordWindowKind 'SysShadow' 416 339) -eq 'chrome') "a menu's shadow is chrome, not a question"
+    Check ((Get-WordWindowKind 'NUIDialog' 920 713) -eq 'question') 'the save prompt is still a question'
+    Check ((Get-WordWindowKind '#32770' 1440 960) -eq 'question')   'Save As is still a question'
+
+    # The sizes are the ones measured on this rig: the tooltip is well past the 150x60 floor, so
+    # nothing but the class name keeps it out of `question`.
+    Check ((Get-WordWindowKind 'WordTabTip' 917 92) -eq 'ours')  "WordTab's tooltip is ours, not a question"
+    Check ((Get-WordWindowKind 'WordTabStrip' 1400 48) -eq 'ours') "WordTab's strip is ours, not a question"
 
     $total = $script:selfPass + $script:selfFail
     Write-Host ''

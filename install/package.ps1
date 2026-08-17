@@ -190,7 +190,8 @@ WHAT YOU CAN DO WITH IT
   back. Right-click a tab for Save, Close, Close Others, Close Tabs to the Right, Close All, and the
   same two Move commands. The x closes a tab, middle-click does too, + makes a new document, and
   Ctrl+Tab / Ctrl+Shift+Tab step along the row. A document with unsaved changes shows a dot where its
-  x is.
+  x is. Rest the pointer on a tab and it tells you the document's full name and the folder it is in -
+  which is what you want when there are enough documents open that the names get cut short.
 
 IF YOU WANT TO TURN SOMETHING OFF
 

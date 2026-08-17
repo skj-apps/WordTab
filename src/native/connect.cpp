@@ -454,6 +454,92 @@ BOOL WordTabReadModified(const HWND* frames, int count, BOOL* modified)
     return TRUE;
 }
 
+// Which folder the document behind one tab lives in.
+//
+// **Read on demand rather than folded into the janitor's pass, and that is a deliberate difference
+// from the dot.** The dot is polled because the thing it reports changes while nobody is looking; a
+// document's folder changes only when the user does Save As, and the only moment anything needs to
+// know it is the moment a tooltip is about to appear. Polling for it would mean a BSTR allocated per
+// window twice a second to answer a question nobody had asked. The cost of asking here is paid by
+// the hover that asked.
+//
+// One window, not the whole row, for the same reason: a hover is about one tab. The collection still
+// has to be walked to find it, because Window.Hwnd is the only join between Word's windows and our
+// frames - the same join, and the same (LONG)(LONG_PTR) narrowing, as WordTabReadModified.
+//
+// **Document.Path, not FullName.** The name is already on the tab and on the first line of the
+// tooltip; repeating it in the second line would spend the width that makes the folder readable.
+// Word returns it with no trailing separator, and an empty string for a document that has never been
+// saved - which is a fact about that document, not a failure to read it.
+BOOL WordTabReadDocumentPath(HWND frame, wchar_t* out, int chars)
+{
+    if (!out || chars <= 0)
+        return FALSE;
+    out[0] = L'\0';
+
+    if (!frame || !IsWindow(frame) || !g_application)
+        return FALSE;
+
+    IDispatch* windows = GetObjectProperty(g_application, L"Windows");
+    if (!windows)
+        return FALSE;
+
+    LONG total = 0;
+    if (!GetLongProperty(windows, L"Count", &total))
+    {
+        windows->Release();
+        return FALSE;
+    }
+
+    // Past here the answer is determinate. Falling off the end of the loop without finding the frame
+    // means Word answered and no window of its claims it, and an empty folder is the truth about a
+    // document this Application cannot see.
+    BOOL answered = TRUE;
+
+    for (LONG index = 1; index <= total; index++)
+    {
+        IDispatch* window = GetItemAt(windows, index);
+        if (!window)
+            continue;
+
+        LONG reported = 0;
+        if (!GetLongProperty(window, L"Hwnd", &reported) ||
+            reported != (LONG)(LONG_PTR)frame)
+        {
+            window->Release();
+            continue;
+        }
+
+        IDispatch* document = GetObjectProperty(window, L"Document");
+        window->Release();
+        if (!document)
+        {
+            // The window is Word's and it will not hand over its document. That is a failure to
+            // read, not a document without a folder, so it is reported as one.
+            answered = FALSE;
+            break;
+        }
+
+        BSTR path = GetStringProperty(document, L"Path");
+        document->Release();
+
+        if (!path)
+        {
+            answered = FALSE;
+        }
+        else
+        {
+            wcsncpy(out, path, (size_t)(chars - 1));
+            out[chars - 1] = L'\0';
+            SysFreeString(path);
+        }
+        break;
+    }
+
+    windows->Release();
+    return answered;
+}
+
 // Application.Documents.Add(), late-bound like everything else here so the build needs nothing from
 // Office.
 //

@@ -60,6 +60,7 @@ $Switches = @(
     @{ Name = 'TabTitleTrim';   Does = 'Trim "  -  Compatibility Mode" and the like off a tab''s name.' }
     @{ Name = 'TabDot';         Does = 'Show a dot instead of the x on a document with unsaved changes. Off, WordTab never asks Word about your documents.' }
     @{ Name = 'TabKeys';        Does = 'Ctrl+Tab and Ctrl+Shift+Tab step along the tab row. TURN THIS OFF if you need Ctrl+Tab to type a tab inside a table.' }
+    @{ Name = 'TabTip';         Does = 'Resting the pointer on a tab shows the document''s full name and the folder it is in. Off, WordTab never asks Word where your documents live.' }
     @{ Name = 'ShowLoadBanner'; Does = 'A dialog at Word startup confirming WordTab loaded. Off by default from the installer.' }
 )
 
