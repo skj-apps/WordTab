@@ -600,6 +600,33 @@ public static class WordLayout
     public static IntPtr WindowAt(int x, int y) { POINT p; p.X = x; p.Y = y; return WindowFromPoint(p); }
     public static POINT Cursor() { POINT p; GetCursorPos(out p); return p; }
 
+    // What SHAPE the pointer currently is, as opposed to where it is.
+    //
+    // The only way a check script can read feedback the add-in gives outside the strip's own pixels: a
+    // tab dragged clear of the row is over Word's document, where nothing of ours may paint, so the
+    // cursor is what says the gesture has changed meaning. GetCursorInfo reports the system-wide
+    // cursor, so this reads what the add-in set from inside Word.
+    //
+    // Comparable against SystemCursor() because the standard cursors are shared objects: LoadCursorW
+    // with a NULL instance hands every process the same handle for the same one, so "is this
+    // IDC_SIZEALL" is an equality test rather than a bitmap comparison. Measured, not assumed - see
+    // the tear-off section of check-reorder.ps1.
+    [StructLayout(LayoutKind.Sequential)]
+    struct CURSORINFO { public int cbSize; public int flags; public IntPtr hCursor; public POINT pt; }
+    [DllImport("user32.dll")] static extern bool GetCursorInfo(ref CURSORINFO info);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr LoadCursorW(IntPtr inst, IntPtr name);
+
+    public static IntPtr CursorShape()
+    {
+        CURSORINFO info = new CURSORINFO();
+        info.cbSize = Marshal.SizeOf(typeof(CURSORINFO));
+        if (!GetCursorInfo(ref info)) return IntPtr.Zero;
+        return info.hCursor;
+    }
+
+    // IDC_ARROW is 32512 and IDC_SIZEALL is 32646; passed as the resource ordinals they are.
+    public static IntPtr SystemCursor(int id) { return LoadCursorW(IntPtr.Zero, new IntPtr(id)); }
+
     // Which process owns a window. Word puts a Protected View document in a sandboxed WINWORD of its
     // own, and an add-in's Application object speaks only for the process it is loaded in - so "same
     // process?" is the difference between a document the object model can see and one it cannot,

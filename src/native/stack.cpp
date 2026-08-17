@@ -55,6 +55,20 @@ struct Member
     // a fact about the window; it is a decision about it, and nothing the window does can revoke it.
     // See StackTearOffTab.
     BOOL tornOff;
+
+    // Whatever document turns up in this frame next is a NEW one, so its tab belongs at the end of
+    // the row rather than at the place this frame used to hold.
+    //
+    // Set while a frame is out of the row and holding no document - Word does not destroy a frame
+    // when its last document closes, it hides it and puts the next document straight into it, so a
+    // member can come back carrying something the user has never seen. Without this the new document
+    // silently inherits the old one's position: drag a tab out, close it, press + and the new
+    // document arrives in the middle of the row.
+    //
+    // Deliberately NOT set for every leave. A minimised window still holds its document, and a user
+    // who minimises Word and restores it must find the row exactly as they left it - a rule that sent
+    // every rejoining window to the end would shuffle the tabs every time one blinked.
+    BOOL rejoin;
 };
 
 static void Reconcile(void);
@@ -287,10 +301,31 @@ static void Present(void)
 // Joining and leaving.
 // ---------------------------------------------------------------------------------------------
 
-static void Join(Member* member)
+// Take a member out of the middle of the array and put it at the end, keeping everything else in
+// order. The array *is* the tab order, so this is how a tab is made the last one - and it is the same
+// operation StackMoveTab performs, done to a member that is not in the row yet.
+//
+// Returns where the member now lives: the caller's pointer is into the array and the memmove moves it.
+static Member* MoveToEnd(Member* member)
+{
+    int index = (int)(member - g_members);
+    if (index < 0 || index >= g_memberCount || index == g_memberCount - 1)
+        return member;
+
+    Member moving = *member;
+    memmove(&g_members[index], &g_members[index + 1],
+            (size_t)(g_memberCount - index - 1) * sizeof(Member));
+    g_members[g_memberCount - 1] = moving;
+    return &g_members[g_memberCount - 1];
+}
+
+// Returns TRUE if the member array was compacted, which the caller has to know about because it is
+// iterating over it. There is one caller - the janitor - and that is checked by the compiler rather
+// than by hoping: this is a static with a single call site.
+static BOOL Join(Member* member)
 {
     if (member->joined)
-        return;
+        return FALSE;
 
     // The one place a torn-off window is kept out, deliberately here rather than in the janitor's
     // eligibility test. Eligibility answers "could this window be a tab", which is still yes - it is
@@ -298,7 +333,25 @@ static void Join(Member* member)
     // back half a second after the user pulled it out. This answers the different question of whether
     // it may be, and putting it on the only path into the stack means a future caller cannot miss it.
     if (member->tornOff)
-        return;
+        return FALSE;
+
+    // A frame that lost its document and has been handed a new one is carrying a document the user
+    // has never seen, so its tab goes where every new document's tab goes: the end. Without this the
+    // new document inherits the position the old one held, and Word chooses which frame to recycle,
+    // so from the user's side a new document arrives in the middle of the row for no visible reason.
+    BOOL compacted = FALSE;
+    if (member->rejoin)
+    {
+        member->rejoin = FALSE;
+        Member* end = MoveToEnd(member);
+        if (end != member)
+        {
+            compacted = TRUE;
+            LogWrite(L"stack  hwnd=0x%p  rejoining with a new document - its tab goes to the end",
+                     (void*)member->frame);
+            member = end;
+        }
+    }
 
     member->joined = TRUE;
     GetWindowRect(member->frame, &member->joinRect);
@@ -323,6 +376,7 @@ static void Join(Member* member)
 
     Present();
     StripRefreshTabs();
+    return compacted;
 }
 
 static void Leave(Member* member, const wchar_t* why, BOOL restorePosition)
@@ -722,15 +776,35 @@ void StackJanitor(void)
             // frames of its own accord - closing one document was measured to hide a *different*
             // window for a moment - and a rule keyed to that would drop a torn-off window back into
             // the stack while the user was looking at it.
-            if (member->tornOff && (!IsWindow(member->frame) || !StripHasDocument(member->frame)))
+            BOOL empty = !IsWindow(member->frame) || !StripHasDocument(member->frame);
+
+            if (member->tornOff && empty)
             {
                 member->tornOff = FALSE;
                 LogWrite(L"stack  hwnd=0x%p  no longer torn off - its document has gone and the "
                          L"frame is Word's to reuse", (void*)member->frame);
             }
 
+            // Recorded from the same fact, and while it is still true. A frame sitting out of the row
+            // with no document in it is one Word is free to hand the next document to, and that
+            // document has never had a tab - so it gets a new one, at the end, rather than the place
+            // this frame used to hold. Read again on every tick because it is a state, not an event:
+            // the frame can be emptied and refilled between two of them.
+            //
+            // Not set for a member that still holds a document. That is a window Word has merely
+            // hidden or the user has minimised, and it must come back exactly where it was.
+            if (empty)
+                member->rejoin = TRUE;
+
             if (EligibleToJoin(member->frame))
-                Join(member);
+            {
+                // Join can move this member to the end of the array, which shifts everything after it
+                // down one - so the entry now at i is the one that was at i+1 and has not been looked
+                // at. Stepping back is what makes the pass complete rather than leaving a window's
+                // membership half a second stale.
+                if (Join(member))
+                    i--;
+            }
         }
         else if (!EligibleToStay(member->frame))
         {

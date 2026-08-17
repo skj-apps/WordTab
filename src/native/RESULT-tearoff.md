@@ -1,16 +1,17 @@
 # Taking a tab out of the stack
 
-**Status: passed 2026-08-16.** `Move to New Window` on the tab context menu takes one document out of
-the stacked window and leaves it standing on its own, offset from the stack, with its taskbar button
-and its Alt+Tab entry back.
+**Status: both halves passed 2026-08-16.** A document comes out of the stacked window and stands on
+its own — by `Move to New Window` on the tab context menu, or by dragging its tab off the strip and
+letting go. It lands offset from the stack, with its taskbar button and its Alt+Tab entry back.
 
-This is the first half of tear-off. The second half is the gesture — dragging a tab off the strip —
-and it is deliberately a separate slice, because it is a `strip.cpp` input change on top of a
-mechanism that is by then already proven.
+Two slices, in this one file on purpose: the mechanism and the gesture are one feature and what is
+known about taking a window out of a stack should have one place to be read. **The mechanism half is
+first, below; the gesture half is at the end.**
 
-**243 checks, 0 failures** across the five affected suites: menu 63 (was 37), look 48, stack 60,
-startscreen 50, soak 22. **No new suite and no new probe** — the section went into `check-menu`, which
-already opens a stack of documents and already has the machinery to open and read the menu.
+**243 checks, 0 failures** across the five affected suites for the mechanism: menu 63 (was 37), look
+48, stack 60, startscreen 50, soak 22. **No new suite and no new probe** — the section went into
+`check-menu`, which already opens a stack of documents and already has the machinery to open and read
+the menu.
 
 ---
 
@@ -152,16 +153,176 @@ it, leaving the four windows every section below was written against.
 - **`Get-StripPlacement` over all five windows**, because the torn-off window is moved and refitted
   and that is exactly the operation the 38px bug lived in.
 
-## Still open
+## Still open after the mechanism half
 
-- **The gesture.** Dragging a tab off the strip is the next slice; it calls `StackTearOffTab` and
-  nothing in this file changes.
+- ~~**The gesture.**~~ Built; see below.
+- ~~**`TabTearOff=0` has not been driven.**~~ Driven positively by the gesture slice; see below.
 - **Putting one back.** There is no way to drag a window into a stack, and a torn-off window rejoins
   only by losing its document. That is deliberate for now — a window that silently rejoined after the
-  user pulled it out would be worse — but it is the obvious next question after the gesture.
-- **`TabTearOff=0` has not been driven.** The switch is read at `StackStart`, so proving it needs a
-  Word restart, and this slice ran out of the machine time it had asked for. Every other switch in
-  this project is driven positively and this one is not yet; it should be picked up by the gesture
-  slice, which has to run the battery anyway.
+  user pulled it out would be worse — but it is the obvious next question.
 - **Tearing off a maximized stack is not driven either** — the three-quarters branch of `PlaceTornOff`
-  is reasoned and logged, not measured. `check-menu` runs at 900x700.
+  is reasoned and logged, not measured. `check-menu` and `check-reorder` both run at 900x700.
+
+---
+
+# The gesture: dragging a tab out of the row
+
+**Status: passed 2026-08-16.** Drag a tab a row-height clear of the strip and let go, and that
+document comes out of the stack. The pointer changes shape while it is out there, so which of the two
+things the drop will do is visible before letting go.
+
+**`check-reorder` 37 → 72 checks.** **No new suite and no new probe** — the gesture is a drag, and the
+suite that drives drags already had the fixture, the confirmed-input machinery and the only honest
+oracle for the tab order. One new primitive in the shared harness (`CursorShape`/`SystemCursor` in
+`WordLayout.cs`) because the feedback is a cursor and nothing could read one.
+
+## One press, two meanings
+
+The drop means *reorder* or *tear off* depending only on where the pointer is when the button comes
+up, and it can change its mind as often as the user likes on the way. That is one state flag,
+`g_dragTorn`, on top of the drag that already existed.
+
+- **The threshold is a whole row-height clear of the strip, above or below** — `TEAROFF_LOGICAL_SLOP`,
+  written as `STRIP_LOGICAL_H` because that is what it means rather than a number that happens to
+  equal it. Sixteen times the reorder slop, and it is the one threshold in this file chosen for **the
+  cost of being wrong** rather than for how it feels: a reorder aimed at the wrong slot is fixed by
+  dragging again, and there is no gesture that puts a torn-off window back, so a tear the user did not
+  mean is a window they have to go and find.
+- **The way back in is half the way out.** Without hysteresis the boundary is a place a hand can come
+  to rest, and a pointer sitting on the line flips the gesture several times a second with the tab
+  jumping under the hand each time.
+- **Starting the drag is deliberately asymmetric.** Horizontal travel past 4px starts a reorder, as it
+  always has; vertical travel starts nothing at all until it is already past the tear-off threshold.
+  A hand that slips downwards while clicking a tab must still be a click — but the one gesture with no
+  horizontal component whatsoever, pulling a tab straight down, is precisely the one this slice exists
+  for, and the old purely-horizontal test could never have seen it. The comment it replaced said in so
+  many words *"there is no tear-off in this add-in, so dragging a tab downwards is not a different
+  gesture"*.
+- **The drop posts `CMD_TEAROFF`**, the same command the menu item raises, through the same
+  `WM_WORDTAB_CMD` route. One implementation of "a tab was torn off" rather than one per way of asking
+  for it, and that path already drops the command if the window has gone in the meantime.
+
+## The feedback, and what it cost to not have a better one
+
+**A tab dragged out of the row is somewhere the strip cannot draw.** The pointer is over Word's
+document, or off the window entirely, and a child window may not paint there. There is no floating
+window preview following the hand, the way a browser does it — that would mean moving the real window
+live, which is a different and much larger slice.
+
+So the two signals are:
+
+- **The row lets go.** The order goes back to what it was when the tab was picked up, and the tab
+  stops following the pointer: it sits still in the slot it came from while the pointer walks away.
+  **A gesture that changes what it means has to show something at the moment it changes**, and this is
+  the only change the strip can make that is visible whether or not the tab has been moved yet.
+  Following the pointer would go on saying "this is being carried in the row", which is the one thing
+  that has stopped being true.
+- **`IDC_SIZEALL`** — Windows' own "you are relocating this", not a cursor invented here. Set directly
+  rather than through `WM_SETCURSOR`, because that message is not sent to anybody while the mouse is
+  captured; for the same reason nothing else is going to put the arrow back underneath us.
+
+**The cursor turned out to be a proper test oracle, which was not obvious.** Standard cursors are
+shared objects — `LoadCursorW` with a NULL instance hands every process the same handle for the same
+one — so a check script can assert *identity* rather than compare bitmaps. Measured before it was
+relied on: `IDC_ARROW` is `0x10003` and `IDC_SIZEALL` is `0x10015` in both processes. The assertion is
+still written as a **change** first, because "some other cursor" would satisfy the change on its own.
+
+**And it must be read while the button is still down.** The first version of the `TabTearOff=0`
+section read it after the release and failed: by then the pointer is over a document and Word has set
+its I-beam. The shape belongs to us only for as long as we hold the capture.
+
+## Three things found on the way, and two of them were not this feature
+
+### A new document was arriving in the middle of the row
+
+**A real defect, pre-existing since the mechanism half, and three moves from a user.** Drag a tab out,
+close that window, press `+`: the new document arrives where the torn-off one used to be. Measured as
+tab 1 of 5.
+
+The cause is one this project has now written down four times. **Word does not destroy a frame when
+its last document closes — it hides it and puts the next document straight into it.** The row order
+*is* the member array, and a recycled frame still holds its old place in that array, so a document the
+user has never seen inherits the position of one that has gone. The add-in's own log said it in one
+line: `joined, snapped to ...` for a handle that had been torn off two minutes earlier.
+
+**The fix is narrow on purpose.** A member that is out of the row *and holding no document* is marked
+`rejoin`, and a rejoining member is moved to the end of the array before it joins. The obvious wider
+rule — "anything that rejoins goes to the end" — is wrong and would have been worse than the bug:
+**a minimised window still holds its document**, and a user who minimises Word and restores it must
+find the row exactly as they left it, not shuffled. The flag is therefore set from the same fact, on
+the same tick, as the one that clears `tornOff`.
+
+Two smaller things fell out of it:
+
+- **`Join` now returns whether it compacted the array**, and the janitor steps its index back when it
+  did. It has exactly one caller, which is why that is safe to make its business rather than hiding
+  the move behind a deferred queue.
+- **The move-to-end is logged.** The one writer in this project that moved something and said nothing
+  cost a slice to find (`StripSetNatural`, `RESULT-chrome.md`), and this is the same shape: a silent
+  reorder nobody asked for.
+
+### The strip was a second behind the pointer
+
+The suite failed three assertions with the pointer confirmed to be exactly where it was aimed, and the
+add-in's log showed the transition arriving **a second late**. The cause was in the new code: while a
+tab is out of the row it does not move, and I was calling `StripRefreshTabs()` on every mouse-move
+anyway — a full composite of every strip in the stack, sixty times a second, to redraw a tab that was
+already where it belonged. Now it repaints only when the tab is not already home, which out there is
+at most once.
+
+**The test lesson is the bigger half.** The assertion was `sleep 250ms, then read the log`, and that
+is exactly the shape this project has already written a rule against: a fixed wait long enough to be
+safe hides the difference between an add-in that reacts instantly and one that is a second behind,
+and a wait that is too short fails while naming the wrong thing — *"the tab did not come back into
+the row"* when what happened is that the strip had not processed the move yet. It is now a bounded
+wait that **asserts the event and prints its latency**: 23ms out, 345ms back, 15ms out again.
+
+The reason it was caught at all is that **the same script was run twice and disagreed with itself**.
+One run did the whole round trip; the next never re-entered the row. A single red run would have been
+read as a threshold that was wrong.
+
+### `far` is still a macro
+
+`BOOL far = ...` compiles as `BOOL = ...`: `windef.h` has `#define far` for the sake of 16-bit code,
+and the compiler reports the error on the line *after* it. Renamed to `travelled`.
+
+## What the suite asserts, and why in that shape
+
+The section is in the **middle** of `check-reorder`, and the suite opens `$Documents = 5` rather than
+4 — the fifth belongs to this section, which tears it off and closes it, leaving the four every
+section below was written against. That placement is the reason the recycled-frame defect was found:
+the `+` section runs downstream of it, and appending the new section at the end would have shipped
+the bug.
+
+- **The control comes first.** A tab carried to 0.4 of a row below the strip still reorders. Without
+  it, "dragging a tab out of the row tears it off" is satisfied by a build that tears off whenever the
+  pointer leaves the strip at all.
+- **The threshold is measured off the strip, not copied from the source.** `TEAROFF_LOGICAL_SLOP` is
+  `STRIP_LOGICAL_H`, so the strip's own height on screen *is* the threshold in physical pixels at
+  whatever DPI the suite is running at — 64px here. A number mirrored from a `#define` goes stale
+  quietly.
+- **One continuous gesture, out and back and out again**, so both thresholds are driven by the route
+  rather than by a second fixture.
+- **The pointer is read back after every mid-gesture move.** An injected mouse move can silently not
+  take, and "the add-in did not notice the pointer come back" and "the pointer never came back" are
+  the same three failing assertions.
+- **The row is read only after the torn-off window has been closed.** With five Word windows and four
+  tabs, `Get-TabSpot` computes its slots from the window count and is wrong *silently* — the slots are
+  merely narrower and the clicks still land. Same trap as `Get-Spot` in the mechanism half.
+- **"It tore off INSTEAD of reordering" is a separate assertion.** The tab is carried two places along
+  the row before it is taken out of it, so a build that committed both would leave the remaining tabs
+  in a different order — and every geometry assertion would still pass.
+- **`TabTearOff=0` is driven positively**: Word restarted with the switch off, the startup line
+  asserted to read `detach=off`, then the same drag out past the same threshold asserted to **reorder**
+  — the input landed, it just meant something else. The cursor is asserted to have stayed an arrow, so
+  nothing was offered that would then be refused. Costs one Word restart, because the switch is read
+  in `StackStart`.
+
+## Still open
+
+- **No live preview of the window being dragged**, and this is the honest gap. The feedback is the row
+  letting go plus a cursor, not a window following the hand. Doing it properly means moving the real
+  window during the drag, which is a slice of its own.
+- **Putting a window back into a stack** is still the obvious next question, and there is still no
+  gesture for it.
+- **The maximized branch of `PlaceTornOff`** remains reasoned rather than measured, by either half.

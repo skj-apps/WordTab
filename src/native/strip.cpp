@@ -69,6 +69,16 @@
 // smaller than everything else in this file, and the check script mirrors these numbers.
 #define DRAG_LOGICAL_SLOP   4
 
+// How far *out* of the row a carried tab has to go before letting go of it means "take this document
+// out of the stack" instead of "put it here". A whole row-height clear of the strip, above or below.
+//
+// Deliberately many times the reorder slop, and it is the one threshold in this file chosen for the
+// cost of being wrong rather than for how it feels: a reorder aimed at the wrong slot is fixed by
+// dragging again, but there is no gesture that puts a torn-off window back, so a tear the user did
+// not mean is a window they have to go and find. Written as the strip's own height because that is
+// what it means - one row clear of the row - and not as a number that happens to equal it today.
+#define TEAROFF_LOGICAL_SLOP  STRIP_LOGICAL_H
+
 // The tab row is bounded independently of the stack. 128 tabs at the 70px minimum is wider than any
 // monitor sold, so a layout array larger than this could only describe tabs nobody can see - and an
 // unbounded one on the stack of a WM_MOUSEMOVE handler is a different kind of problem.
@@ -308,6 +318,7 @@ static int  g_dragGrabDx = 0;       // how far into the tab, so it does not jump
 static int  g_dragLeft   = 0;       // the carried tab's left edge right now
 static int  g_dragFrom   = 0;       // the position it was picked up from - the log, and the undo
 static BOOL g_dragging   = FALSE;   // past the slop: this is a drag, not a click that has not ended
+static BOOL g_dragTorn   = FALSE;   // carried clear of the row: letting go now takes it out of the stack
 static HWND g_dragScroll = NULL;    // the strip running the auto-scroll timer, NULL when it is off
 static ATOM g_stripClass = 0;
 static UINT_PTR g_janitor = 0;
@@ -3004,7 +3015,20 @@ static HWND MenuTargetAt(StripState* state, HWND hwnd, POINT point)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Dragging a tab to reorder it.
+// Dragging a tab: along the row to reorder it, or out of the row to take its document out of the
+// stack.
+//
+// One gesture with two meanings and one press. Which one it is is decided continuously, by where the
+// pointer is when the button comes up, and it can change its mind as many times as the user likes on
+// the way - the two states are the same drag with the row either holding on to the tab or having let
+// go of it. What separates them is a threshold much larger than the one that starts the drag, and the
+// asymmetry is deliberate: a misaimed reorder is undone by dragging again, and a tear-off the user
+// did not mean is a window standing somewhere they have to go and find.
+//
+// Everything about *what happens* to a torn-off window belongs to the stack and was built and driven
+// before this: StackTearOffTab is what the Move to New Window menu item calls, and this drop raises
+// the same command by the same route. There is no second answer here to where the window goes, what
+// stops the janitor putting it straight back, or when it stops being torn off.
 //
 // The row rearranges *live*, as the tab is carried, rather than showing an insertion marker and
 // rearranging on the drop. Both are defensible; live wins here because every window in the stack
@@ -3023,14 +3047,34 @@ static HWND MenuTargetAt(StripState* state, HWND hwnd, POINT point)
 static void DragScrollStart(HWND hwnd);
 static void DragScrollStop(void);
 
+// What the pointer says while a tab is being carried.
+//
+// The cursor is the only feedback this add-in has outside the strip's own 32 pixels. A tab dragged
+// clear of the row is somewhere the strip cannot draw - the pointer is over Word's document, or off
+// the window entirely - and a child window may not paint there. So the shape of the pointer is what
+// distinguishes the two things a release can now mean, and IDC_SIZEALL is Windows' own "you are
+// relocating this", not a cursor invented here.
+//
+// System cursors are shared and cached by the window manager: LoadCursorW hands back the same handle
+// every time and there is nothing to destroy. Setting it while we hold the mouse capture is enough to
+// keep it - WM_SETCURSOR is not sent to anybody while the mouse is captured, so nothing else is going
+// to put the arrow back underneath us.
+static void DragCursor(BOOL torn)
+{
+    SetCursor(LoadCursorW(NULL, torn ? IDC_SIZEALL : IDC_ARROW));
+}
+
 // Forget the gesture without touching the row: a drop that was agreed to, or a strip destroyed
 // underneath one.
 static void DragForget(void)
 {
     DragScrollStop();
+    if (g_dragTorn)
+        DragCursor(FALSE);
     g_dragStrip = NULL;
     g_dragFrame = NULL;
     g_dragging  = FALSE;
+    g_dragTorn  = FALSE;
 }
 
 // Put the row back exactly as it was and stop carrying the tab - but keep the capture, because the
@@ -3051,6 +3095,9 @@ static void DragUndo(HWND hwnd, const wchar_t* why)
 
     g_dragFrame = NULL;
     g_dragging  = FALSE;
+    if (g_dragTorn)
+        DragCursor(FALSE);
+    g_dragTorn  = FALSE;
     DragScrollStop();
 
     if (!was || !frame || !IsWindow(frame))
@@ -3074,6 +3121,9 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
         BOOL was = g_dragging;
         g_dragFrame = NULL;
         g_dragging  = FALSE;
+        if (g_dragTorn)
+            DragCursor(FALSE);
+        g_dragTorn  = FALSE;
         DragScrollStop();
         if (was)
         {
@@ -3082,24 +3132,6 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
             StripRefreshTabs();
         }
         return;
-    }
-
-    int slop = Scaled(DRAG_LOGICAL_SLOP, state->dpi);
-    int dx   = point.x - g_dragPressX;
-
-    if (!g_dragging)
-    {
-        // Horizontal distance only. The row has no vertical meaning - there is no tear-off in this
-        // add-in, so dragging a tab downwards is not a different gesture, it is the same one done
-        // untidily - and a threshold that counted vertical movement would start a reorder from a
-        // hand that slipped while clicking.
-        if (dx > -slop && dx < slop)
-            return;
-
-        g_dragging = TRUE;
-        DragScrollStart(hwnd);
-        LogWrite(L"strip  hwnd=0x%p  drag started on 0x%p (tab %d)",
-                 (void*)hwnd, (void*)g_dragFrame, g_dragFrom);
     }
 
     RECT client;
@@ -3119,6 +3151,116 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
     if (layout.count <= 0)
     {
         DragUndo(hwnd, L"the row it was being carried in has no documents left");
+        return;
+    }
+
+    // How far the pointer is outside the strip, in the only direction the strip has any room to be
+    // outside in. The mouse is captured, so this keeps arriving - and keeps being meaningful - long
+    // after the pointer has left the window.
+    int outBy = 0;
+    if (point.y < client.top)
+        outBy = client.top - point.y;
+    else if (point.y > client.bottom)
+        outBy = point.y - client.bottom;
+
+    // Whether leaving the row can mean anything here. Two reasons it might not: the switch is off, or
+    // this is the only tab in the stack and there is nowhere for it to go - StackTearOffTab refuses
+    // both, and a cursor that promised something the drop then declines is worse than no cursor.
+    BOOL canTear = StackCanTearOff() && layout.count > 1;
+
+    int slop    = Scaled(DRAG_LOGICAL_SLOP, state->dpi);
+    int tearIn  = Scaled(TEAROFF_LOGICAL_SLOP, state->dpi);
+    int tearOut = tearIn / 2;      // hysteresis; see below
+    int dx      = point.x - g_dragPressX;
+
+    if (!g_dragging)
+    {
+        // Horizontal travel starts a reorder, exactly as it always has. Vertical travel starts
+        // nothing at all until it is a whole row clear of the strip - which is the tear-off threshold
+        // itself, not a slop of its own.
+        //
+        // That asymmetry is the point rather than an oversight. A hand that slips downwards while
+        // clicking a tab must still be a click, so vertical movement cannot have a small threshold;
+        // but the one gesture that has no horizontal component whatsoever - pulling a tab straight
+        // down out of the row - is precisely the one this exists for, and a purely horizontal test
+        // could never see it.
+        // Not called `far`: windef.h still #defines that to nothing for the sake of 16-bit code, so
+        // `BOOL far = ...` compiles as `BOOL = ...` and the error names the line after it.
+        BOOL travelled = (dx <= -slop || dx >= slop);
+        if (!travelled && canTear && outBy > tearIn)
+            travelled = TRUE;
+        if (!travelled)
+            return;
+
+        g_dragging = TRUE;
+        DragScrollStart(hwnd);
+        LogWrite(L"strip  hwnd=0x%p  drag started on 0x%p (tab %d)",
+                 (void*)hwnd, (void*)g_dragFrame, g_dragFrom);
+    }
+
+    // In the row or out of it. The threshold is lower on the way back in than on the way out, because
+    // the boundary is somewhere a hand can come to rest: with one threshold a pointer sitting on the
+    // line flips the gesture between reordering and tearing off several times a second, and the tab
+    // jumps under the hand every time it does.
+    BOOL torn = canTear && (g_dragTorn ? (outBy > tearOut) : (outBy > tearIn));
+
+    if (torn != g_dragTorn)
+    {
+        g_dragTorn = torn;
+        DragCursor(torn);
+
+        if (torn)
+        {
+            // The row lets go. The order goes back to what it was when the tab was picked up, and
+            // the tab stops following the pointer - it sits still, in the slot it came from, while
+            // the pointer walks away from it.
+            //
+            // A gesture that changes what it means has to show something at the moment it changes,
+            // and this is the only change the strip can make that is visible whether or not the tab
+            // has been moved yet. Following the pointer would go on saying "this is being carried in
+            // the row", which is the one thing that has stopped being true.
+            StackMoveTab(g_dragFrame, g_dragFrom);
+            DragScrollStop();
+            LogWrite(L"strip  hwnd=0x%p  drag left the row - letting go now tears 0x%p off"
+                     L"  (%dpx outside a %dpx strip, threshold %d)",
+                     (void*)hwnd, (void*)g_dragFrame, outBy, (int)client.bottom, tearIn);
+        }
+        else
+        {
+            DragScrollStart(hwnd);
+            LogWrite(L"strip  hwnd=0x%p  drag back in the row - letting go now reorders 0x%p"
+                     L"  (%dpx outside a %dpx strip, threshold %d)",
+                     (void*)hwnd, (void*)g_dragFrame, outBy, (int)client.bottom, tearOut);
+        }
+
+        // StackMoveTab above has rearranged the row underneath the layout computed a few lines up.
+        LayoutOf(state, &client, frames, &layout);
+    }
+
+    if (g_dragTorn)
+    {
+        // Restated every move rather than only on the transition. The cursor is process-wide state
+        // and this costs one call; a tear-off gesture that silently reverted to an arrow half way
+        // through would be a gesture with no feedback at all.
+        DragCursor(TRUE);
+
+        // Repainted only when the tab is not already where it belongs, which out here is at most
+        // once. A carried tab moves with the pointer and every strip in the stack draws it, so the
+        // reorder path below pays for a full repaint of every window per mouse-move - but a tab that
+        // has been let go of by the row does not move at all, and doing that work per move buys
+        // nothing and puts the strip a visible fraction of a second behind the hand. Measured: with
+        // the unconditional refresh here, the add-in was still working through the moves that brought
+        // the pointer back into the row a second after the pointer had arrived.
+        int home = -1;
+        for (int i = 0; i < layout.count; i++)
+            if (frames[i] == g_dragFrame)
+                home = i;
+
+        if (home >= 0 && g_dragLeft != layout.tab[home].left)
+        {
+            g_dragLeft = layout.tab[home].left;
+            StripRefreshTabs();
+        }
         return;
     }
 
@@ -3186,7 +3328,9 @@ static void DragScrollStart(HWND hwnd)
 
 static void DragScrollTick(StripState* state, HWND hwnd)
 {
-    if (!g_dragging || g_dragStrip != hwnd || !g_dragFrame)
+    // g_dragTorn among the reasons to stop: a tab carried out of the row is not being aimed at a slot
+    // in it, so scrolling the row under it would be moving something the gesture is no longer about.
+    if (!g_dragging || g_dragTorn || g_dragStrip != hwnd || !g_dragFrame)
     {
         DragScrollStop();
         return;
@@ -3382,14 +3526,17 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         break;
 
-    // Letting go of a tab. The drop has nothing to commit - the row rearranged as the tab was
-    // carried - so this is bookkeeping and a log line. It is also where a press that never became a
-    // drag ends, which is a plain click and was already handled on the way down.
+    // Letting go of a tab. A drop back in the row has nothing to commit - the row rearranged as the
+    // tab was carried - so that is bookkeeping and a log line. A drop *outside* the row is the one
+    // that does something, and it is the only place in this file where releasing a button acts on
+    // where the pointer is rather than on what is under it. It is also where a press that never
+    // became a drag ends, which is a plain click and was already handled on the way down.
     case WM_LBUTTONUP:
         if (g_dragStrip == hwnd)
         {
             HWND frame = g_dragFrame;
             BOOL was   = g_dragging;
+            BOOL torn  = g_dragTorn;
             int  from  = g_dragFrom;
 
             // Cleared *before* the capture goes back. ReleaseCapture sends this window a
@@ -3399,7 +3546,23 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             if (GetCapture() == hwnd)
                 ReleaseCapture();
 
-            if (was && frame)
+            if (was && frame && torn)
+            {
+                // Posted, and posted as the same command the menu item raises. StackTearOffTab moves
+                // windows, changes which one is in front and refits an interior - none of which
+                // belongs inside a mouse handler that is still unwinding a capture - and routing it
+                // through WM_WORDTAB_CMD means there is one implementation of "a tab was torn off"
+                // rather than one per way of asking for it. That path already drops the command if
+                // the window has gone in the meantime.
+                // The release point is logged as well as the tab, because "the add-in never saw the
+                // pointer come back" and "the pointer never came back" are the same evidence from
+                // outside, and this is the one line that says where the add-in thought it was.
+                POINT drop = PointOf(lParam);
+                LogWrite(L"strip  hwnd=0x%p  drag dropped out of the row: tearing 0x%p off (tab %d)"
+                         L"  (released at y=%d)", (void*)hwnd, (void*)frame, from, (int)drop.y);
+                PostMessageW(hwnd, WM_WORDTAB_CMD, (WPARAM)CMD_TEAROFF, (LPARAM)frame);
+            }
+            else if (was && frame)
             {
                 LogWrite(L"strip  hwnd=0x%p  drag ended: 0x%p is tab %d (was %d)",
                          (void*)hwnd, (void*)frame, StackTabIndex(frame), from);
