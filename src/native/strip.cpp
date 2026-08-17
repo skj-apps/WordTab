@@ -63,6 +63,20 @@
 // continuous quantity, not the kind of come-and-go state that has to be heard rather than polled.
 #define ID_DRAG_SCROLL   1
 
+// Holding a scroll chevron down keeps scrolling, the way a scrollbar arrow does.
+//
+// Two intervals, because one would be wrong in both directions: long enough not to fire on an
+// ordinary click, and the row would crawl; short enough to cross a long row, and every click would
+// scroll twice. So nothing happens for CHEVRON_HOLD_MS - which is comfortably longer than a click -
+// and after that a step every CHEVRON_REPEAT_MS.
+//
+// The click itself still happens on RELEASE and is unchanged. Acting on the press would have been the
+// smaller change, but it would have taken the press-and-slide-off cancel away from these two buttons
+// and left the close button as the only one in the strip that still had it.
+#define ID_CHEVRON_REPEAT  2
+#define CHEVRON_HOLD_MS    400
+#define CHEVRON_REPEAT_MS   90
+
 // How far a press has to travel before it is a drag rather than a click. Four logical pixels is what
 // Windows itself uses (SM_CXDRAG's default), but taken as our own scaled constant rather than read
 // from the system: SM_CXDRAG is not per-monitor DPI scaled, so on this 150% rig it would be a third
@@ -201,6 +215,7 @@ struct StripState
     HWND  hotFrame;
     int   pressKind;      // a left press on a close or new button, waiting for its release
     HWND  pressFrame;
+    BOOL  pressRepeated;  // ...and, on a scroll chevron, whether holding it has already scrolled
     HWND  middleFrame;    // a middle press on a tab, likewise
     BOOL  rightDown;      // a right press, waiting to become a context menu on release
     HWND  rightFrame;     // ...and the tab it landed on, NULL for the empty part of the strip
@@ -3243,10 +3258,30 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
         {
             g_dragOntoKnown = TRUE;
             g_dragOnto = onto;
-            LogWrite(L"strip  hwnd=0x%p  rejoin drag is over %s",
+
+            // What was actually under the pointer, named, when the answer is "nothing".
+            //
+            // Without it, a rejoin that would not take looks identical from outside to a pointer that
+            // never arrived - and those have completely different causes. That cost a diagnosis: a
+            // drag aimed at a confirmed-correct point produced seven seconds of silence, and nothing
+            // anywhere could say whether the add-in had seen the wrong window under the pointer or
+            // had never been told the pointer moved. Cheap because it is written on a *change* of
+            // target, not per mouse-move.
+            wchar_t under[64] = L"nothing";
+            HWND    at = WindowFromPoint(screen);
+            if (at)
+            {
+                wchar_t cls[48] = L"";
+                GetClassNameW(at, cls, 48);
+                _snwprintf(under, 64, L"0x%p %s", (void*)at, cls);
+                under[63] = L'\0';
+            }
+
+            LogWrite(L"strip  hwnd=0x%p  rejoin drag is over %s  (pointer at %d,%d over %s)",
                      (void*)hwnd,
                      onto ? L"a row it can join - letting go now puts it back"
-                          : L"nothing it can join - letting go now does nothing");
+                          : L"nothing it can join - letting go now does nothing",
+                     (int)screen.x, (int)screen.y, under);
         }
 
         // IDC_NO is the honest answer for most of this gesture's travel, and saying so is the point:
@@ -3487,6 +3522,58 @@ static void DragScrollTick(StripState* state, HWND hwnd)
     DragMove(state, hwnd, cursor);
 }
 
+// A scroll chevron held down.
+//
+// Each tick re-asks two questions rather than trusting what it was armed with. Is the pointer still on
+// that button - which is what makes sliding off a held chevron pause the repeat and sliding back
+// resume it, the same thing a scrollbar arrow does and the same rule the release already follows. And
+// is there anywhere left to scroll, which stops the timer running at ninety milliseconds against a row
+// that has reached its end.
+static void ChevronRepeatTick(StripState* state, HWND hwnd)
+{
+    int kind = state->pressKind;
+    if ((kind != HIT_PREV && kind != HIT_NEXT) || GetCapture() != hwnd)
+    {
+        KillTimer(hwnd, ID_CHEVRON_REPEAT);
+        return;
+    }
+
+    POINT cursor;
+    if (!GetCursorPos(&cursor) || !ScreenToClient(hwnd, &cursor))
+        return;
+
+    // Slid off: pause, and deliberately keep the timer so that sliding back on resumes it.
+    StripHit hit = HitTestStrip(state, hwnd, cursor);
+    if (hit.kind != kind)
+        return;
+
+    RECT client;
+    HWND frames[MAX_STRIPS];
+    StripLayout layout;
+    if (!GetClientRect(hwnd, &client))
+        return;
+    LayoutOf(state, &client, frames, &layout);
+
+    if (!ScrollBy(state, hwnd, (kind == HIT_NEXT) ? layout.width : -layout.width))
+    {
+        // Nothing moved, so the row is against that end. Stop rather than spin - the button is drawn
+        // faint and is no longer a target, and the release will find nothing to do either.
+        KillTimer(hwnd, ID_CHEVRON_REPEAT);
+        return;
+    }
+
+    if (!state->pressRepeated)
+    {
+        state->pressRepeated = TRUE;
+        LogWrite(L"strip  hwnd=0x%p  %s chevron held down - scrolling while it is held",
+                 (void*)state->frame, (kind == HIT_NEXT) ? L"right" : L"left");
+    }
+
+    // The hold delay becoming a repeat rate, rather than a second timer: SetTimer with an id that
+    // already exists replaces that timer's interval.
+    SetTimer(hwnd, ID_CHEVRON_REPEAT, CHEVRON_REPEAT_MS, NULL);
+}
+
 static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     StripState* state = (StripState*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
@@ -3589,6 +3676,11 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             DragScrollTick(state, hwnd);
             return 0;
         }
+        if (state && wParam == ID_CHEVRON_REPEAT)
+        {
+            ChevronRepeatTick(state, hwnd);
+            return 0;
+        }
         break;
 
     case WM_LBUTTONDOWN:
@@ -3602,10 +3694,18 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 // Press and release on the same button, the way every other button in Windows
                 // behaves: pressing one and sliding off cancels it. Acting on the press would mean
                 // a mis-aimed click closes a document with no way to change your mind.
-                state->pressKind  = hit.kind;
-                state->pressFrame = hit.frame;
+                state->pressKind     = hit.kind;
+                state->pressFrame    = hit.frame;
+                state->pressRepeated = FALSE;
                 SetCapture(hwnd);
                 InvalidateRect(hwnd, NULL, FALSE);
+
+                // A held chevron keeps scrolling. Armed here rather than on the first repeat so
+                // there is one place that starts it and one that stops it, and only for the two
+                // buttons it means anything for - holding the close button down is not a request to
+                // close several documents.
+                if (hit.kind == HIT_PREV || hit.kind == HIT_NEXT)
+                    SetTimer(hwnd, ID_CHEVRON_REPEAT, CHEVRON_HOLD_MS, NULL);
             }
             else if (hit.kind == HIT_TAB)
             {
@@ -3739,13 +3839,27 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         if (state && state->pressKind != HIT_NONE)
         {
-            int  kind  = state->pressKind;
-            HWND frame = state->pressFrame;
+            int  kind     = state->pressKind;
+            HWND frame    = state->pressFrame;
+            BOOL repeated = state->pressRepeated;
 
-            state->pressKind  = HIT_NONE;
-            state->pressFrame = NULL;
+            state->pressKind     = HIT_NONE;
+            state->pressFrame    = NULL;
+            state->pressRepeated = FALSE;
+            KillTimer(hwnd, ID_CHEVRON_REPEAT);
             if (GetCapture() == hwnd)
                 ReleaseCapture();
+
+            // A hold that already scrolled has done the work. Letting the release scroll once more
+            // would make every held chevron overshoot by exactly one tab, which is the kind of error
+            // that reads as the row being imprecise rather than as an extra step.
+            if (repeated)
+            {
+                LogWrite(L"strip  hwnd=0x%p  chevron released after a hold - no extra step",
+                         (void*)state->frame);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
 
             StripHit hit = HitTestStrip(state, hwnd, PointOf(lParam));
             if (hit.kind == kind && hit.frame == frame)
@@ -3885,11 +3999,13 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         }
         if (state && (state->pressKind != HIT_NONE || state->middleFrame || state->rightDown))
         {
-            state->pressKind   = HIT_NONE;
-            state->pressFrame  = NULL;
-            state->middleFrame = NULL;
-            state->rightDown   = FALSE;
-            state->rightFrame  = NULL;
+            state->pressKind     = HIT_NONE;
+            state->pressFrame    = NULL;
+            state->pressRepeated = FALSE;
+            state->middleFrame   = NULL;
+            state->rightDown     = FALSE;
+            state->rightFrame    = NULL;
+            KillTimer(hwnd, ID_CHEVRON_REPEAT);
             InvalidateRect(hwnd, NULL, FALSE);
         }
         break;

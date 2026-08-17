@@ -6,8 +6,41 @@
 Open more documents than fit and the row now scrolls. The tabs live in a **track** that stops short
 of a fixed cluster pinned to the right-hand end of the strip — two scroll chevrons and the **+** —
 and they are clipped to it and hit-tested against the part of them inside it. Wheel over the row to
-move it, click a chevron to step one tab, and carrying a tab against either end scrolls the row
-under it. The active tab brings itself into view when it changes and when the window changes shape.
+move it, click a chevron to step one tab, **hold a chevron to keep scrolling**, and carrying a tab
+against either end scrolls the row under it. The active tab brings itself into view when it changes
+and when the window changes shape.
+
+---
+
+## Holding a chevron — added 2026-08-16
+
+One click is still one tab, which is what the rest of this writeup argues for. The cost of that is a
+long row taking a lot of clicks, and holding the button is the answer, the same way it is on a
+scrollbar arrow. **`check-scroll` 49 → 62 checks.**
+
+- **Two intervals, because one would be wrong in both directions.** Nothing for `CHEVRON_HOLD_MS`
+  (400ms, comfortably longer than a click), then a step every `CHEVRON_REPEAT_MS` (90ms). Long enough
+  never to fire on an ordinary click; short enough to cross a long row.
+- **The click still happens on RELEASE, unchanged.** Moving it to the press would have been the
+  smaller change, and it is what a scrollbar arrow does — but it would have taken the
+  press-and-slide-off cancel away from these two buttons and left the close button as the only one in
+  the strip that still had it.
+- **A hold that already scrolled suppresses the release's step.** Otherwise every held chevron
+  overshoots by exactly one tab, which reads as the row being imprecise rather than as an extra step.
+- **Each tick re-asks two questions rather than trusting what it was armed with**: is the pointer
+  still on that button — so sliding off pauses the repeat and sliding back on resumes it, the same
+  rule the release already follows — and is there anywhere left to scroll, which stops the timer
+  spinning at 90ms against a row already at its end.
+- **`SetTimer` with an id that already exists replaces that timer's interval**, so the hold delay
+  becomes the repeat rate rather than a second timer.
+- **Proved the way everything else here is proved.** The scroll position cannot be read from outside
+  Word but is exactly knowable at both ends, so a hold that starts at the start and ends with the row
+  against the far end has scrolled by more than one tab whatever the repeat rate turns out to be.
+  Asserted against **where clicking to the end reached**, not against a named document — the row order
+  is whatever the sections above left it, so naming one would assert the tab order rather than the
+  scroll position. The first version did name one and was wrong: an earlier section adds a `Document1`
+  that ends up last. Both directions driven, and **a quick click is asserted NOT to log a hold**,
+  which is the assertion that the delay exists at all.
 
 ---
 

@@ -780,6 +780,20 @@ try {
 
     # Onto the stack's row.
     [WordLayout]::DragMoveTo($lone.X, ($lone.Y + 60), $dropX, $dropY, 14, 60)
+
+    # Both halves read back, and this section went red inside a battery for want of them. The drag
+    # produced seven seconds of silence with the drop point confirmed correct *before* the gesture,
+    # and nothing recorded anywhere could say whether the pointer had failed to arrive or whether the
+    # window under it had changed while the gesture was in the air. Those have nothing in common
+    # except how they look from outside.
+    $at = [WordLayout]::Cursor()
+    $nowUnder = [WordLayout]::WindowAt($dropX, $dropY)
+    Write-Note ("pointer aimed at ({0},{1}); it is at ({2},{3}); under that point now: 0x{4:X}" -f `
+                $dropX, $dropY, $at.X, $at.Y, [int64]$nowUnder)
+    Assert (([Math]::Abs($at.X - $dropX) -le 2) -and ([Math]::Abs($at.Y - $dropY) -le 2)) `
+           'the pointer really did arrive on the stacked window''s row'
+    Assert ($nowUnder -eq $stackedStrip.Hwnd) 'and that row is still what is under the point'
+
     $over = Wait-Logged 'rejoin drag is over a row it can join'
     $cursorYes = [WordLayout]::CursorShape()
     Write-Note "and that it was over a joinable row $($over.Ms)ms later"
@@ -798,28 +812,51 @@ foreach ($line in $said) { Write-Note $line.Trim() }
 Assert ($said.Count -eq 1) "the add-in put exactly one window back ($($said.Count))"
 
 Assert ((Get-FrameCount) -eq $stackCount) "still $stackCount windows - nothing opened or closed ($((Get-FrameCount)))"
-Test-OneRectangle 'After a window was dragged back in'
 
-# Reachability in reverse: the stack takes the taskbar button and Alt+Tab entry off every window but
-# the active one, so a window that rejoined has to have given them back up. One presented window is
-# what a stack of four looks like.
-$shown = @(Get-Frames | Where-Object { -not [WordLayout]::IsToolWindow($_) })
-Assert ($shown.Count -eq 1) "the stack is one taskbar button again ($($shown.Count))"
+# Everything below here can only be measured if the window actually went back, and that is not
+# fastidiousness: with a window still out, the row is shorter than the number of Word windows, and
+# Get-TabSpot computes its slots from the window count. The slots come out narrower, the clicks land
+# in the wrong places, one of them lands on the + and makes a blank document - and three real
+# failures were reported as eleven, with a stray "Document1" in the middle of the row to explain.
+#
+# So: one clear failure, then put the fixture back into a shape the rest of the suite can be measured
+# in. The recovery is deliberately NOT another attempt at the gesture under test.
+$stillOut = @(Get-Frames | Where-Object { ([WordLayout]::RectOf($_)).Left -ne $stackRect.Left -or
+                                          ([WordLayout]::RectOf($_)).Top  -ne $stackRect.Top })
+if ($stillOut.Count -gt 0) {
+    Assert $false ("the window did not go back into the stack ($($stillOut.Count) still out) - " +
+                   'the checks below it cannot be measured and are skipped')
+    Write-Note 'closing the window that would not go back, so the sections after this measure a consistent row'
+    foreach ($f in $stillOut) {
+        Invoke-ConfirmedKeyOn -Hwnd $f -Vk $VK.W -Ctrl -What 'Ctrl+W on the window that would not go back' | Out-Null
+    }
+    Wait-Frames ($stackCount - $stillOut.Count) 25 | Out-Null
+    Write-Note "$((Get-FrameCount)) window(s) left, all in the stack"
+}
+else {
+    Test-OneRectangle 'After a window was dragged back in'
 
-$place = Get-StripPlacement (@(Get-Frames))
-Assert ($place.Measured -eq $stackCount) "all $stackCount windows measured for strip placement (measured $($place.Measured))"
-Assert $place.Ok ('every strip sits between the chrome and the document' + $place.Text)
+    # Reachability in reverse: the stack takes the taskbar button and Alt+Tab entry off every window
+    # but the active one, so a window that rejoined has to have given them back up. One presented
+    # window is what a stack of four looks like.
+    $shown = @(Get-Frames | Where-Object { -not [WordLayout]::IsToolWindow($_) })
+    Assert ($shown.Count -eq 1) "the stack is one taskbar button again ($($shown.Count))"
 
-# Where its tab landed, which is the decision this slice had to make rather than discover. The end of
-# the row: the window is ARRIVING, not being undone, and a tab that reappeared in the middle of a row
-# the user has rearranged since would be a surprise. It was tab 0 when it was torn off.
-$rejoined = Get-Order
-Write-Note "order: $(Format-Order $rejoined)"
-Assert ($rejoined[-1] -eq $victim) "`"$(Name $victim)`" came back as the LAST tab, not where it left from"
-Assert (@($rejoined | Sort-Object -Unique).Count -eq $stackCount) 'every document still has exactly one tab'
-$others = @($before | Where-Object { $_ -ne $victim })
-Assert (Test-SameOrder (@($rejoined | Select-Object -First $others.Count)) $others) `
-       'and the tabs that stayed behind kept their order'
+    $place = Get-StripPlacement (@(Get-Frames))
+    Assert ($place.Measured -eq $stackCount) "all $stackCount windows measured for strip placement (measured $($place.Measured))"
+    Assert $place.Ok ('every strip sits between the chrome and the document' + $place.Text)
+
+    # Where its tab landed, which is the decision this slice had to make rather than discover. The end
+    # of the row: the window is ARRIVING, not being undone, and a tab that reappeared in the middle of
+    # a row the user has rearranged since would be a surprise. It was tab 0 when it was torn off.
+    $rejoined = Get-Order
+    Write-Note "order: $(Format-Order $rejoined)"
+    Assert ($rejoined[-1] -eq $victim) "`"$(Name $victim)`" came back as the LAST tab, not where it left from"
+    Assert (@($rejoined | Sort-Object -Unique).Count -eq $stackCount) 'every document still has exactly one tab'
+    $others = @($before | Where-Object { $_ -ne $victim })
+    Assert (Test-SameOrder (@($rejoined | Select-Object -First $others.Count)) $others) `
+           'and the tabs that stayed behind kept their order'
+}
 
 # ---- carrying a tab past the end of the row ---------------------------------------------------------
 
@@ -909,6 +946,103 @@ if (@($before).Count -ge 3) {
     }
 } else {
     Write-Note "only $(@($before).Count) tab(s) - skipping the close-from-the-middle check"
+}
+
+# ---- tearing off a MAXIMIZED stack ------------------------------------------------------------------
+#
+# The branch of PlaceTornOff that has never been driven. Everywhere else in this project a torn-off
+# window keeps its size and is offset by one caption and border - but two maximized windows are
+# pixel-identical, and an offset is not even possible, so a stack that is maximized has to hand the
+# torn-off window a *window-sized* window instead: three quarters of the work area, centred, then
+# cascaded by the same step.
+#
+# Last section before the Word restart on purpose. It changes the shape of every window in the fixture,
+# and Word persists its window placement on exit - so a suite that left it maximized would hand the
+# next suite in the battery a maximized Word and a set of assertions written at 900x700. The restore
+# is in a finally for the same reason.
+
+Write-Step 'Tearing a tab off a maximized stack'
+
+$maxFrames = @(Get-Frames)
+$wasRect   = [WordLayout]::RectOf($maxFrames[0])
+$work      = [WordLayout]::WorkArea($maxFrames[0])
+Write-Note ("work area {0}" -f (Format-Rect $work))
+
+try {
+    Set-WordForeground | Out-Null
+    [WordLayout]::Show([WordLayout]::GetForeground(), [WordLayout]::SW_MAXIMIZE)
+    Start-Sleep -Milliseconds 1500
+
+    $zoomed = @(Get-Frames | Where-Object { [WordLayout]::Maximized($_) })
+    Assert ($zoomed.Count -eq @(Get-Frames).Count) `
+           "the whole stack maximized together ($($zoomed.Count) of $(@(Get-Frames).Count))"
+
+    if ($zoomed.Count -eq @(Get-Frames).Count) {
+        Set-LogMark
+        $spot     = Get-TabSpot 0
+        $stripH   = $spot.Band.Bottom - $spot.Band.Top
+        $wayBelow = $spot.Band.Bottom + [int]($stripH * 1.6)
+        $victim   = (Get-Order)[0]
+
+        Set-WordForeground | Out-Null
+        $spot = Get-TabSpot 0
+        $onWhat = Get-ClassAt $spot.X $spot.Y
+        Assert ($onWhat -eq 'WordTabStrip') "the maximized tear-off starts on the strip, not on `"$onWhat`""
+        [WordLayout]::DragTo($spot.X, $spot.Y, $spot.X, $wayBelow, 12, 60)
+        Wait-Until { -not [WordLayout]::Maximized($victim) } 8 | Out-Null
+        Start-Sleep -Milliseconds 1500
+
+        $said = @(Get-LogSince 'torn off to')
+        foreach ($line in $said) { Write-Note $line.Trim() }
+        Assert ($said.Count -eq 1) "the add-in placed exactly one torn-off window ($($said.Count))"
+        Assert (@(Get-LogSince 'the stack was maximized').Count -eq 1) `
+               'and it took the maximized branch, by its own account'
+
+        # It cannot still be maximized: two maximized windows are the same picture, which is the whole
+        # reason this branch exists.
+        Assert (-not [WordLayout]::Maximized($victim)) 'the torn-off window came down to a window'
+
+        $torn = [WordLayout]::RectOf($victim)
+        $wantW = [int](($work.Right - $work.Left) * 3 / 4)
+        $wantH = [int](($work.Bottom - $work.Top) * 3 / 4)
+        Write-Note ("torn-off window {0}; three quarters of the work area is {1}x{2}" -f `
+                    (Format-Rect $torn), $wantW, $wantH)
+        Assert ([Math]::Abs(($torn.Right - $torn.Left) - $wantW) -le 2) `
+               'it is three quarters of the work area wide'
+        Assert ([Math]::Abs(($torn.Bottom - $torn.Top) - $wantH) -le 2) `
+               'and three quarters of it tall'
+
+        # Centred, then cascaded by one caption and border - so it sits exactly that step down and
+        # right of where centring alone would have put it.
+        $centredLeft = $work.Left + [int]((($work.Right - $work.Left) - $wantW) / 2)
+        $centredTop  = $work.Top  + [int]((($work.Bottom - $work.Top) - $wantH) / 2)
+        $dx = $torn.Left - $centredLeft
+        $dy = $torn.Top - $centredTop
+        Write-Note "offset from centred: ($dx,$dy)"
+        Assert ($dx -gt 0 -and $dx -eq $dy) "cascaded down and right of centre by one equal step ($dx,$dy)"
+        Assert ($torn.Right -le $work.Right -and $torn.Bottom -le $work.Bottom) `
+               'and it is still inside the work area'
+
+        # The stack it came out of is untouched - still maximized, still one rectangle.
+        $stillMax = @(Get-Frames | Where-Object { $_ -ne $victim -and [WordLayout]::Maximized($_) })
+        Assert ($stillMax.Count -eq @(Get-Frames).Count - 1) `
+               "the windows left behind are still maximized ($($stillMax.Count))"
+    }
+}
+finally {
+    # Everything back to a window, and back to the rectangle the fixture started at. Word writes its
+    # placement on exit, and the suites after this one in the battery are written at that size.
+    foreach ($f in @(Get-Frames)) {
+        if ([WordLayout]::Maximized($f)) { [WordLayout]::Show($f, [WordLayout]::SW_RESTORE) }
+    }
+    Start-Sleep -Milliseconds 1200
+    $front = [WordLayout]::GetForeground()
+    if (@(Get-Frames) -contains $front) {
+        [WordLayout]::MoveTo($front, $wasRect.Left, $wasRect.Top)
+        [WordLayout]::Resize($front, ($wasRect.Right - $wasRect.Left), ($wasRect.Bottom - $wasRect.Top))
+    }
+    Start-Sleep -Milliseconds 1200
+    Write-Note ("restored to {0}" -f (Format-Rect ([WordLayout]::RectOf(@(Get-Frames)[0]))))
 }
 
 # ---- TabTearOff=0 leaves the drag as a plain reorder ------------------------------------------------
@@ -1001,10 +1135,18 @@ if (-not $KeepOpen) {
 
                 Assert (@(Get-LogSince 'drag left the row').Count -eq 0) 'the tab never comes out of the row with the switch off'
                 Assert (@(Get-LogSince 'torn off, now its own window').Count -eq 0) 'and nothing left the stack'
-                Write-Note ("cursor out past the threshold 0x{0:X}, IDC_ARROW is 0x{1:X}" -f `
-                            [int64]$cursorOut, [int64][WordLayout]::SystemCursor(32512))
-                Assert ($cursorOut -eq [WordLayout]::SystemCursor(32512)) `
-                    'the pointer stayed an ordinary arrow - nothing was offered that would then be refused'
+                # The claim is that the add-in offered NEITHER of its drag cursors, not that the
+                # pointer is an arrow. With the switch off nothing here touches the cursor at all, so
+                # what it shows is whatever Word last left there - and 102px below the strip that is
+                # Word's own I-beam over the document, which is correct and has nothing to do with
+                # this switch. Asserting "arrow" made this section fail for a reason that was not
+                # about tearing off.
+                Write-Note ("cursor out past the threshold 0x{0:X}  (SIZEALL 0x{1:X}, NO 0x{2:X}, arrow 0x{3:X})" -f `
+                            [int64]$cursorOut, [int64][WordLayout]::SystemCursor(32646),
+                            [int64][WordLayout]::SystemCursor(32648), [int64][WordLayout]::SystemCursor(32512))
+                Assert (($cursorOut -ne [WordLayout]::SystemCursor(32646)) -and
+                        ($cursorOut -ne [WordLayout]::SystemCursor(32648))) `
+                    'neither drag cursor was offered - nothing was promised that would then be refused'
 
                 # The positive half. Same gesture, same route, and it still does the thing it did
                 # before tear-off existed.

@@ -126,6 +126,35 @@ foreach ($name in $suites) {
     # called title.log holding scroll's output, which is worse than no file at all.
     Reset-LogFile -Label $name | Out-Null
 
+    # The suite's own console output, kept beside its log, and this is the other half of "the
+    # battery's evidence has to survive the battery".
+    #
+    # The archived log says what the ADD-IN did. This says what the SUITE said about it - and it is
+    # the only thing in the world that names *which assertion* went red. That mattered twice on
+    # 2026-08-16: a single check in `reorder` failed inside a 14-minute battery whose console output
+    # had been captured in a way that kept only the summary, and it took three more runs to establish
+    # that it would not reproduce - and it still has no name. A battery that cannot say what failed
+    # has to be run again to find out, which is the most expensive kind of missing evidence here.
+    $historyDir = $script:LogHistoryDir
+    if (-not $historyDir) { $historyDir = Join-Path $env:LOCALAPPDATA 'WordTab\history' }
+    try {
+        New-Item -ItemType Directory -Path $historyDir -Force | Out-Null
+        $transcriptName = '{0}-{1}.out.txt' -f (Get-Date -Format 'yyyyMMdd-HHmmss-fff'), $name
+        $transcriptPath = Join-Path $historyDir $transcriptName
+        $output | ForEach-Object { "$_" } | Set-Content -Path $transcriptPath -Encoding UTF8
+        Write-Host "    the suite's own output was kept in history\$transcriptName" -ForegroundColor DarkGray
+
+        # Pruned on the same rule as the logs, and separately from them: they are two files per suite
+        # per battery and letting one kind push the other out of the window would leave halves of
+        # pairs behind.
+        $oldOut = @(Get-ChildItem -Path $historyDir -Filter '*.out.txt' -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -Skip 40)
+        foreach ($f in $oldOut) { Remove-Item -Path $f.FullName -Force -ErrorAction SilentlyContinue }
+    } catch {
+        Write-Host "    could not keep the suite's output ($($_.Exception.Message))" -ForegroundColor Yellow
+        $transcriptPath = $null
+    }
+
     # Not anchored: the suites do not agree on how they announce the total. Some print
     # "34 checks, all passed." at column 0, others "PASS  40 checks, 0 failures". Anchoring this
     # matched neither on the first run and every suite reported "(no summary line)" while passing.
@@ -134,11 +163,12 @@ foreach ($name in $suites) {
     $fails = @($output | ForEach-Object { "$_" } | Where-Object { $_ -match '^\s*FAIL ' })
 
     $results += [pscustomobject]@{
-        Suite   = $name
-        Exit    = $code
-        Summary = $summary
-        Fails   = $fails.Count
-        Minutes = [Math]::Round(((Get-Date) - $started).TotalMinutes, 1)
+        Suite      = $name
+        Exit       = $code
+        Summary    = $summary
+        Fails      = $fails.Count
+        Minutes    = [Math]::Round(((Get-Date) - $started).TotalMinutes, 1)
+        Transcript = $transcriptPath
     }
 }
 
@@ -158,5 +188,20 @@ if ($bad.Count -eq 0) {
     Write-Host "All $($results.Count) suites green." -ForegroundColor Green
 } else {
     Write-Host "$($bad.Count) of $($results.Count) suites need looking at: $(($bad.Suite) -join ', ')" -ForegroundColor Red
+
+    # Named here rather than left to be found. A red suite in a long battery is read hours later by
+    # somebody who no longer has the console, and the two files that answer "what actually happened"
+    # are both on disk under names nobody would guess.
+    Write-Host ''
+    Write-Host 'What each of them said, and what the add-in was doing at the time:' -ForegroundColor DarkGray
+    foreach ($r in $bad) {
+        if ($r.Transcript) {
+            Write-Host ("  {0,-12} {1}" -f $r.Suite, $r.Transcript) -ForegroundColor DarkGray
+        } else {
+            Write-Host ("  {0,-12} (its output could not be kept)" -f $r.Suite) -ForegroundColor Yellow
+        }
+    }
+    Write-Host ("  add-in logs alongside them in {0}" -f
+                $(if ($script:LogHistoryDir) { $script:LogHistoryDir } else { Join-Path $env:LOCALAPPDATA 'WordTab\history' })) -ForegroundColor DarkGray
     exit 1
 }

@@ -492,6 +492,96 @@ Assert (Invoke-ConfirmedClick -What 'clicking the dead right chevron' `
 Start-Sleep -Milliseconds 500
 Assert ((Get-SlotDocument ($Docs - 1) $max) -eq $atEnd) 'clicking the dead chevron does nothing at all'
 
+# ---- 5b. holding a chevron keeps scrolling ---------------------------------------------------------
+#
+# One click is one tab, which is asserted above and is deliberate - a page per click overshoots the tab
+# you were looking for every time. The cost of that is a long row taking a lot of clicks, and holding
+# the button is the answer, the same way it is on a scrollbar arrow.
+#
+# Proved the way everything else in this suite is proved: the scroll position cannot be read from
+# outside Word, but it is exactly knowable at both ends. A hold that started at the start and finishes
+# with the row against the far end has scrolled by more than one tab, whatever the repeat rate is.
+#
+# The click semantics are unchanged and that is asserted too - a hold that also fired the release's
+# step would overshoot every time by exactly one tab, which reads as the row being imprecise rather
+# than as an extra step.
+
+Write-Step 'Holding a scroll chevron down'
+
+Move-RowTo 'start' | Out-Null
+Assert ((Get-SlotDocument 0 0) -like 'scroll-1*') 'back at the start before the hold'
+
+# First: an ordinary click must NOT look like a hold. The delay before repeating is what separates
+# them, so this is the assertion that the delay exists at all.
+Set-LogMark
+Set-WordForeground | Out-Null
+Invoke-ConfirmedClick -What 'a quick click of the right chevron' `
+                      -Point { [WordLayout]::Center((Get-Row 0).Layout.Next) } | Out-Null
+Start-Sleep -Milliseconds 700
+Assert (@(Get-LogSince 'chevron held down').Count -eq 0) 'a click is not a hold - it scrolls once and stops'
+Assert ((Get-SlotDocument 1 $width) -like 'scroll-2*') 'and it still moves the row by exactly one tab'
+
+# Now the hold, from the start.
+Move-RowTo 'start' | Out-Null
+Assert ((Get-SlotDocument 0 0) -like 'scroll-1*') 'back at the start again for the hold'
+
+Set-LogMark
+Set-WordForeground | Out-Null
+$row  = Get-Row 0
+$hold = [WordLayout]::Center($row.Layout.Next)
+$maxScroll = $row.Layout.MaxScroll
+
+# Confirmed once, before the button goes down, and never again: this is one continuous gesture and a
+# retry that re-pressed would be a different one.
+$onWhat = Get-ClassAt $hold.X $hold.Y
+Assert ($onWhat -eq 'WordTabStrip') "the hold starts on the strip, not on `"$onWhat`""
+
+try {
+    [WordLayout]::DragHold($hold.X, $hold.Y, $hold.X, $hold.Y, 1, 50)
+    # Long enough to clear the 400ms delay and take several 90ms steps. The row is three tabs wide
+    # here, so this is far more than enough to reach the end.
+    Start-Sleep -Milliseconds 1500
+}
+finally {
+    [WordLayout]::DragRelease($hold.X, $hold.Y)
+}
+Start-Sleep -Milliseconds 700
+
+Assert (@(Get-LogSince 'chevron held down').Count -ge 1) 'the add-in reports the chevron being held'
+Assert (@(Get-LogSince 'chevron released after a hold - no extra step').Count -eq 1) `
+       'and the release adds no extra step on top of what the hold already did'
+
+$row = Get-Row $maxScroll
+Assert (-not $row.Layout.CanNext) 'holding it carried the row all the way to the far end'
+
+# Against where CLICKING to the end put it, not against a guess at which document that is. The row
+# order is whatever the sections above left it as, so naming a document here would be asserting the
+# tab order rather than the scroll position - and the scroll position is what a hold is about.
+$heldTo = Get-SlotDocument ($Docs - 1) $maxScroll
+Write-Note "holding reached `"$heldTo`"; clicking to the end reached `"$atEnd`""
+Assert ($heldTo -eq $atEnd) 'and it reached exactly where clicking all the way to the end reached'
+
+# And back, which drives the other direction rather than assuming it is symmetrical.
+Set-LogMark
+Set-WordForeground | Out-Null
+$row  = Get-Row $maxScroll
+$hold = [WordLayout]::Center($row.Layout.Prev)
+$onWhat = Get-ClassAt $hold.X $hold.Y
+Assert ($onWhat -eq 'WordTabStrip') "the hold back starts on the strip, not on `"$onWhat`""
+try {
+    [WordLayout]::DragHold($hold.X, $hold.Y, $hold.X, $hold.Y, 1, 50)
+    Start-Sleep -Milliseconds 1500
+}
+finally {
+    [WordLayout]::DragRelease($hold.X, $hold.Y)
+}
+Start-Sleep -Milliseconds 700
+
+Assert (@(Get-LogSince 'chevron held down').Count -ge 1) 'the left chevron holds too'
+$row = Get-Row 0
+Assert (-not $row.Layout.CanPrev) 'and it carried the row back to the start'
+Assert ((Get-SlotDocument 0 0) -like 'scroll-1*') 'with the first document in the first slot again'
+
 # ---- 6. the wheel ---------------------------------------------------------------------------------
 
 Write-Step 'The wheel over the row'

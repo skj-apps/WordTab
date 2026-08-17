@@ -357,3 +357,48 @@ Also still open from this slice, deliberately not done:
   Word, not the ones between an action and its assertion. Most of what is left is the second kind.
 - `check-scroll`'s `Use-Wheel` still injects `mouse_event` through a local P/Invoke rather than
   through `WordLayout`. The pointer move in front of it is confirmed now; the notches are not.
+
+---
+
+# The battery keeps its own evidence — 2026-08-16
+
+**A fifteen-minute battery that cannot say which assertion failed has to be run again to find out,
+and that is the most expensive kind of missing evidence this project has.** It happened twice in one
+evening.
+
+- A single check in `check-reorder` went red inside a full battery. The run had been launched in a way
+  that kept only the summary, so the failing line was gone. Three further runs — the suite alone twice
+  and a five-suite battery in the same order — were all green. **It is still unnamed.**
+- Later the same evening `check-dot` went red and took `soak-stack` down with it, and that one *was*
+  diagnosable, but only because the second battery had been captured by hand.
+
+## What changed
+
+**`check-all` now writes each suite's own console output to `%LOCALAPPDATA%\WordTab\history\` beside
+that suite's add-in log**, `<stamp>-<suite>.out.txt`, pruned on the same rule as the logs and
+separately from them so one kind cannot push the other out of the window. **And when a suite fails,
+the summary prints the path**, rather than leaving two files that answer "what actually happened"
+sitting on disk under names nobody would guess.
+
+The two files are deliberately different evidence and both are needed: **the log says what the
+ADD-IN did; the transcript says what the SUITE said about it**, and only the second one names an
+assertion.
+
+## The failure that was diagnosable, and why it named the wrong thing
+
+`check-dot`'s *Saving Beta* section failed with `the dot goes out when the document is saved`. The
+keystroke was confirmed to have landed — `Save-Tab` uses `Invoke-ConfirmedKeyOn` — so the obvious
+reading was that the add-in had failed to clear the dot. It had not: **Word had not saved the file**,
+and the dot was correctly still on. Beta stayed modified, the suite's own cleanup then met Word's save
+prompt, `check-dot` stopped, and `soak-stack` ran next against a Word wedged behind a modal and could
+not open its documents. One slow save, three suites' worth of noise.
+
+**So the assertion now checks the file on disk first, and in that order.** `Ctrl+S actually made Word
+write the file to disk` is a claim about *Word*; `the dot goes out once it is saved` is a claim about
+the *add-in*, and it is only meaningful once the first one holds. Without that split, a save that
+silently did not happen fails as a defect in the thing under test, which is not what it is.
+
+**It did not reproduce** — `check-dot` passed 68 of 68 standalone straight afterwards. Worth writing
+down alongside it: the suite prints `something covered Word, not a keystroke` in the *passing* run
+too. That line is its own retry working, not evidence of interference, and reading it as a clue was
+a wrong turn worth not taking twice.

@@ -324,7 +324,28 @@ the bug.
   letting go plus a cursor, not a window following the hand. Doing it properly means moving the real
   window during the drag, which is a slice of its own.
 - ~~**Putting a window back into a stack**~~ — built; see below.
-- **The maximized branch of `PlaceTornOff`** remains reasoned rather than measured.
+- ~~**The maximized branch of `PlaceTornOff`**~~ — measured 2026-08-16; see below.
+
+## Tearing off a maximized stack — measured 2026-08-16
+
+The one branch of `PlaceTornOff` that had never been driven, by either half. Everywhere else a
+torn-off window keeps its size and is offset by one caption and border — but **two maximized windows
+are pixel-identical and an offset is not even possible**, so a maximized stack hands the torn-off
+window a window-sized window instead: three quarters of the work area, centred, then cascaded by the
+same step.
+
+Measured on this rig, and it is exactly what the code reasoned: work area **2848x1672**, three
+quarters of it **2136x1254**, and the torn-off window landed at **(406,259 2136x1254)** — cascaded
+**(50,50)** from centred, which is `SM_CYCAPTION + SM_CYSIZEFRAME` here. The windows left behind
+stayed maximized, and the add-in's own log names the branch it took.
+
+- **The section is the last one before the Word restart, on purpose.** It changes the shape of every
+  window in the fixture, and **Word persists its window placement on exit** — so a suite that left it
+  maximized would hand the next suite in the battery a maximized Word and a set of assertions written
+  at 900x700. The restore is in a `finally` for the same reason.
+- **The work area is read through the same API the add-in uses**, not taken as the screen size. A
+  check that compared against the whole screen would be measuring a different rectangle from the one
+  the product placed against. New `[WordLayout]::WorkArea`.
 
 ---
 

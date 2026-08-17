@@ -664,9 +664,31 @@ Assert $afterArmed.IsDot 'and the dot is back once nothing is pressed or hovered
 # ---- 5. saving puts it out --------------------------------------------------------------------------
 
 Write-Step 'Saving Beta'
+
+# The file on disk is asserted as well as the dot, and the order matters: the dot going out is a claim
+# about the ADD-IN, and it is only meaningful once Word has actually saved. Without this, a save that
+# silently did not happen fails as "the dot did not go out" - which reads as a defect in the thing
+# under test and is not one.
+#
+# That is not hypothetical. This section went red inside a battery on 2026-08-16 with the keystroke
+# confirmed to have landed; the two assertions below both failed, Beta stayed modified, and the
+# suite's own cleanup then met Word's save prompt and stopped the whole battery. Nothing in the output
+# said whether Word had saved, so the failure named the wrong half. It did not reproduce.
+$betaWritten = (Get-Item $beta).LastWriteTime
 Save-Tab 1
+
+$wroteBy = $null
+$deadline = (Get-Date).AddSeconds(8)
+while ((Get-Date) -lt $deadline) {
+    if ((Get-Item $beta).LastWriteTime -gt $betaWritten) { $wroteBy = (Get-Item $beta).LastWriteTime; break }
+    Start-Sleep -Milliseconds 200
+}
+Write-Note ("Beta.docx last written {0} -> {1}" -f $betaWritten.ToString('HH:mm:ss.fff'),
+            $(if ($wroteBy) { $wroteBy.ToString('HH:mm:ss.fff') } else { 'unchanged' }))
+Assert ($null -ne $wroteBy) 'Ctrl+S actually made Word write the file to disk'
+
 $b3 = Wait-Dot $betaFrame $false
-Assert ($null -ne $b3 -and -not $b3.On) 'the dot goes out when the document is saved'
+Assert ($null -ne $b3 -and -not $b3.On) 'and the dot goes out once it is saved'
 
 $savedBeta = Read-TabButton 1 'Beta-saved'
 Assert $savedBeta.IsCross 'and the x is back on the tab'

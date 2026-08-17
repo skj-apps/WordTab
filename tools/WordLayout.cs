@@ -161,6 +161,24 @@ public static class WordLayout
         SetWindowPos(hwnd, IntPtr.Zero, 0, 0, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE);
     }
 
+    // The usable area of the monitor a window is on - the screen less the taskbar. Needed because the
+    // add-in places a torn-off window relative to it, so a check that compared against the whole
+    // screen would be measuring a different rectangle from the one the product used.
+    [StructLayout(LayoutKind.Sequential)]
+    struct MONITORINFO { public int cbSize; public RECT rcMonitor; public RECT rcWork; public int dwFlags; }
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+
+    public static RECT WorkArea(IntPtr hwnd)
+    {
+        MONITORINFO info = new MONITORINFO();
+        info.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+        IntPtr monitor = MonitorFromWindow(hwnd, 2 /* MONITOR_DEFAULTTONEAREST */);
+        if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info))
+            return info.rcWork;
+        return RectOf(hwnd);
+    }
+
     public static void MoveTo(IntPtr hwnd, int x, int y)
     {
         SetWindowPos(hwnd, IntPtr.Zero, x, y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
