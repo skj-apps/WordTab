@@ -219,46 +219,132 @@ Write-Ok ("Load banner: {0}" -f $(if ($NoBanner) { 'off' } else { 'on' }))
 Write-Step 'Verifying'
 
 # Word keeps a list of add-ins it killed after a crash or a failed load. An entry here beats
-# LoadBehavior=3 and is the classic "I registered it and nothing happens" cause, so surface it.
-$disabled = @(Get-ChildItem 'HKCU:\Software\Microsoft\Office\16.0\Word\Resiliency\DisabledItems' -ErrorAction SilentlyContinue |
-              ForEach-Object { Get-ItemProperty $_.PSPath } | ForEach-Object { $_.PSObject.Properties } |
-              Where-Object { $_.Name -notlike 'PS*' })
-if ($disabled.Count -gt 0) {
-    Write-Warning "Word has $($disabled.Count) item(s) in Resiliency\DisabledItems. If WordTab does not load, clear that key: File > Options > Add-ins > Manage: Disabled Items."
+# LoadBehavior=3 outright and is the classic "I registered it and nothing happens" cause.
+#
+# The entries are NAMED rather than counted, and that is the whole point of this block. Each value
+# is a binary blob carrying the add-in's DLL path and its friendly name as NUL-separated UTF-16, so
+# the question "is it US Word disabled, or somebody else" can be answered instead of raised. Those
+# are completely different situations with different fixes, and the old wording - a count - reported
+# them identically. On the dev rig this key holds two entries and BOTH are Office Tab.
+function Get-DisabledAddinPaths {
+    $key = 'HKCU:\Software\Microsoft\Office\16.0\Word\Resiliency\DisabledItems'
+    if (-not (Test-Path $key)) { return @() }
+    $found = @()
+    foreach ($name in @((Get-Item $key).Property)) {
+        $bytes = (Get-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue).$name
+        if ($bytes -isnot [byte[]]) { continue }
+        # Trim: a blob is fixed-width and padded, so the tail of a field is NULs. Only the PATH
+        # fields are kept - each blob also carries the vendor's friendly name, and keeping those
+        # would double the count and give the matching below a second thing to be confused by.
+        foreach ($field in ([System.Text.Encoding]::Unicode.GetString($bytes) -split "`0")) {
+            $field = $field.Trim()
+            if ($field -match '\.dll$' -or $field -match '\.(vsto|xll|wll)$') { $found += $field }
+        }
+    }
+    return @($found)
+}
+
+# A ProgId's DLL, resolved the way Word resolves it. Used to tell a disabled entry apart from ours
+# by PATH rather than by a friendly name somebody else chose.
+function Get-AddinDllPath($progId) {
+    foreach ($hive in @('HKCU:', 'HKLM:')) {
+        $classKey = "$hive\Software\Classes\$progId\CLSID"
+        if (-not (Test-Path $classKey)) { continue }
+        $guid = (Get-ItemProperty -Path $classKey -ErrorAction SilentlyContinue).'(default)'
+        if (-not $guid) { continue }
+        $serverKey = "$hive\Software\Classes\CLSID\$guid\InprocServer32"
+        if (-not (Test-Path $serverKey)) { continue }
+        $path = (Get-ItemProperty -Path $serverKey -ErrorAction SilentlyContinue).'(default)'
+        if ($path) { return $path }
+    }
+    return $null
+}
+
+$disabledPaths = @(Get-DisabledAddinPaths)
+$ourDll        = Join-Path $InstallDir $DllName
+$oursDisabled  = @($disabledPaths | Where-Object { $_ -and $_.ToLowerInvariant() -eq $ourDll.ToLowerInvariant() })
+
+if ($oursDisabled.Count -gt 0) {
+    # The one case in here that means this install will not work. Loud, and with the fix.
+    Write-Warning 'WORD HAS DISABLED WORDTAB. It will not load until you clear it, however correct the registration is.'
+    Write-Note '  Word > File > Options > Add-ins > Manage: Disabled Items > Go... > select WordTab > Enable'
+} elseif ($disabledPaths.Count -gt 0) {
+    # Not ours, so not a blocker - but it is worth naming, because an add-in Word has disabled is
+    # also one that cannot conflict with us, and the rival check below depends on knowing that.
+    Write-Ok "Word has not disabled WordTab ($($disabledPaths.Count) other entry/entries in Disabled Items)"
+    foreach ($path in ($disabledPaths | Select-Object -Unique)) { Write-Note "  disabled: $path" }
 } else {
     Write-Ok 'Word has no disabled items'
 }
 
-# Another tabbed-Word add-in is not a blocker and this deliberately does not disable one: they share
-# the same `_WwF` document frame, and on the dev rig WordTab and Office Tab have coexisted through
-# every check suite without the strip's tripwire firing once. But if the tab row ever looks doubled,
-# or the document jumps, this is the first thing to know - and turning somebody else's software off
-# on their machine is their call, so this prints the command rather than running it.
-# One warning, not one per registration. The dev rig alone has three of these ProgIds registered in
-# both hives, which came out as five separate warnings and buried the useful line - and a wall of
-# warnings after a successful install reads as a failed one.
+# Another tabbed-Word add-in drives the same `_WwF` document frame that WordTab carves the strip out
+# of, so whether one is going to LOAD is worth reporting accurately. Two things decide that, and
+# this used to get both wrong:
+#
+#   - **HKCU beats HKLM for the same ProgId.** Word reads the per-user value and stops; a machine-wide
+#     LoadBehavior=3 sitting under a per-user 0 or 2 is not an add-in that loads. The old code
+#     scanned both hives and reported a hit in either, so the dev rig - HKLM 3, HKCU 2 - was told an
+#     add-in would load that Word had already given up on.
+#   - **Disabled Items beats LoadBehavior.** An add-in Word killed after a failed load stays dead at
+#     LoadBehavior=3. The dev rig's Office Tab is in exactly that state.
+#
+# **And the claim that used to be here - that WordTab and Office Tab "have coexisted through every
+# check suite" - was measured on 2026-08-17 and is FALSE.** Office Tab is registered on the dev rig
+# with LoadBehavior=3, which is what that sentence was read off; it has never once loaded during a
+# check. Word put it in Disabled Items on 2026-08-15 and no suite has run beside a live rival since.
+# Re-enabling it (Disabled Items cleared, LoadBehavior 3 on all three ProgIds, its own trial
+# unexpired and its own Word switch on, its launcher running) got its DLL into WINWORD and still drew
+# no strip, so the two have never been in one Word together and the coexistence claim cannot be made
+# from this rig at all. Say untested, because untested is what it is.
+#
+# Turning somebody else's software off on their machine is their call, so this prints the command
+# rather than running it. One warning, not one per registration: the dev rig alone has three of these
+# ProgIds in both hives, which came out as five warnings and buried the useful line.
 $rivals = @('OfficeTab.TabsforWord2013', 'OfficeTabs.Connect', 'TabsforOfficeHelper.Helper')
-$perUser = @(); $machine = @()
+$rivalsLoading = @(); $rivalsBlocked = @(); $rivalsPerUser = @()
 foreach ($rival in $rivals) {
+    $behavior = $null; $fromHive = $null
     foreach ($hive in @('HKCU:', 'HKLM:')) {
         $key = "$hive\Software\Microsoft\Office\Word\Addins\$rival"
         if (-not (Test-Path $key)) { continue }
-        if ((Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).LoadBehavior -ne 3) { continue }
-        if ($hive -eq 'HKCU:') { $perUser += $rival } else { $machine += $rival }
+        $value = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).LoadBehavior
+        if ($null -eq $value) { continue }
+        $behavior = [int]$value; $fromHive = $hive
+        break                       # per-user wins outright, so the first hive with a value decides
+    }
+    if ($null -eq $behavior -or $behavior -ne 3) { continue }
+
+    # Registered to load - but Word may already have disabled it. Matched on the DLL path rather
+    # than on a friendly name, because the name in Disabled Items is the vendor's, not the ProgId.
+    $dll = Get-AddinDllPath $rival
+    $isBlocked = $false
+    if ($dll) {
+        $isBlocked = @($disabledPaths | Where-Object { $_ -and $_.ToLowerInvariant() -eq $dll.ToLowerInvariant() }).Count -gt 0
+    }
+    if ($isBlocked) { $rivalsBlocked += $rival }
+    else {
+        $rivalsLoading += $rival
+        if ($fromHive -eq 'HKCU:') { $rivalsPerUser += $rival }
     }
 }
-$rivalNames = @(($perUser + $machine) | Select-Object -Unique)
-if ($rivalNames.Count -gt 0) {
-    Write-Warning "Another tabbed-Word add-in is set to load: $($rivalNames -join ', ')"
-    Write-Note 'That is not known to be a problem - WordTab and Office Tab have coexisted through every check'
-    Write-Note 'suite on the dev rig - but they drive the same part of Word. If the tab row looks doubled or'
-    Write-Note 'the document jumps, turn the other one off first:'
-    foreach ($r in ($perUser | Select-Object -Unique)) {
+
+if ($rivalsLoading.Count -gt 0) {
+    # "registered to load", not "will load". The registry says what Word has been ASKED to do; the
+    # dev rig has a ProgId at LoadBehavior=3, absent from Disabled Items, whose DLL does not turn up
+    # in WINWORD's module list at all. Claiming the stronger thing would be an assertion about the
+    # product made from a fact about a registry key.
+    Write-Warning "Another tabbed-Word add-in is registered to load with Word: $(@($rivalsLoading | Select-Object -Unique) -join ', ')"
+    Write-Note 'WordTab has never been tested beside a working one - they carve up the same document frame,'
+    Write-Note 'and both of them stack Word windows. Turn the other one off before starting Word:'
+    foreach ($r in @($rivalsPerUser | Select-Object -Unique)) {
         Write-Note "  Set-ItemProperty 'HKCU:\Software\Microsoft\Office\Word\Addins\$r' LoadBehavior 0"
     }
-    if ($machine.Count -gt 0) {
-        Write-Note '  and for the machine-wide ones: Word > File > Options > Add-ins > Manage: COM Add-ins'
+    if (@($rivalsLoading | Where-Object { $rivalsPerUser -notcontains $_ }).Count -gt 0) {
+        Write-Note '  and for any registered machine-wide: Word > File > Options > Add-ins > Manage: COM Add-ins'
     }
+    Write-Note 'Put it back the same way with LoadBehavior 3, or by re-ticking it in that dialog.'
+} elseif ($rivalsBlocked.Count -gt 0) {
+    Write-Ok "no other tabbed-Word add-in will load (Word has disabled: $(@($rivalsBlocked | Select-Object -Unique) -join ', '))"
 } else {
     Write-Ok 'no other tabbed-Word add-in is set to load'
 }

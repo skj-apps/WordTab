@@ -105,12 +105,131 @@ merely believed to be equivalent.
   DLL. Past that point the DLL travels without its sources and the check has nothing to stand on —
   so it happens at the last moment it can mean anything.
 - **The installer warns about other tabbed-Word add-ins; it does not disable them.** Turning
-  somebody else's software off on their machine is their call. And the honest framing is a warning
+  somebody else's software off on their machine is their call. ~~And the honest framing is a warning
   rather than a blocker: WordTab and Office Tab have coexisted through every check suite on the dev
-  rig without the strip's tripwire firing once.
+  rig without the strip's tripwire firing once.~~ **That second sentence was false and was retracted
+  on 2026-08-17 — see "What the installer says about other add-ins" below.**
 - **`README.txt` is written for someone with no context and no me.** Ordered steps, the expected
   outcome stated so a wrong one is recognisable, and every failure path paired with the thing to
   check — `LoadBehavior` rewritten to 2, `Resiliency\DisabledItems`, and where the log is.
 - **The load banner is on by default in a package**, and the README says it will appear. It is the
   one thing that proves the add-in loaded before any document is open, and the first run is exactly
   when that is worth a click.
+
+---
+
+# What the installer says about other add-ins, and why it used to be wrong
+
+Measured 2026-08-17, the morning of the first install on a real user's machine. **No product code
+changed** — `install\install.ps1` and `install\package.ps1` only, so the DLL stays byte-identical to
+the build the last green battery tested (MD5 `9C5015588D4838D7EA27733B96DE5D53`).
+
+## The claim that started it
+
+The installer told the user, and this file repeated it:
+
+> That is not known to be a problem - WordTab and Office Tab have coexisted through every check
+> suite on the dev rig
+
+**That sentence was read off a registry key, not off a running Word, and it is false.** The dev rig
+has `OfficeTab.TabsforWord2013` and `TabsforOfficeHelper.Helper` at `LoadBehavior=3`, which is what
+"is installed and enabled" looks like from the registry. It says nothing about whether Word loaded
+them.
+
+It matters because the work rig is a machine where **Office Tab is a tool the user actually uses**,
+and the installer was about to tell them the combination was proven.
+
+## What is actually true on the dev rig
+
+Word's window tree, two documents open, WordTab installed:
+
+```
+--- frame 0x1D0630 ---
+vis  NetUIHWND                (0,0 874x356)      <- the ribbon
+vis  _WwF                     (0,420 874x221)
+vis  WordTabStrip             (0,356 874x64)     <- ours, and the only one
+==> Office Tab processes
+    none
+==> Modules loaded into WINWORD matching Tab
+    C:\Users\skj81\AppData\Local\Programs\WordTab\WordTab.dll
+```
+
+No `TChromeTabs`, no Office Tab process, no Office Tab DLL in `WINWORD` at all. **Office Tab has
+never once been loaded during a check suite.** The reason is two entries in
+
+```
+HKCU\Software\Microsoft\Office\16.0\Word\Resiliency\DisabledItems
+    A24457 -> c:\program files (x86)\extendoffice\office tab\tabsforoffice64.dll
+              office tab (classic) 19.00
+    A39205 -> c:\program files (x86)\extendoffice\office tab\tabsforoffice32.dll
+```
+
+written **2026-08-15 at 20:32:37**, mid-development, at the same second Word rewrote
+`OfficeTabs.Connect` to `LoadBehavior=2`.
+
+**And the cause of that is NOT established.** Two stories fit the timestamp — WordTab and Office Tab
+colliding, or one of the suites' `Kill()` calls (live in the tree until the harness slice removed
+them) taking Word down while Office Tab was loading, which is exactly how Word decides an add-in
+hung. **It is not written down as a WordTab defect, because nothing measured says it is one.**
+
+## The attempt to measure the collision, and why it failed
+
+With the user's agreement, Office Tab was fully re-enabled and Word restarted, WordTab switched off
+as a control: both `DisabledItems` entries cleared, `LoadBehavior=3` on all three of its ProgIds, its
+own `Expired=0 ExpiredDays=30`, its own `Office2013\TabsforWord\Enable=1`, and finally
+`OfficeTabLauncher.exe` started by hand because nothing autostarts it here.
+
+`TabsforOffice64.dll` **did** get into `WINWORD` — so this was not a registration problem — and it
+**still drew nothing**: two separate `OpusApp` frames, `_WwF` at full height with no carve, no
+`TChromeTabs`, screenshot confirming plain Word.
+
+**So the collision cannot be measured on this rig at all**, and the honest report is "untested".
+Everything was restored: both `DisabledItems` values back, `LoadBehavior` 3/2/3/3 as found, no Office
+Tab process left running, no `Run` key added.
+
+## What the installer does now
+
+Three defects, all of them in the *reporting* rather than the install, all found by looking at a
+machine instead of at the code:
+
+- **Disabled Items are NAMED, not counted.** Each value is a fixed-width binary blob holding the DLL
+  path and the vendor's friendly name as NUL-separated UTF-16, so the question "is it *us* Word
+  disabled, or somebody else" can be answered. Those are different situations with different fixes
+  and the old code printed the same warning for both. Only the `.dll`/`.vsto`/`.xll`/`.wll` fields
+  are kept — keeping the friendly names would double the count and give the path matching a second
+  thing to trip on.
+- **`HKCU` beats `HKLM` for the same ProgId.** Word reads the per-user value and stops. The old code
+  scanned both hives and reported a hit in either, so the dev rig — `HKLM` 3 under `HKCU` 2 — was
+  told an add-in would load that Word had already given up on.
+- **Disabled Items beats `LoadBehavior`.** A rival Word has killed stays dead at `LoadBehavior=3`,
+  and matching it needs the ProgId resolved through its CLSID to a **path**, because the name in
+  Disabled Items is the vendor's and not the ProgId.
+
+The result on this rig, which is now three true statements where there was one false one:
+
+```
+    Word has not disabled WordTab (2 other entry/entries in Disabled Items)
+      disabled: c:\program files (x86)\extendoffice\office tab\tabsforoffice64.dll
+      disabled: c:\program files (x86)\extendoffice\office tab\tabsforoffice32.dll
+WARNING: Another tabbed-Word add-in is registered to load with Word: TabsforOfficeHelper.Helper
+    WordTab has never been tested beside a working one ...
+```
+
+## Decisions worth not re-deriving
+
+- **"Registered to load", not "will load".** `TabsforOfficeHelper.Helper` is at `LoadBehavior=3`,
+  absent from Disabled Items, and its DLL does not appear in `WINWORD`'s module list. The registry
+  says what Word has been *asked* to do; claiming the stronger thing would be an assertion about the
+  product made from a fact about a registry key — the same mistake the retracted sentence made.
+- **An entry naming OUR OWN DLL is the one case in that block that means the install will not
+  work**, so it is the one that gets a warning and the exact dialog path. Everything else there is
+  information.
+- **The README now says turn the other one off, and says why it is being cautious.** It also gives
+  the user a way to try both anyway and a description of what failure would look like — one row of
+  tabs is fine, two rows or a document that jumps is not. A warning nobody can act on is a warning
+  nobody reads.
+- **The rig was left exactly as found**, checked value by value rather than assumed: the `.reg`
+  exports were taken before the first change and re-imported after the last.
+- **This is the second time reading the installer rather than recalling it has produced real
+  findings**, and it is the same lesson as the packaging slice: a verification is only as good as the
+  environment it ran in. "They have coexisted" was true of a rig where the rival never ran.

@@ -219,10 +219,19 @@ IF SOMETHING IS WRONG
     - File > Options > Add-ins > Manage: Disabled Items. Word parks add-ins there after a crash and
       that beats LoadBehavior=3.
 
-  Another tabbed-Word add-in (Office Tab and similar) is NOT known to be a problem - they have
-  coexisted through every check suite on the development machine - but they do drive the same part of
-  Word, so if the tab row looks doubled or the document jumps, turn the other one off first. The
-  installer prints the exact command if it finds one.
+IF YOU ALREADY RUN OFFICE TAB (OR ANOTHER TABBED-WORD ADD-IN)
+
+  TURN IT OFF BEFORE YOU START WORD. WordTab has never been run beside a working one, and this is
+  the honest version of a claim that used to sit here saying they coexist fine. They do not conflict
+  in theory - they both carve the strip out of the same document frame and both stack Word's windows
+  on top of each other, which is one job done twice.
+
+  It is not known to be dangerous, and it is one command each way. The installer prints the exact
+  line for whatever it finds registered. To put the other one back afterwards, set LoadBehavior to 3
+  again, or re-tick it in File > Options > Add-ins > Manage: COM Add-ins.
+
+  If you would rather try both at once: open two documents and look at the tab row. One row of tabs
+  is fine. Two rows, a row that flickers, or a document that jumps up and down means turn one off.
 
 TO REMOVE IT
 
