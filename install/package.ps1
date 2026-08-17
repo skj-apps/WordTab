@@ -113,9 +113,13 @@ New-Item -ItemType Directory -Path (Join-Path $payload 'src\native\build') -Forc
 
 Copy-Item (Join-Path $PSScriptRoot 'install.ps1')   (Join-Path $payload 'install\install.ps1')
 Copy-Item (Join-Path $PSScriptRoot 'uninstall.ps1') (Join-Path $payload 'install\uninstall.ps1')
+# The escape hatch travels with the thing it is an escape from. A package whose tab row comes out the
+# wrong colour on a machine nobody here has seen is exactly the case settings.ps1 exists for, and
+# leaving it behind would mean the answer to "turn that bit off" was regedit.
+Copy-Item (Join-Path $PSScriptRoot 'settings.ps1')  (Join-Path $payload 'install\settings.ps1')
 Copy-Item (Join-Path $NativeDir 'wordtab.h')        (Join-Path $payload 'src\native\wordtab.h')
 Copy-Item $BuiltDll                                 (Join-Path $payload 'src\native\build\WordTab.dll')
-Write-Ok 'install.ps1 and uninstall.ps1 copied verbatim'
+Write-Ok 'install.ps1, uninstall.ps1 and settings.ps1 copied verbatim'
 
 # The Word this was built and checked against. A package that turns up on a machine with a different
 # Word is still worth trying, but the difference is the first thing to look at.
@@ -177,7 +181,31 @@ WHAT TO DO, IN ORDER
      "WordTab is loaded inside Word" comes up first - that is the load banner, and it is on by
      default so that the first run proves itself. Turn it off with:
 
-         New-ItemProperty HKCU:\Software\WordTab ShowLoadBanner -Value 0 -PropertyType DWord -Force
+         powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Set ShowLoadBanner=0
+
+WHAT YOU CAN DO WITH IT
+
+  Click a tab to switch. Drag one along the row to reorder it. Drag one DOWN, clear of the row, and
+  let go - that document comes out into a window of its own; drag its tab back onto the row to put it
+  back. Right-click a tab for Save, Close, Close Others, Close Tabs to the Right, Close All, and the
+  same two Move commands. The x closes a tab, middle-click does too, + makes a new document, and
+  Ctrl+Tab / Ctrl+Shift+Tab step along the row. A document with unsaved changes shows a dot where its
+  x is.
+
+IF YOU WANT TO TURN SOMETHING OFF
+
+  Every part of it is a separate switch, and none of this needs regedit:
+
+         powershell -ExecutionPolicy Bypass -File install\settings.ps1
+
+  That lists every setting, what it does, and what the add-in reported at the last Word startup.
+  To change one:  -Set TabDot=0    To put everything back:  -Reset
+  Close Word completely afterwards - it reads these once, when it starts.
+
+  The two most likely to be wanted:
+    TabThemeSample=0   if the tab row is the wrong colour on this machine. It stops taking colours
+                       off Word's ribbon and uses the Office theme setting instead. TRY THIS FIRST.
+    TabKeys=0          if you need Ctrl+Tab to type a tab character inside a table.
 
 IF SOMETHING IS WRONG
 
