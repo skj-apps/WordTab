@@ -1,10 +1,15 @@
-# Ctrl+Tab: the research, before the feature
+# Ctrl+Tab: the research, then the feature
 
-**2026-08-16. Queue item 5, the research half. NO PRODUCT CODE CHANGED** — `src\native` is
-untouched, this is `tools\` only, and the installed DLL is still `8DA909D3C0A1570A84A0B14368C9B2FE`,
-byte-identical to the one in `dist\WordTab-20260816-4abea68.zip`.
+**Queue item 5, done in two halves on 2026-08-16. Both halves are in this one file on purpose** —
+what is known about Word and the keyboard should have one place to be read, not a research note and
+a build note that agree until one of them is corrected.
 
-Instrument: `tools\probe-keyboard.ps1`. Eight measurements, three oracles each.
+- **The research half** (below, commit `b10a375`) changed **no product code**: `tools\` only, with
+  the installed DLL still `8DA909D3C0A1570A84A0B14368C9B2FE`, byte-identical to the one in
+  `dist\WordTab-20260816-4abea68.zip`. Instrument `tools\probe-keyboard.ps1`, eight measurements,
+  three oracles each.
+- **The feature half** is at the end of this file, under "The build". Ctrl+Tab and Ctrl+Shift+Tab
+  now move along the tab row.
 
 ## Why this was a research slice and not a feature slice
 
@@ -148,3 +153,138 @@ works or doesn't.
   than into the probe so that keystroke confirmation keeps having exactly one implementation —
   `-Shift` without `-Ctrl` throws rather than quietly sending an unshifted key. Gated with
   `WordTabHarness.ps1 -SelfTest`: 23 checks, 0 failures.
+
+---
+
+# The build
+
+**2026-08-16, the same evening. Ctrl+Tab moves one tab to the right, Ctrl+Shift+Tab one to the
+left, both wrapping.** The brief above was followed as written and nothing in it turned out to be
+wrong, which is the return on having measured first.
+
+**No new suite and no new probe.** The regression test is a section inside `tools\check-stack.ps1`,
+which already has three documents up and already knows the tab order. `probe-keyboard.ps1` stays as
+the measurement.
+
+## What was built
+
+Three edits, ~90 lines of product code.
+
+- **`frames.cpp`: a `WH_GETMESSAGE` hook on `g_uiThread`,** next to the `WH_CBT` that has always been
+  there. `GetMsgProc` rewrites a matching `WM_KEYDOWN` to `WM_NULL` and posts
+  `WM_WORDTAB_SWITCH_TAB` to the coordinator window. Installed in `FramesStart` only when `TabKeys`
+  is on, unhooked in `FramesStop` alongside the CBT hook.
+- **`stack.cpp`: `StackNeighbourTab(frame, delta)`,** the tab `delta` positions along the row,
+  wrapping; `NULL` when there is nowhere to go.
+- **`CoordinatorProc` gains one case**, which recomputes the target and calls `StackActivate`.
+
+## The five decisions that are not obvious from the code
+
+**1. `WH_GETMESSAGE`, not `WH_KEYBOARD`, and the reason is the swallow.** In a `GetMessage` hook the
+`MSG` is ours for the length of the call and rewriting it to `WM_NULL` is total. It is also the same
+move the strip already makes on `WM_WINDOWPOSCHANGING` — change what is being *proposed* rather than
+correct what has already happened — so it is an idiom this codebase already has rather than a new
+one. The decisive part is *when* it runs: before the message loop's `TranslateMessage`. Swallow any
+later and the synthesised `WM_CHAR` of `0x09` is still on its way, and Word types a tab into the
+document with no keydown left to explain it.
+
+**2. The hook computes nothing and activates nothing; it posts.** `CbtProc` has always worked this
+way and the reason transfers exactly: this code runs *inside* `GetMessage`, and calling
+`SetForegroundWindow` from in there re-enters message retrieval on the thread that is retrieving.
+The post is pumped a moment later, at a point in the loop where switching a window is an ordinary
+thing to do.
+
+**And what is posted is the source and the direction, never the target.** Slice 4 lost a bug to a
+posted command whose target had gone by the time it arrived, so the tab to move to is worked out at
+the moment it is used. Same message, same mistake available, not made twice.
+
+**3. The chord is swallowed on membership, not on "is there somewhere to go" — and that is the
+product decision this slice makes.** The test is `StackTabIndex(root) >= 0`: did this key go to a
+window that is a tab in our row. A Word with one document open therefore swallows Ctrl+Tab and does
+nothing, rather than typing a tab character that it would not type one document later. The
+alternative makes what the key *means* depend on how many documents happen to be open, which is the
+same objection the research half raised against swallowing everywhere-except-in-a-table.
+
+It also lands correctly in three places without any code for them, which is the sign the test is the
+right one: **focus inside a dialog** roots at the dialog rather than at an `OpusApp`, so Ctrl+Tab
+still moves between the pages of a property sheet; **a Word window with no document** has already
+left the stack; and **`Stack=0`** means there is no row, so the key is Word's again.
+
+**4. Auto-repeat is swallowed but not acted on, and this one is a judgement, not a measurement.**
+Bit 30 of the keydown's `lParam` is the previous key state. A held chord repeats at up to ~30/sec and
+each switch here is a real window activation plus a relayout of every window in the stack, so
+honouring repeats would thrash Word; a row small enough to fit on screen is one nobody needs to hold
+a key to cross. Tapping Tab with Ctrl held still works, because each tap is a fresh keydown.
+**Swallowing the repeats is not optional** — passing them through would put a run of tab characters
+into the document, which is worse than either answer. **Not driven by the suite**: injected input
+does not carry the auto-repeat bit, so a test of it would be a test of the test. Recorded as
+undriven rather than as covered.
+
+**5. `GetKeyState`, not `GetAsyncKeyState`.** The message-synchronised state is the right question —
+"which modifiers were down when this key was pressed" — and it is reliably populated here because
+Ctrl goes down *first*, so its own `WM_KEYDOWN` has been retrieved and dispatched before Tab arrives.
+This was written as the reasoned choice and then settled by the suite rather than by argument; if it
+had been wrong, all four chords would have gone straight through into the document.
+
+## How it is proved
+
+**Section "Ctrl+Tab between documents" in `check-stack.ps1`, riding on the existing three-document
+fixture.** `$activated` — which window each computed tab slot brought forward — *is* the tab order,
+and it is the only way this project can know that order from outside Word.
+
+**The assertion that matters is the direction, not that something switched.** Four presses,
+`+1 +1 -1 -1` starting from the last tab, which is where the click loop leaves the run: that crosses
+the right-hand end on the first press and the left-hand end on the last, so both wraps are driven
+without a step that exists only to set them up. Then the second oracle: the add-in's own
+`keys  ctrl+tab  … tab 2 -> … tab 0` lines, one per chord, because the foreground window says which
+document came forward and the log says which tab WordTab decided on.
+
+**And the cost that was avoided:** `Document.Saved` per window before and after, asserting nothing
+went from saved to modified — with `at least one document was unmodified before the chords` as a
+control, because a check that cannot fail is not a check.
+
+**Two more, at the end of the run:** the one-document case (chord swallowed, log says
+`nowhere (swallowed; no other tab)`, nothing typed), and **`TabKeys=0` driven positively** — Word
+restarted with the switch off, the startup line asserted to read `msgHook=off`, then Ctrl+Tab
+asserted to *reach Word and type*. "Nothing happened" is also what a keystroke that never landed
+produces, and this project has had three negative tests pass for exactly that reason.
+
+## Near-misses worth more than the successes
+
+- **The test's own MRU comparison was wrong, and it was wrong in the shape this whole feature is
+  about.** The first version computed Word's answer as "the tab to the left of the one we are on",
+  which is right for the *first* press and wrong for every one after it, because Word's list
+  reorders on every switch. Two of the four steps then printed `and not to Word's MRU tab 0` about a
+  press whose correct answer was *also* tab 0 — a comparison against a number that is only sometimes
+  the other model's answer, reading exactly like a discriminator. It now tracks the list properly and
+  **counts the presses that genuinely disagree (3 of 4) and asserts that count**, so the section
+  cannot quietly stop being able to tell the two implementations apart. The research half's central
+  finding was that a sequence both hypotheses predict is not a measurement of either; the *test for
+  it* made the same mistake one level up.
+- **The suite now sets `Document.Saved`, which is the second place in the project to do it.** The
+  standing rule — the add-in only ever reads it — protects the *user's* documents from the
+  *add-in*, and is untouched: nothing in `src\native` does this or may. A suite marking its own
+  scratch `.rtf` in `%TEMP%` saved is the act `probe-keyboard.ps1` already justified, and the
+  alternative is a modal save prompt left on the user's screen, because `Close-AllWord` correctly
+  refuses to answer a question it did not raise. It is also what makes the one-document check *able
+  to fail*: the resize earlier in the same run dirties a document all by itself.
+- **`TabKeys=0` uninstalls the hook rather than making it inert**, which costs the suite a Word
+  restart, because the switch is read once at `FramesStart`. That is the right trade for a hook that
+  sees every message Word retrieves: "off" has to mean out of the way. Same shape as `TabDot=0`,
+  where the poll returns before it asks.
+- **The startup line reports what `SetWindowsHookEx` returned, never the variable that asked for
+  it** — `msgHook=installed` / `FAILED` / `off (…TabKeys=0)`. `TabThemeSample` stayed dead for two
+  slices because its log line printed the variable, which kept its default.
+- **Both outcomes of a chord are logged, including the one where nothing happens.** "The hook never
+  fired" and "the hook fired and there was nowhere to go" are different facts and must not share a
+  silence. That is what makes the one-document assertion possible at all.
+
+## Still open
+
+- **Ctrl+Shift+Tab inside a table is still unmeasured** — the research half says so and the feature
+  did not change it. Shift+Tab is "previous cell" there, so treat the reverse chord's cost as
+  unknown rather than zero.
+- **Backstage.** Ctrl+Tab with Backstage open switches documents underneath it. Harmless, since the
+  strip is hidden behind `FullpageUIHost` anyway, but it is not a considered behaviour.
+- **Auto-repeat**, above: decided, not driven.
+- **No keyboard reorder and no keyboard scroll.** Unchanged by this slice.

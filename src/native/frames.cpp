@@ -37,6 +37,10 @@ static const UINT_PTR kSubclassId = 0x57544142;   // 'WTAB'
 // Posted to the coordinator window when the CBT hook sees a frame being created.
 #define WM_WORDTAB_FRAME_CREATED  (WM_APP + 1)
 
+// Posted to the coordinator when the keyboard hook swallows Ctrl+Tab.
+//   wParam = the frame the keystroke went to, lParam = +1 for the tab to the right, -1 for the left
+#define WM_WORDTAB_SWITCH_TAB     (WM_APP + 2)
+
 static const wchar_t* const kCoordinatorClass = L"WordTabCoordinator";
 
 // ---------------------------------------------------------------------------------------------
@@ -55,6 +59,8 @@ static BOOL   g_lockReady   = FALSE;
 static BOOL   g_started     = FALSE;
 static DWORD  g_uiThread    = 0;
 static HHOOK  g_cbtHook     = NULL;
+static HHOOK  g_msgHook     = NULL;
+static BOOL   g_keysEnabled = FALSE;
 static HWND   g_coordinator = NULL;
 static ATOM   g_coordClass  = 0;
 
@@ -599,6 +605,81 @@ static LRESULT CALLBACK CbtProc(int code, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(NULL, code, wParam, lParam);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Ctrl+Tab between documents.
+//
+// Word gives the keyboard focus to _WwG, the document pane, which this add-in does not subclass -
+// and a WM_KEYDOWN goes to the focus window and nowhere else. Unlike WM_CONTEXTMENU it does not
+// travel up to parents, so no number of extra window subclasses could ever see a keystroke and a
+// thread hook is the only route. Measured with GetGUIThreadInfo; RESULT-keyboard.md §1.
+//
+// WH_GETMESSAGE rather than WH_KEYBOARD, for one reason: here the MSG belongs to us for the length
+// of the call and rewriting it to WM_NULL is a documented, total swallow. That is the same move the
+// strip makes on WM_WINDOWPOSCHANGING - change what is being proposed rather than correct what
+// already happened - and it is the only reliable one, because it runs *before* the message loop's
+// TranslateMessage. Swallowing later would leave the synthesised WM_CHAR of 0x09 behind and Word
+// would type a tab into the document with no keydown to explain it.
+//
+// The hook computes nothing and activates nothing. It posts, exactly as CbtProc does and for the
+// same reason: this runs inside GetMessage, and SetForegroundWindow from in there re-enters message
+// retrieval on the thread that is retrieving. By the time the post is pumped the loop is back at a
+// place where a window switch is an ordinary thing to do. What is posted is the *source and the
+// direction*, never the target - slice 4 lost a bug to a posted command whose target had gone by the
+// time it arrived, so the tab to move to is worked out at the moment it is used.
+// ---------------------------------------------------------------------------------------------
+
+static LRESULT CALLBACK GetMsgProc(int code, WPARAM wParam, LPARAM lParam)
+{
+    // PM_NOREMOVE is somebody peeking: the message stays in the queue and will be back. Rewriting it
+    // now would be discarded and acting on it would switch tabs twice, once on the look and once on
+    // the read.
+    if (code == HC_ACTION && wParam == PM_REMOVE && lParam)
+    {
+        MSG* msg = (MSG*)lParam;
+
+        // GetKeyState and not GetAsyncKeyState: this is the modifier state as of the last message
+        // this thread took off its queue, which is the right question - Ctrl goes down first, so its
+        // own WM_KEYDOWN has already been retrieved and dispatched by the time Tab arrives. The
+        // physical-state call would answer about the instant the hook happened to run instead.
+        if (msg->message == WM_KEYDOWN && msg->wParam == VK_TAB &&
+            (GetKeyState(VK_CONTROL) & 0x8000) != 0)
+        {
+            HWND frame = GetAncestor(msg->hwnd, GA_ROOT);
+
+            // The test is "did this key go to a window that is a tab in our row", and it decides the
+            // swallow on its own - not "is there somewhere to go". A single-document Word swallows
+            // Ctrl+Tab and does nothing, rather than typing a tab character that one document later
+            // it would not have typed. A chord whose meaning depends on how many documents are open
+            // is worse than one that is sometimes a no-op.
+            //
+            // It also falls out correctly everywhere it needs to: focus inside a dialog roots at the
+            // dialog and not at an OpusApp, so Ctrl+Tab still moves between the pages of a property
+            // sheet; a Word window with no document has left the stack; and Stack=0 means there is no
+            // row, so the key is Word's again.
+            if (StackTabIndex(frame) >= 0)
+            {
+                // Bit 30 is the previous key state: set means this is an auto-repeat. Repeats are
+                // swallowed but not acted on, and that is deliberate rather than an oversight. A
+                // switch here is a real window activation and a relayout of every window in the
+                // stack; at the 30-a-second repeat rate a held chord would thrash Word, and a row
+                // small enough to fit on screen is one nobody needs to hold a key to cross. Tapping
+                // Tab with Ctrl held still works - each tap is a fresh keydown.
+                if ((msg->lParam & (1 << 30)) == 0 && g_coordinator)
+                {
+                    LPARAM delta = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : +1;
+                    PostMessageW(g_coordinator, WM_WORDTAB_SWITCH_TAB, (WPARAM)frame, delta);
+                }
+
+                msg->message = WM_NULL;
+                msg->wParam  = 0;
+                msg->lParam  = 0;
+            }
+        }
+    }
+
+    return CallNextHookEx(NULL, code, wParam, lParam);
+}
+
 static LRESULT CALLBACK CoordinatorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (msg == WM_WORDTAB_FRAME_CREATED)
@@ -606,6 +687,31 @@ static LRESULT CALLBACK CoordinatorProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         AttachFrame((HWND)wParam, L"new frame");
         return 0;
     }
+
+    if (msg == WM_WORDTAB_SWITCH_TAB)
+    {
+        HWND source = (HWND)wParam;
+        int  delta  = (int)(LONG_PTR)lParam;
+        HWND target = StackNeighbourTab(source, delta);
+
+        // Both outcomes are logged, including the one where nothing happens. "The hook never fired"
+        // and "the hook fired and there was nowhere to go" are different facts and they must not
+        // share a silence - that is the same rule the modified-flag reader is built on.
+        if (target)
+        {
+            LogWrite(L"keys  ctrl%s+tab  0x%p tab %d -> 0x%p tab %d",
+                     delta < 0 ? L"+shift" : L"", (void*)source, StackTabIndex(source),
+                     (void*)target, StackTabIndex(target));
+            StackActivate(target);
+        }
+        else
+        {
+            LogWrite(L"keys  ctrl%s+tab  0x%p tab %d -> nowhere (swallowed; no other tab)",
+                     delta < 0 ? L"+shift" : L"", (void*)source, StackTabIndex(source));
+        }
+        return 0;
+    }
+
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
@@ -655,13 +761,32 @@ void FramesStart(void)
     // module handle here is the documented way to have SetWindowsHookEx quietly refuse.
     g_cbtHook = SetWindowsHookExW(WH_CBT, CbtProc, NULL, g_uiThread);
 
+    // Ctrl+Tab / Ctrl+Shift+Tab between documents. Off, the hook is not installed at all rather than
+    // installed and inert - the same shape as TabDot=0, where the poll returns before it asks. This
+    // is a hook on every message Word retrieves, so "off" has to mean it is out of the way.
+    //
+    // And unlike most switches in this project, 0 here is a real answer rather than a way of putting
+    // a bug back. Word owns Ctrl+Tab, and inside a table it is the only way to type a literal tab
+    // into a cell - measured, RESULT-keyboard.md §4. Everywhere else plain Tab already does the same
+    // thing, so the cost of taking the chord is confined to that one place; a user who works in
+    // tables all day is the person this switch is for.
+    g_keysEnabled = WordTabReadFlag(L"TabKeys", TRUE);
+    if (g_keysEnabled)
+        g_msgHook = SetWindowsHookExW(WH_GETMESSAGE, GetMsgProc, NULL, g_uiThread);
+
     // While we hold window subclasses and a hook, DllCanUnloadNow must say no. Balanced in
     // FramesStop; kept separate from the pin above, which never comes back.
     InterlockedIncrement(&g_lockCount);
 
-    LogWrite(L"FramesStart  uiThread=%lu  coordinator=0x%p  cbtHook=%s  qpc=%lldHz",
+    // Both hooks are reported by what SetWindowsHookEx actually returned, never by the variable that
+    // asked for them. A switch that reads back its own default is how TabThemeSample stayed dead for
+    // two slices while the log said it was on.
+    LogWrite(L"FramesStart  uiThread=%lu  coordinator=0x%p  cbtHook=%s  msgHook=%s  qpc=%lldHz",
              g_uiThread, (void*)g_coordinator,
-             g_cbtHook ? L"installed" : L"FAILED", g_qpcFreq);
+             g_cbtHook ? L"installed" : L"FAILED",
+             !g_keysEnabled ? L"off (HKCU\\Software\\WordTab\\TabKeys=0)"
+                            : (g_msgHook ? L"installed" : L"FAILED"),
+             g_qpcFreq);
 
     // Whatever already exists. At OnStartupComplete the first frame is created but not yet
     // visible - measured, every run - so this must not filter on IsWindowVisible.
@@ -690,10 +815,17 @@ void FramesStop(void)
     LogWrite(L"FramesStop  thread=%lu%s  frames=%d", thread,
              thread == g_uiThread ? L" (ui thread)" : L" (NOT the ui thread)", g_frameCount);
 
+    // Every hook installed in FramesStart comes out here. The keyboard one especially: left behind,
+    // it would rewrite messages through a callback whose DLL has gone.
     if (g_cbtHook)
     {
         UnhookWindowsHookEx(g_cbtHook);
         g_cbtHook = NULL;
+    }
+    if (g_msgHook)
+    {
+        UnhookWindowsHookEx(g_msgHook);
+        g_msgHook = NULL;
     }
 
     // Both put Word back the way it was while every frame is still alive: the stack returns each

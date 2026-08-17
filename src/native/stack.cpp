@@ -898,6 +898,47 @@ int StackTabsRightOf(HWND frame)
     return JoinedCount() - index - 1;
 }
 
+// The tab `delta` positions along the row, wrapping. Ctrl+Tab is +1 and Ctrl+Shift+Tab is -1.
+//
+// The reason this is a function on the stack rather than three lines inside the keyboard hook is the
+// same reason StackMoveTab exists: the row is g_members in array order, and the translation from a
+// tab position to the array slot that holds it is not the identity - g_members also carries windows
+// that are not joined. Every caller reaches the row through an HWND and nothing outside this file
+// indexes the array.
+//
+// NULL for "there is nowhere to go", which covers a window that is not a tab in a stack (stacking
+// switched off, a lone window, one Word has hidden) and a stack holding a single tab. The caller
+// swallows the chord either way - see the note on GetMsgProc about why a key that sometimes types a
+// tab character is worse than one that sometimes does nothing.
+HWND StackNeighbourTab(HWND frame, int delta)
+{
+    int from = StackTabIndex(frame);
+    if (from < 0)
+        return NULL;
+
+    int joined = JoinedCount();
+    if (joined < 2)
+        return NULL;
+
+    // Two modulos: C's % keeps the sign of the dividend, so a step off the left end of a three-tab
+    // row is -1 and would index nothing. Written for any delta rather than for the two it is called
+    // with, because a keyboard-scroll slice would otherwise find a function that only handles +-1.
+    int to = ((from + delta) % joined + joined) % joined;
+    if (to == from)
+        return NULL;
+
+    int seen = 0;
+    for (int i = 0; i < g_memberCount; i++)
+    {
+        if (!g_members[i].joined)
+            continue;
+        if (seen == to)
+            return g_members[i].frame;
+        seen++;
+    }
+    return NULL;
+}
+
 // Move a tab to a position in the row.
 //
 // The move is expressed in tab positions and performed in array positions, and the two are not the

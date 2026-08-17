@@ -246,6 +246,15 @@ BOOL StackMoveTab(HWND frame, int toIndex);
 // a tab in a stack, because to the caller those mean the same thing: nothing to close to the right.
 int  StackTabsRightOf(HWND frame);
 
+// The tab `delta` positions along the row from this one, wrapping at both ends. This is the whole of
+// what Ctrl+Tab needs and it deliberately lives here rather than in the keyboard code, because the
+// row order is g_members' order and nothing outside this file may walk that array.
+//
+// NULL when there is nowhere to go: not a tab in a stack, or the only tab in one. Word's own Ctrl+F6
+// cannot be used for this - Word orders its windows most-recently-used, the row is ordered by
+// position, and the two agree only until the user switches documents once. RESULT-keyboard.md §3.
+HWND StackNeighbourTab(HWND frame, int delta);
+
 // Close the document behind a tab. Activates it first - see the comment on the definition, which is
 // about where a modal save prompt ends up in the z-order - and returns the user to the tab they were
 // on if it was not the one they closed.

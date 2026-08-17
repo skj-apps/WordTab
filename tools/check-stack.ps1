@@ -88,6 +88,31 @@ function Get-Parts($frame) {
 
 function Format-Rect($r) { "({0},{1} {2}x{3})" -f $r.Left, $r.Top, ($r.Right - $r.Left), ($r.Bottom - $r.Top) }
 
+# Word's own report of one window's document, through that window's own object model. $null when Word
+# will not answer, which must never be folded in with "Word answered and the document is clean". Used
+# by the keyboard sections to answer "did a tab character get inserted" without reading pixels.
+function Get-Saved($frame) {
+    $om = [WordLayout]::NativeOm($frame)
+    if ($null -eq $om) { return $null }
+    try { return [bool]$om.Document.Saved } catch { return $null }
+}
+
+# Discard a change this suite made itself, to a file it authored itself, in %TEMP%.
+#
+# `Document.Saved` is settable and the standing rule in src\native is that the add-in only ever READS
+# it - that rule protects the USER'S documents from the ADD-IN, which must never tell Word that
+# something a person typed has been dealt with. A suite marking its own scratch .rtf saved is a
+# different act, and the alternative is worse: the TabKeys=0 section deliberately provokes an edit,
+# and Close-AllWord correctly refuses to answer a question it did not raise, so without this the run
+# ends with a modal save prompt sitting on the user's screen. Same reasoning as probe-keyboard.ps1's
+# Close-Word, which is the other place in this project that does it. FALSE when Word would not
+# answer, which the caller must treat as "the fixture is not in a known state", never as success.
+function Set-Saved($frame) {
+    $om = [WordLayout]::NativeOm($frame)
+    if ($null -eq $om) { return $false }
+    try { $om.Document.Saved = $true; return $true } catch { return $false }
+}
+
 # The window on top, or the first one if the foreground belongs to another application entirely.
 #
 # Written as a search with a fallback rather than as `@(... | Where-Object ...)[0]`, because under
@@ -266,6 +291,152 @@ Assert (@($activated | Where-Object { $frames -contains $_ }).Count -eq $count) 
 
 Test-Stacked 'After switching tabs' | Out-Null
 
+# ---- Ctrl+Tab between documents ------------------------------------------------------------------
+#
+# The keyboard route to the row. Word gives the keyboard to _WwG, which this add-in does not
+# subclass and could not usefully subclass - a WM_KEYDOWN goes to the focus window and nowhere else -
+# so the chord is served by a WH_GETMESSAGE hook on Word's UI thread which rewrites it to WM_NULL and
+# posts the switch to the coordinator. The measurement behind all of that is RESULT-keyboard.md.
+#
+# This rides on the click loop above rather than opening a fixture of its own, and that is not only
+# economy: $activated IS the tab order. It was established by clicking each computed slot and reading
+# which window came forward, which is the only way the tab order can be known from outside Word.
+#
+# THE ASSERTION THAT MATTERS IS THE DIRECTION, NOT "SOMETHING SWITCHED". Word orders its own window
+# list most-recently-used; the tab row is ordered by position. The two agree exactly until the user
+# switches documents once - which is the whole reason this feature could not be built by forwarding
+# Word's Ctrl+F6, and the reason a test asserting only "a different document came forward" would pass
+# against an implementation that is wrong in the way this one was specifically designed not to be.
+#
+# The clicks above visited the tabs left to right, so the run arrives here on the LAST tab with the
+# MRU order running right to left - and there the two models disagree about every press below.
+
+Write-Step 'Ctrl+Tab between documents'
+
+if (($landed -ne $count) -or ($distinct.Count -ne $count)) {
+    Write-Note 'the clicks above did not establish the tab order - skipping the keyboard checks rather than measuring against a guess'
+} else {
+    $order = @($activated)
+    $fg    = [WordLayout]::GetForeground()
+    $at    = -1
+    for ($i = 0; $i -lt $order.Count; $i++) { if ($order[$i] -eq $fg) { $at = $i } }
+    Assert ($at -ge 0) "the run is sitting on a tab whose position is known before the first chord (tab $at of $count)"
+
+    # A precondition reported as a check. If Word has the keyboard anywhere but the document pane
+    # then the chord is not being pressed where a user would press it, and "the hook works" would be
+    # a claim about the ribbon. The hook itself does not care - it roots msg->hwnd to the frame - but
+    # the *cost* being avoided is a tab character in the document, and that needs a caret.
+    $gui = [WordLayout]::ThreadGui($fg)
+    $focusClass = if ($gui.hwndFocus -ne [IntPtr]::Zero) { [WordLayout]::ClassOf($gui.hwndFocus) } else { '(none)' }
+    Write-Note ("keyboard focus 0x{0:X} ({1})" -f [int64]$gui.hwndFocus, $focusClass)
+    Assert ($focusClass -eq '_WwG') "Word has the keyboard in the document pane, where a user would press the chord (focus is $focusClass)"
+
+    # The baseline for "the chord never reached the document". Recorded per window, because the
+    # resize further up dirties a document all by itself - Word treats the view as part of the
+    # document - so the honest test is that nothing went from saved to modified, not that everything
+    # is clean. The count of genuinely clean documents is asserted too: without one, that test cannot
+    # fail and would be passing for the wrong reason.
+    $savedBefore = @{}
+    foreach ($f in $order) { $savedBefore[[int64]$f] = Get-Saved $f }
+    $clean = @($savedBefore.Values | Where-Object { $_ -eq $true }).Count
+    Write-Note ("documents reporting saved=True before the chords: $clean of $count")
+
+    if ($at -ge 0) {
+        # +1, +1, -1, -1 from the last tab is 0, 1, 0, last - which crosses the right-hand end on the
+        # first press and the left-hand end on the last, so both wraps are driven without a step that
+        # exists only to set them up.
+        $steps = @(
+            @{ Shift = $false; Delta =  1 },
+            @{ Shift = $false; Delta =  1 },
+            @{ Shift = $true;  Delta = -1 },
+            @{ Shift = $true;  Delta = -1 }
+        )
+
+        # Word's own answer, tracked properly rather than guessed at.
+        #
+        # The first version of this computed it as "the tab to the left of the one we are on", which
+        # is right for the FIRST press and wrong for every one after it - Word's list reorders on
+        # every switch, and two of the four steps then printed "and not to Word's MRU tab 0" about a
+        # press whose correct answer was also tab 0. A comparison against a number that is only
+        # sometimes the other model's answer is not a discriminator, and it read like one.
+        #
+        # The list is knowable exactly because this suite caused every activation in it: the clicks
+        # above visited tab 0, then 1, then 2, so most-recently-used is the reverse of that. Word's
+        # Ctrl+F6 goes to the next entry after the current one, and whatever is switched to moves to
+        # the front. Only the forward direction was measured (RESULT-keyboard.md section 3); Word's
+        # reverse chord is Ctrl+Shift+F6 and its ordering was not, so this is stated as the forward
+        # answer and the discriminating steps are counted rather than assumed.
+        $mruList = @()
+        for ($i = $count - 1; $i -ge 0; $i--) { $mruList += $i }
+
+        $expect  = $at
+        $wrapped = 0
+        $split   = 0
+        Set-LogMark
+        foreach ($step in $steps) {
+            $from    = $expect
+            $expect  = ((($expect + $step.Delta) % $count) + $count) % $count
+            $chord   = if ($step.Shift) { 'Ctrl+Shift+Tab' } else { 'Ctrl+Tab' }
+            $crosses = ([Math]::Abs($expect - $from) -ne 1)
+            if ($crosses) { $wrapped++ }
+
+            $mru = $mruList[1]
+            $differs = ($mru -ne $expect)
+            if ($differs) { $split++ }
+            Write-Note ("$chord from tab $from - the row says tab $expect, Word's MRU order [$($mruList -join ',')] says tab $mru" +
+                        $(if ($differs) { ' - they disagree, so this press tells the two models apart' } else { ' - they agree here' }))
+
+            if (-not (Invoke-ConfirmedKey -Vk 0x09 -Ctrl -Shift:$step.Shift -What $chord)) {
+                Assert $false "$chord could be delivered to Word"
+                continue
+            }
+            Start-Sleep -Milliseconds 900
+
+            $now   = [WordLayout]::GetForeground()
+            $title = [WordLayout]::TitleOf($now)
+            $landedAt = -1
+            for ($i = 0; $i -lt $order.Count; $i++) { if ($order[$i] -eq $now) { $landedAt = $i } }
+            Write-Note ("  -> foreground 0x{0:X} tab {1} `"{2}`"" -f [int64]$now, $landedAt, $title)
+
+            Assert ($landedAt -eq $expect) `
+                ("$chord from tab $from moved to tab $expect" + $(if ($crosses) { ' (wrapping)' } else { '' }) +
+                 $(if ($differs) { ", not to Word's MRU tab $mru" } else { '' }) + " (landed on $landedAt)")
+
+            # Whatever came forward goes to the front of Word's list, whether we put it there or Word
+            # did. Driven off what actually landed rather than off what was expected, so a failed
+            # press does not leave the model describing a machine it has diverged from.
+            if ($landedAt -ge 0) { $mruList = @($landedAt) + @($mruList | Where-Object { $_ -ne $landedAt }) }
+        }
+
+        Assert ($wrapped -eq 2) "the four chords crossed both ends of the row ($wrapped of 2 wraps driven)"
+        Assert ($split -ge 2) `
+            ("the row order and Word's MRU order disagreed on $split of $($steps.Count) presses, so this " +
+             "section can tell a tab-order implementation from one that forwards Word's own command")
+
+        # The add-in's own view, which is the second oracle. The foreground window says which document
+        # Word brought forward; the log says which tab WordTab decided on and which one it started
+        # from. The two disagreeing would mean the row and the stack had come apart.
+        $keyLines = @(Get-LogSince 'keys  ctrl')
+        foreach ($line in $keyLines) { Write-Note "  log: $($line.Trim())" }
+        Assert ($keyLines.Count -eq $steps.Count) `
+            "the add-in logged one switch per chord ($($keyLines.Count) of $($steps.Count))"
+        Assert (@($keyLines | Where-Object { $_ -like '*nowhere*' }).Count -eq 0) `
+            'no chord found the row empty of anywhere to go'
+        Assert (@($keyLines | Where-Object { $_ -like '*ctrl+shift+tab*' }).Count -eq 2) `
+            "two of the four were logged as the reverse chord ($(@($keyLines | Where-Object { $_ -like '*ctrl+shift+tab*' }).Count))"
+
+        # And the cost that was avoided. Word owns Ctrl+Tab and types a literal tab with it; the hook
+        # has to swallow the chord rather than watch it go past. This is the check that says it did.
+        $typed = @()
+        foreach ($f in $order) {
+            $after = Get-Saved $f
+            if (($savedBefore[[int64]$f] -eq $true) -and ($after -eq $false)) { $typed += $f }
+        }
+        Assert ($clean -gt 0) "at least one document was unmodified before the chords, so the check below can fail ($clean)"
+        Assert ($typed.Count -eq 0) "no chord put a tab character into a document ($($typed.Count) went from saved to modified)"
+    }
+}
+
 # ---- one window to the rest of Windows ----------------------------------------------------------
 #
 # The taskbar and Alt+Tab cannot be enumerated through any API, so what is asserted here is the
@@ -376,6 +547,33 @@ if ($last.Count -eq 1) {
     $parts = @(Get-Parts $last[0])
     Assert ($parts[0].Strip -and $parts[0].Wwf -and $parts[0].Strip.Bottom -eq $parts[0].Wwf.Top) `
         'the last window still has its strip, correctly placed'
+
+    # One document, and the chord still belongs to the tab row. This is the product decision the
+    # keyboard slice made explicitly rather than by accident: the chord is swallowed on the basis of
+    # "this key went to a window that is a tab in our row", NOT "there is somewhere to go". The
+    # alternative types a tab character on a one-document Word and switches on a two-document one,
+    # which makes what the key does depend on how many documents happen to be open.
+    #
+    # It costs nothing to check here: the window is already up and it is our own fixture. Marking it
+    # saved first is what makes the assertion able to fail - the resize earlier in this run dirties a
+    # document on its own, and "still modified" would then be true whatever the hook did. See the
+    # note on the TabKeys=0 section below for why a suite may set Saved on a file it authored.
+    if (Set-Saved $last[0]) {
+        Set-LogMark
+        if (Invoke-ConfirmedKey -Vk 0x09 -Ctrl -What 'Ctrl+Tab with one document open') {
+            Start-Sleep -Milliseconds 700
+            $lone = @(Get-LogSince 'keys  ctrl')
+            foreach ($line in $lone) { Write-Note "  log: $($line.Trim())" }
+            Assert (@($lone | Where-Object { $_ -like '*nowhere*' }).Count -eq 1) `
+                "the chord was swallowed and reported having nowhere to go ($($lone.Count) line(s) logged)"
+            Assert ((Get-Saved $last[0]) -eq $true) `
+                'and no tab character reached the one open document'
+        } else {
+            Assert $false 'Ctrl+Tab could be delivered to the last window'
+        }
+    } else {
+        Write-Note 'Word would not answer for the last document - skipping the one-document chord check'
+    }
 } else {
     Write-Note "expected one window left, found $($last.Count) - skipping the last-window checks"
 }
@@ -397,6 +595,94 @@ if ($Screenshot) {
         $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
         $graphics.Dispose(); $bitmap.Dispose()
         Write-Note $path
+    }
+}
+
+# ---- TabKeys=0 gives the chord back to Word -------------------------------------------------------
+#
+# The escape hatch, driven rather than assumed. Word owns Ctrl+Tab, and inside a table it is the only
+# way to type a literal tab into a cell - measured, RESULT-keyboard.md section 4 - so this switch is
+# the answer for somebody who works in tables all day, and a dead one leaves them nothing.
+#
+# It is checked POSITIVELY: the assertion is that the keystroke reaches Word and types, not that
+# nothing happened. "Nothing happened" is also what a keystroke that never landed produces, and this
+# project has had three negative tests pass for exactly that reason. Pairs with the one-document
+# check above, which is the same chord in the same shape with the switch on and nothing typed.
+#
+# It costs one Word restart, because the switch is read once at FramesStart. That is the price of a
+# switch that turns a hook OFF rather than making it inert, and turning it off properly is the point:
+# with TabKeys=0 there is no WH_GETMESSAGE hook on Word's UI thread at all.
+
+if (-not $KeepOpen) {
+    Write-Step 'TabKeys=0 gives Ctrl+Tab back to Word'
+
+    $switchKey  = 'HKCU:\Software\WordTab'
+    $hadTabKeys = $false
+    $oldTabKeys = $null
+    if (Test-Path $switchKey) {
+        $existing = Get-ItemProperty -Path $switchKey -Name 'TabKeys' -ErrorAction SilentlyContinue
+        if ($existing -and ($existing.PSObject.Properties.Name -contains 'TabKeys')) {
+            $hadTabKeys = $true
+            $oldTabKeys = $existing.TabKeys
+        }
+    }
+
+    try {
+        $end = Close-AllWord
+        if (-not $end.Closed) {
+            Write-Note ("Word would not close ({0}) - skipping the TabKeys=0 check" -f $end.Reason)
+        } else {
+            if (-not (Test-Path $switchKey)) { New-Item -Path $switchKey | Out-Null }
+            Set-ItemProperty -Path $switchKey -Name 'TabKeys' -Value 0 -Type DWord
+
+            $path = Join-Path $scratch 'wordtab-stack-keys.rtf'
+            "{\rtf1\ansi WordTab TabKeys=0 check.\par}" | Set-Content -Path $path -Encoding Ascii
+            Set-LogMark
+            Start-Process -FilePath 'winword.exe' -ArgumentList "`"$path`""
+            if (-not (Wait-WordReady 1 45)) { Write-Note 'the document did not arrive with a strip on it within 45s' }
+            Start-Sleep -Seconds 2
+
+            # The add-in's own account of the switch, reported from what SetWindowsHookEx returned
+            # rather than from the variable that asked for it - which is how TabThemeSample stayed
+            # dead for two slices while the log said it was on.
+            $start = @(Get-LogSince 'FramesStart  uiThread')
+            foreach ($line in $start) { Write-Note "  log: $($line.Trim())" }
+            Assert (@($start | Where-Object { $_ -like '*msgHook=off*' }).Count -ge 1) `
+                'the add-in started with no keyboard hook installed'
+
+            $keyFrames = @(Get-Frames)
+            if ($keyFrames.Count -ne 1) {
+                Write-Note "expected one window for the TabKeys=0 check, found $($keyFrames.Count) - skipping"
+            } elseif (-not (Set-Saved $keyFrames[0])) {
+                Write-Note 'Word would not answer for the fixture - skipping the TabKeys=0 keystroke'
+            } else {
+                Assert ((Get-Saved $keyFrames[0]) -eq $true) 'the fixture starts unmodified, so a typed tab will show'
+
+                Set-LogMark
+                if (Invoke-ConfirmedKey -Vk 0x09 -Ctrl -What 'Ctrl+Tab with TabKeys=0') {
+                    Start-Sleep -Milliseconds 900
+                    Assert ((Get-Saved $keyFrames[0]) -eq $false) `
+                        'Ctrl+Tab reached Word and put a tab character in the document - the switch really is off'
+                    Assert (@(Get-LogSince 'keys  ctrl').Count -eq 0) `
+                        'and the add-in did not see the chord at all'
+                    Set-Saved $keyFrames[0] | Out-Null
+                } else {
+                    Assert $false 'Ctrl+Tab could be delivered with TabKeys=0'
+                }
+            }
+        }
+    } finally {
+        # Put the switch back exactly as it was found, including absent. A suite that leaves TabKeys=0
+        # behind would disable the feature on the dev rig and every suite after it would agree that
+        # nothing is wrong.
+        if ($hadTabKeys) {
+            Set-ItemProperty -Path $switchKey -Name 'TabKeys' -Value $oldTabKeys -Type DWord
+        } elseif (Test-Path $switchKey) {
+            Remove-ItemProperty -Path $switchKey -Name 'TabKeys' -ErrorAction SilentlyContinue
+        }
+        $restored = Get-ItemProperty -Path $switchKey -Name 'TabKeys' -ErrorAction SilentlyContinue
+        $nowIs = if ($restored -and ($restored.PSObject.Properties.Name -contains 'TabKeys')) { $restored.TabKeys } else { '(absent)' }
+        Write-Note "TabKeys restored to $nowIs"
     }
 }
 
