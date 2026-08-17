@@ -129,7 +129,7 @@ enum { HIT_NONE = 0, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_PREV, HIT_NEXT };
 // The menu's command ids, which are also the ids TrackPopupMenu hands back. They start at 1 because
 // TPM_RETURNCMD answers 0 for "the user dismissed it without choosing".
 enum { CMD_NEW = 1, CMD_SAVE, CMD_CLOSE, CMD_CLOSE_OTHERS, CMD_CLOSE_ALL, CMD_CLOSE_RIGHT,
-       CMD_TEAROFF };
+       CMD_TEAROFF, CMD_JOIN };
 
 static const wchar_t* const kWwfClass    = L"_WwF";
 static const wchar_t* const kStripClass  = L"WordTabStrip";
@@ -314,11 +314,15 @@ static int  g_scrollMax   = -1;    // the row's shape last time it was revealed 
 static HWND g_dragStrip  = NULL;    // the strip that owns the capture, NULL when no press is held
 static HWND g_dragFrame  = NULL;    // the tab under that press, NULL once cancelled
 static int  g_dragPressX = 0;       // where the press landed, in strip client coordinates
+static int  g_dragPressY = 0;       // ...and its y, which only the rejoin gesture has a use for
 static int  g_dragGrabDx = 0;       // how far into the tab, so it does not jump when picked up
 static int  g_dragLeft   = 0;       // the carried tab's left edge right now
 static int  g_dragFrom   = 0;       // the position it was picked up from - the log, and the undo
 static BOOL g_dragging   = FALSE;   // past the slop: this is a drag, not a click that has not ended
 static BOOL g_dragTorn   = FALSE;   // carried clear of the row: letting go now takes it out of the stack
+static BOOL g_dragJoin   = FALSE;   // the other gesture: a window on its own being carried INTO a stack
+static HWND g_dragOnto   = NULL;    // the frame whose row it is over, NULL when it is over nothing
+static BOOL g_dragOntoKnown = FALSE; // whether g_dragOnto has been worked out yet this gesture
 static HWND g_dragScroll = NULL;    // the strip running the auto-scroll timer, NULL when it is off
 static ATOM g_stripClass = 0;
 static UINT_PTR g_janitor = 0;
@@ -364,6 +368,22 @@ static BOOL    g_paletteReady = FALSE;
 // The two GDI objects the palette still needs as handles: everything else is composited by hand.
 static HBRUSH g_backBrush     = NULL;   // the flat fallback renderer's ground
 static HBRUSH g_menuBackBrush = NULL;   // SetMenuInfo's MIM_BACKGROUND, which is not ours to paint
+
+// Which of our strips a window handle is, if it is one of ours at all.
+//
+// Answered by looking in our own array rather than by asking the window - a class-name check on a
+// handle that came from WindowFromPoint would believe anything that registered the same class, and
+// GWLP_USERDATA on a foreign window is somebody else's pointer being read as ours. These are exactly
+// the strips this process made, so the question cannot be answered wrongly.
+static StripState* FindByStrip(HWND strip)
+{
+    if (!strip)
+        return NULL;
+    for (int i = 0; i < g_stripCount; i++)
+        if (g_strips[i].strip == strip)
+            return &g_strips[i];
+    return NULL;
+}
 
 static StripState* FindByFrame(HWND frame)
 {
@@ -2936,6 +2956,18 @@ static void ShowTabMenu(HWND hwnd, POINT client, HWND target)
         if (StackCanTearOff())
             MenuAddItem(menu, CMD_TEAROFF, L"&Move to New Window", count > 1);
 
+        // ...and the way back, offered only on a window that is actually out of a stack, which is the
+        // only place it means anything. Unlike the item above this one appears and disappears, and
+        // that is the right way round: "Move to New Window" is a thing every tab could do, so it
+        // stays put and greys; this is a thing only a window standing on its own can do, and on every
+        // other tab it would be a permanently grey line saying nothing.
+        //
+        // It exists because the gesture alone is not discoverable. A user who took this window out
+        // through the menu will look in the menu to put it back, and the drag is not something they
+        // can be expected to guess.
+        if (StackCanRejoin(target))
+            MenuAddItem(menu, CMD_JOIN, L"Move &Back to the Tab Row", TRUE);
+
         MenuAddSeparator(menu);
         MenuAddItem(menu, CMD_CLOSE, L"&Close", TRUE);
         MenuAddItem(menu, CMD_CLOSE_OTHERS, L"Close &Others", count > 1);
@@ -3059,9 +3091,9 @@ static void DragScrollStop(void);
 // every time and there is nothing to destroy. Setting it while we hold the mouse capture is enough to
 // keep it - WM_SETCURSOR is not sent to anybody while the mouse is captured, so nothing else is going
 // to put the arrow back underneath us.
-static void DragCursor(BOOL torn)
+static void DragCursor(const wchar_t* which)
 {
-    SetCursor(LoadCursorW(NULL, torn ? IDC_SIZEALL : IDC_ARROW));
+    SetCursor(LoadCursorW(NULL, which));
 }
 
 // Forget the gesture without touching the row: a drop that was agreed to, or a strip destroyed
@@ -3069,12 +3101,15 @@ static void DragCursor(BOOL torn)
 static void DragForget(void)
 {
     DragScrollStop();
-    if (g_dragTorn)
-        DragCursor(FALSE);
+    if (g_dragTorn || g_dragJoin)
+        DragCursor(IDC_ARROW);
     g_dragStrip = NULL;
     g_dragFrame = NULL;
     g_dragging  = FALSE;
     g_dragTorn  = FALSE;
+    g_dragJoin  = FALSE;
+    g_dragOnto  = NULL;
+    g_dragOntoKnown = FALSE;
 }
 
 // Put the row back exactly as it was and stop carrying the tab - but keep the capture, because the
@@ -3091,17 +3126,32 @@ static void DragUndo(HWND hwnd, const wchar_t* why)
 {
     HWND frame = g_dragFrame;
     BOOL was   = g_dragging;
+    BOOL join  = g_dragJoin;
     int  from  = g_dragFrom;
 
     g_dragFrame = NULL;
     g_dragging  = FALSE;
-    if (g_dragTorn)
-        DragCursor(FALSE);
+    if (g_dragTorn || g_dragJoin)
+        DragCursor(IDC_ARROW);
     g_dragTorn  = FALSE;
+    g_dragJoin  = FALSE;
+    g_dragOnto  = NULL;
+    g_dragOntoKnown = FALSE;
     DragScrollStop();
 
     if (!was || !frame || !IsWindow(frame))
         return;
+
+    // A cancelled rejoin has nothing to put back. Carrying a window towards a stack never moved
+    // anything - the whole gesture is a question that is answered on release - so the undo is the
+    // absence of the join, and calling StackMoveTab here would be asking the row to reorder a tab
+    // that is not in it.
+    if (join)
+    {
+        LogWrite(L"strip  hwnd=0x%p  rejoin cancelled (%s) - 0x%p stays on its own",
+                 (void*)hwnd, why, (void*)frame);
+        return;
+    }
 
     StackMoveTab(frame, from);
     LogWrite(L"strip  hwnd=0x%p  drag cancelled (%s) - 0x%p back at tab %d",
@@ -3116,14 +3166,21 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
     // The document behind a carried tab can go away mid-gesture: Word hiding the window, a close
     // that was already in flight, the janitor dropping it from the stack. There is then nothing to
     // carry and nowhere to put it back, so the gesture is simply over.
-    if (!IsWindow(g_dragFrame) || StackTabIndex(g_dragFrame) < 0)
+    // A rejoin drag is carrying a window that is deliberately NOT in the row, so "no longer in the
+    // row" cannot be its abandon test - only the window going away can be.
+    BOOL lost = g_dragJoin ? !IsWindow(g_dragFrame)
+                           : (!IsWindow(g_dragFrame) || StackTabIndex(g_dragFrame) < 0);
+    if (lost)
     {
         BOOL was = g_dragging;
         g_dragFrame = NULL;
         g_dragging  = FALSE;
-        if (g_dragTorn)
-            DragCursor(FALSE);
+        if (g_dragTorn || g_dragJoin)
+            DragCursor(IDC_ARROW);
         g_dragTorn  = FALSE;
+        g_dragJoin  = FALSE;
+        g_dragOnto  = NULL;
+        g_dragOntoKnown = FALSE;
         DragScrollStop();
         if (was)
         {
@@ -3131,6 +3188,71 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
                      (void*)hwnd);
             StripRefreshTabs();
         }
+        return;
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The other gesture: a window standing on its own being carried INTO a stack.
+    //
+    // Handled before everything below and returning, because none of it applies. There is no row to
+    // reorder - this window's strip draws exactly one tab, its own - and no threshold to cross,
+    // since the tab is already outside every row that matters. The only question a mouse-move can
+    // answer here is which window's row the pointer is over, and the only two things that can
+    // happen on release are "join that one" and "nothing".
+    // ---------------------------------------------------------------------------------------------
+    if (g_dragJoin)
+    {
+        if (!g_dragging)
+        {
+            int startSlop = Scaled(DRAG_LOGICAL_SLOP, state->dpi);
+            int dxStart   = point.x - g_dragPressX;
+            int dyStart   = point.y - g_dragPressY;
+            if (dxStart > -startSlop && dxStart < startSlop &&
+                dyStart > -startSlop && dyStart < startSlop)
+                return;
+
+            g_dragging = TRUE;
+            LogWrite(L"strip  hwnd=0x%p  drag started on 0x%p - it is on its own, so this is a rejoin",
+                     (void*)hwnd, (void*)g_dragFrame);
+        }
+
+        // Which window's row the pointer is over. WindowFromPoint reports what is under the point
+        // regardless of who holds the mouse capture, which is the whole reason this can work at all:
+        // the strip being dragged FROM owns the mouse for the length of the gesture, so no other
+        // window will ever be told the pointer is there.
+        POINT screen = point;
+        ClientToScreen(hwnd, &screen);
+
+        HWND onto = NULL;
+        StripState* target = FindByStrip(WindowFromPoint(screen));
+        if (target && target->frame != g_dragFrame && StackTabIndex(target->frame) >= 0)
+            onto = target->frame;
+
+        // Re-asked every move rather than cached from the press: the row underneath can change while
+        // the gesture is in the air - a document closing takes a window out of it - and a drop
+        // aimed at a stack that is no longer there has to be refused, not honoured against a stale
+        // answer.
+        if (onto && !StackCanRejoin(g_dragFrame))
+            onto = NULL;
+
+        // The `known` flag rather than a comparison against NULL: at the start of the gesture the
+        // answer is genuinely "nothing", and a bare `onto != g_dragOnto` would treat the first
+        // evaluation as no change and say nothing at all - so the most common state this gesture is
+        // ever in would be the one state that was never announced.
+        if (!g_dragOntoKnown || onto != g_dragOnto)
+        {
+            g_dragOntoKnown = TRUE;
+            g_dragOnto = onto;
+            LogWrite(L"strip  hwnd=0x%p  rejoin drag is over %s",
+                     (void*)hwnd,
+                     onto ? L"a row it can join - letting go now puts it back"
+                          : L"nothing it can join - letting go now does nothing");
+        }
+
+        // IDC_NO is the honest answer for most of this gesture's travel, and saying so is the point:
+        // there is no window preview following the hand, so without it the user is carrying an
+        // invisible thing with no way of knowing whether releasing will do anything.
+        DragCursor(g_dragOnto ? IDC_SIZEALL : IDC_NO);
         return;
     }
 
@@ -3207,7 +3329,7 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
     if (torn != g_dragTorn)
     {
         g_dragTorn = torn;
-        DragCursor(torn);
+        DragCursor(torn ? IDC_SIZEALL : IDC_ARROW);
 
         if (torn)
         {
@@ -3242,7 +3364,7 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
         // Restated every move rather than only on the transition. The cursor is process-wide state
         // and this costs one call; a tear-off gesture that silently reverted to an arrow half way
         // through would be a gesture with no feedback at all.
-        DragCursor(TRUE);
+        DragCursor(IDC_SIZEALL);
 
         // Repainted only when the tab is not already where it belongs, which out here is at most
         // once. A carried tab moves with the pointer and every strip in the stack draws it, so the
@@ -3509,16 +3631,39 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
                 // different window, and the one thing that has to be true when this returns is that
                 // this strip owns the mouse. A tab that is not in a stack has no row to be reordered
                 // within, so it is not picked up at all.
+                //
+                // Two gestures start the same way and the difference is decided once, here, from
+                // whether this tab is in a row at all. A tab in the row can be reordered along it or
+                // pulled out of it; a window standing on its own has one tab and nothing to reorder
+                // it against, so the only thing carrying it can mean is putting it back.
                 if (g_dragEnabled && StackTabIndex(hit.frame) >= 0)
                 {
                     POINT point  = PointOf(lParam);
                     g_dragStrip  = hwnd;
                     g_dragFrame  = hit.frame;
                     g_dragPressX = point.x;
+                    g_dragPressY = point.y;
                     g_dragGrabDx = point.x - hit.tab.left;
                     g_dragLeft   = hit.tab.left;
                     g_dragFrom   = hit.index;
                     g_dragging   = FALSE;
+                    g_dragJoin   = FALSE;
+                    SetCapture(hwnd);
+                }
+                else if (g_dragEnabled && StackCanRejoin(hit.frame))
+                {
+                    POINT point  = PointOf(lParam);
+                    g_dragStrip  = hwnd;
+                    g_dragFrame  = hit.frame;
+                    g_dragPressX = point.x;
+                    g_dragPressY = point.y;
+                    g_dragGrabDx = point.x - hit.tab.left;
+                    g_dragLeft   = hit.tab.left;
+                    g_dragFrom   = hit.index;
+                    g_dragging   = FALSE;
+                    g_dragJoin   = TRUE;
+                    g_dragOnto   = NULL;
+                    g_dragOntoKnown = FALSE;
                     SetCapture(hwnd);
                 }
             }
@@ -3537,6 +3682,8 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             HWND frame = g_dragFrame;
             BOOL was   = g_dragging;
             BOOL torn  = g_dragTorn;
+            BOOL join  = g_dragJoin;
+            HWND onto  = g_dragOnto;
             int  from  = g_dragFrom;
 
             // Cleared *before* the capture goes back. ReleaseCapture sends this window a
@@ -3545,6 +3692,26 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             DragForget();
             if (GetCapture() == hwnd)
                 ReleaseCapture();
+
+            if (was && frame && join)
+            {
+                // Dropped on somebody's row, or dropped on nothing. Nothing is a perfectly good
+                // outcome and is left silent apart from the log: the pointer said IDC_NO for the
+                // whole approach, so a release there is a user who changed their mind, not a
+                // gesture that failed.
+                if (onto)
+                {
+                    LogWrite(L"strip  hwnd=0x%p  rejoin dropped on 0x%p's row - putting 0x%p back",
+                             (void*)hwnd, (void*)onto, (void*)frame);
+                    PostMessageW(hwnd, WM_WORDTAB_CMD, (WPARAM)CMD_JOIN, (LPARAM)frame);
+                }
+                else
+                {
+                    LogWrite(L"strip  hwnd=0x%p  rejoin let go over nothing - 0x%p stays on its own",
+                             (void*)hwnd, (void*)frame);
+                }
+                return 0;
+            }
 
             if (was && frame && torn)
             {
@@ -3759,6 +3926,7 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             break;
 
         case CMD_TEAROFF:      StackTearOffTab(target);   break;
+        case CMD_JOIN:         StackJoinTab(target);      break;
         case CMD_CLOSE:        StackCloseTab(target);     break;
         case CMD_CLOSE_OTHERS: StackCloseOthers(target);  break;
         case CMD_CLOSE_RIGHT:  StackCloseToRight(target); break;

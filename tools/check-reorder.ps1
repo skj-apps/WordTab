@@ -147,9 +147,16 @@ function Get-TopStrip {
 
 # Where to aim, measured now - never held from an earlier call. `grip` is how far across the tab to
 # take hold of it, as a fraction, so the arithmetic about where a carried tab lands stays readable.
-function Get-TabSpot($index, $grip = 0.33) {
+#
+# `tabs` is how many tabs that row holds, and it defaults to the number of Word windows because for
+# most of this suite's life those are the same number. They are NOT the same while a window is out of
+# the stack: that window's own row holds exactly one tab while four windows exist. Getting it wrong
+# does not throw - the computed slots are merely narrower than the real ones and the click still lands
+# somewhere - so it is a wrong answer arrived at silently, which is why it is a parameter rather than
+# an assumption. Same trap, and the same fix, as Get-Spot in check-menu.
+function Get-TabSpot($index, $grip = 0.33, $tabs = $null) {
     $top = Get-TopStrip
-    $count = (Get-FrameCount)
+    $count = if ($null -eq $tabs) { (Get-FrameCount) } else { $tabs }
     $layout = [WordLayout]::Tabs($top.Strip.Hwnd, $count)
     if ($index -ge $layout.Tabs.Length) { throw "Tab $index does not exist ($($layout.Tabs.Length) tabs)." }
 
@@ -692,6 +699,127 @@ Write-Note "order: $(Format-Order $kept)"
 $expected = @($before | Where-Object { $_ -ne $victim })
 Assert (Test-SameOrder $kept $expected) 'the tabs left behind are in the order they started in - the drop tore off instead of reordering'
 Test-OneRectangle 'After a tab was dragged out of the row'
+
+# ---- dragging a window back into the stack -----------------------------------------------------------
+#
+# The inverse gesture, and the reason tearing off is no longer a one-way door. A window standing on
+# its own draws a row of exactly one tab; carrying that tab onto another window's row and letting go
+# puts it back.
+#
+# Everything here is about the INPUT, the same as the tear-off section: the mechanism is Join, which
+# has snapped windows onto the stack rectangle since the first stacking slice. What is new is that the
+# drop has a *target* - the first gesture in this add-in that acts on a window other than the one it
+# started in - and that the answer can change while the gesture is in the air.
+#
+# Placed above the sections that follow on purpose, so all of them run against a row containing a
+# window that left and came back. That placement is what found the last two defects in this file.
+
+Write-Step 'Dragging a window back into the stack'
+$before = Get-Order
+Write-Note "order: $(Format-Order $before)"
+$stackCount = Get-FrameCount
+$victim     = $before[0]
+$stackRect  = [WordLayout]::RectOf($victim)
+
+# Out again, with the gesture proven above. Cheaper than a second fixture and it means the rejoin is
+# tested against a window that got out the way a user gets it out.
+Set-WordForeground | Out-Null
+Set-LogMark
+$spot     = Get-TabSpot 0
+$stripH   = $spot.Band.Bottom - $spot.Band.Top
+$wayBelow = $spot.Band.Bottom + [int]($stripH * 1.6)
+$onWhat = Get-ClassAt $spot.X $spot.Y
+Assert ($onWhat -eq 'WordTabStrip') "the tear-off starts on the strip, not on `"$onWhat`""
+[WordLayout]::DragTo($spot.X, $spot.Y, $spot.X, $wayBelow, 12, 60)
+Wait-Until { ([WordLayout]::RectOf($victim)).Left -ne $stackRect.Left } 8 | Out-Null
+Start-Sleep -Milliseconds 1200
+Assert (@(Get-LogSince 'torn off, now its own window').Count -eq 1) `
+       "`"$(Name $victim)`" is out of the stack again, ready to be put back"
+Assert ([WordLayout]::GetForeground() -eq $victim) 'and it is the window in front'
+
+# Its row holds exactly ONE tab while four Word windows exist, so the slot has to be computed against
+# a count of one. Ask for it wrong and nothing throws - the slots come out narrower and the press
+# still lands on the strip - which is the whole reason Get-TabSpot takes the count.
+$lone = Get-TabSpot 0 0.5 1
+Write-Note ("its own row: one tab at ({0},{1})" -f $lone.X, $lone.Y)
+
+# Somewhere over a STACKED window's row that the torn-off window does not cover. The stack is where
+# it always was and the torn-off window sits one caption down and to the right of it, so the left-hand
+# end of the stack's row is still on screen.
+$stacked      = @(Get-Frames | Where-Object { $_ -ne $victim })[0]
+$stackedStrip = (Get-Parts $stacked).Strip
+$stackedRect  = [WordLayout]::RectOf($stackedStrip.Hwnd)
+$dropX = $stackedRect.Left + 20
+$dropY = [int](($stackedRect.Top + $stackedRect.Bottom) / 2)
+
+# Confirmed against the system, not computed and hoped for. This is the exact question the add-in asks
+# on every mouse-move - what window is under this point - so if the answer here is not the stacked
+# window's strip, every assertion below would be about a drop that was never aimed at anything.
+$under = [WordLayout]::WindowAt($dropX, $dropY)
+Write-Note ("drop point ({0},{1}) is over 0x{2:X}, the stack's strip is 0x{3:X}" -f `
+            $dropX, $dropY, [int64]$under, [int64]$stackedStrip.Hwnd)
+Assert ($under -eq $stackedStrip.Hwnd) 'the drop point really is over a stacked window''s tab row'
+
+$cursorNo  = [IntPtr]::Zero
+$cursorYes = [IntPtr]::Zero
+
+try {
+    $onWhat = Get-ClassAt $lone.X $lone.Y
+    Assert ($onWhat -eq 'WordTabStrip') "the rejoin drag starts on the strip, not on `"$onWhat`""
+
+    # Down into its own document first: a real place a hand passes through, and nothing there can be
+    # joined. The negative half of the feedback, and it is asserted rather than assumed because "the
+    # pointer did not change" is also what a gesture that never started produces.
+    [WordLayout]::DragHold($lone.X, $lone.Y, $lone.X, ($lone.Y + 60), 8, 60)
+    $nothing = Wait-Logged 'rejoin drag is over nothing'
+    $cursorNo = [WordLayout]::CursorShape()
+    Write-Note "the add-in worked out there was nothing to join $($nothing.Ms)ms after the pointer got there"
+    Assert $nothing.Ok 'carried over its own document, the add-in says there is nothing to join'
+    Assert ($cursorNo -eq [WordLayout]::SystemCursor(32648)) `
+           'and the pointer says so - IDC_NO, letting go here does nothing'
+
+    # Onto the stack's row.
+    [WordLayout]::DragMoveTo($lone.X, ($lone.Y + 60), $dropX, $dropY, 14, 60)
+    $over = Wait-Logged 'rejoin drag is over a row it can join'
+    $cursorYes = [WordLayout]::CursorShape()
+    Write-Note "and that it was over a joinable row $($over.Ms)ms later"
+    Assert $over.Ok 'over a stacked window''s row, the add-in says it can go back'
+    Assert ($cursorYes -eq [WordLayout]::SystemCursor(32646)) 'and the pointer changes to IDC_SIZEALL'
+}
+finally {
+    [WordLayout]::DragRelease($dropX, $dropY)
+}
+
+Wait-Until { ([WordLayout]::RectOf($victim)).Left -eq $stackRect.Left } 10 | Out-Null
+Start-Sleep -Milliseconds 1200
+
+$said = @(Get-LogSince 'put back into the stack')
+foreach ($line in $said) { Write-Note $line.Trim() }
+Assert ($said.Count -eq 1) "the add-in put exactly one window back ($($said.Count))"
+
+Assert ((Get-FrameCount) -eq $stackCount) "still $stackCount windows - nothing opened or closed ($((Get-FrameCount)))"
+Test-OneRectangle 'After a window was dragged back in'
+
+# Reachability in reverse: the stack takes the taskbar button and Alt+Tab entry off every window but
+# the active one, so a window that rejoined has to have given them back up. One presented window is
+# what a stack of four looks like.
+$shown = @(Get-Frames | Where-Object { -not [WordLayout]::IsToolWindow($_) })
+Assert ($shown.Count -eq 1) "the stack is one taskbar button again ($($shown.Count))"
+
+$place = Get-StripPlacement (@(Get-Frames))
+Assert ($place.Measured -eq $stackCount) "all $stackCount windows measured for strip placement (measured $($place.Measured))"
+Assert $place.Ok ('every strip sits between the chrome and the document' + $place.Text)
+
+# Where its tab landed, which is the decision this slice had to make rather than discover. The end of
+# the row: the window is ARRIVING, not being undone, and a tab that reappeared in the middle of a row
+# the user has rearranged since would be a surprise. It was tab 0 when it was torn off.
+$rejoined = Get-Order
+Write-Note "order: $(Format-Order $rejoined)"
+Assert ($rejoined[-1] -eq $victim) "`"$(Name $victim)`" came back as the LAST tab, not where it left from"
+Assert (@($rejoined | Sort-Object -Unique).Count -eq $stackCount) 'every document still has exactly one tab'
+$others = @($before | Where-Object { $_ -ne $victim })
+Assert (Test-SameOrder (@($rejoined | Select-Object -First $others.Count)) $others) `
+       'and the tabs that stayed behind kept their order'
 
 # ---- carrying a tab past the end of the row ---------------------------------------------------------
 

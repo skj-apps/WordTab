@@ -318,11 +318,118 @@ the bug.
   nothing was offered that would then be refused. Costs one Word restart, because the switch is read
   in `StackStart`.
 
-## Still open
+## Still open after the gesture half
 
 - **No live preview of the window being dragged**, and this is the honest gap. The feedback is the row
   letting go plus a cursor, not a window following the hand. Doing it properly means moving the real
   window during the drag, which is a slice of its own.
-- **Putting a window back into a stack** is still the obvious next question, and there is still no
-  gesture for it.
-- **The maximized branch of `PlaceTornOff`** remains reasoned rather than measured, by either half.
+- ~~**Putting a window back into a stack**~~ — built; see below.
+- **The maximized branch of `PlaceTornOff`** remains reasoned rather than measured.
+
+---
+
+# Putting one back
+
+**Status: passed 2026-08-16.** A window standing on its own goes back into the stack — drag its lone
+tab onto another window's tab row and let go, or right-click it and choose **Move Back to the Tab
+Row**. Until this existed, tearing off was a one-way door: the only way a torn-off window rejoined was
+by losing its document, which is to say by being closed.
+
+**`check-reorder` 72 → 90 checks, `check-menu` 63 → 71.** No new suite and no new probe.
+
+## Almost all of it already existed
+
+`Join()` has snapped windows onto the stack rectangle, put their tabs in the row and repainted every
+strip since the first stacking slice. `StackJoinTab` clears the sticky flag, marks the member as
+arriving, calls `Join`, and activates the window. That is the whole mechanism — the same shape as the
+tear-off half, where `Leave()` turned out to already do everything.
+
+What is genuinely new is in the input:
+
+- **This is the first gesture in the add-in that acts on a window other than the one it started in.**
+  The strip being dragged *from* owns the mouse capture for the whole gesture, so no other window is
+  ever told the pointer is over it. `WindowFromPoint` answers regardless of capture, which is the only
+  reason this can work at all.
+- **The window under the point is resolved through our own `g_strips` array, not by class name.** A
+  handle that came from `WindowFromPoint` could be anything; a class-name check believes whatever
+  registered that class, and reading `GWLP_USERDATA` off a foreign window is reading somebody else's
+  pointer as ours. `FindByStrip` can only answer with a strip this process made.
+- **The target is re-asked on every mouse-move rather than cached from the press.** The row underneath
+  can change while the gesture is in the air — a document closing takes a window out of it — and a
+  drop aimed at a stack that is no longer there has to be refused rather than honoured against a stale
+  answer.
+
+## The tab lands at the END of the row, and that is a decision
+
+Not where it left from. The window is **arriving**, not being undone: the user may have torn it off
+ten minutes and three reorders ago, and a tab reappearing in the middle of a row they have rearranged
+since would be a surprise. It reuses the flag written for recycled frames, which is the same rule for
+the same reason — *a tab that was not in the row joins at the end of it*.
+
+The suite asserts this specifically: the window was tab 0 when it was torn off, and it comes back as
+the last tab, with the three that stayed behind still in their original order.
+
+## IDC_NO is most of this gesture, and saying so is the point
+
+There is still no window preview following the hand. So the pointer carries the whole of the feedback,
+and unlike the tear-off gesture the answer is *usually no*: everywhere except one thin band of screen,
+letting go does nothing.
+
+- Over a row it can join → **`IDC_SIZEALL`**.
+- Anywhere else → **`IDC_NO`**, Windows' own "you cannot drop that here".
+
+**A gesture whose most common state is "this will do nothing" has to say so**, or the user is carrying
+an invisible thing with no way of knowing whether releasing will achieve anything. Both states are
+driven: the suite carries the tab down into the window's own document first, which is a real place a
+hand passes through and one that can never be joined.
+
+**The "over nothing" state had to be announced explicitly.** It is the state the gesture *starts* in,
+so a bare `onto != g_dragOnto` treated the first evaluation as no change and logged nothing at all —
+the most common state this gesture is ever in would have been the one state never announced. Hence
+`g_dragOntoKnown`.
+
+## Two routes, one command, and both driven
+
+Tearing off has a menu item and a gesture; putting back now has both too, and for the same reason.
+**The gesture alone is not discoverable**: a user who took a window out through the menu will look in
+the menu to put it back, and a drag onto another window's tab row is not something anyone guesses.
+
+- **`Move Back to the Tab Row` is hidden rather than greyed on ordinary tabs**, which is the opposite
+  of every other item on this menu. That is deliberate: `Move to New Window` is something any tab
+  *could* do, so it stays put and greys; this is something only a window standing on its own can do,
+  and on every other tab it would be a permanently grey line describing a state that tab is not in.
+- **The shared expected-menu list grew a second shape** rather than a footnote. `Get-TabMenuItems`
+  documented in so many words that the list is the same whatever the row holds, because items grey
+  rather than hide — and this item breaks that. `-OnItsOwn` returns the ten-item list, and the
+  torn-off window's whole menu is asserted against it, because an item that hides changes the *shape*
+  of the menu and the shape is what the rule about `Close All` never moving under the pointer is for.
+- **The menu route is driven in `check-menu`, the drag route in `check-reorder`** — the same split as
+  tearing off, and both raise the one `CMD_JOIN` so neither is a second implementation.
+
+## What the suite asserts, and why in that shape
+
+- **It tears the window off with the gesture proven a section earlier**, rather than building a second
+  fixture, so the rejoin is tested against a window that got out the way a user gets it out.
+- **The lone row's slot is computed against a count of ONE.** That window's row holds one tab while
+  four Word windows exist. Asking for it wrong does not throw — the computed slots come out narrower
+  and the press still lands on the strip — so `Get-TabSpot` now takes the count rather than assuming
+  it. Third time this trap has been paid for in this project.
+- **The drop point is confirmed against `WindowFromPoint` before the gesture starts.** That is the
+  exact question the add-in asks on every move; if the answer here were not the stacked window's
+  strip, every assertion after it would be about a drop that was never aimed at anything.
+- **Reachability is asserted in reverse.** After a tear-off the claim is *two* windows presented to the
+  shell; after a rejoin it is **one**, because a window that went back into the stack has to have
+  given its taskbar button and Alt+Tab entry back up.
+- **The section sits above everything else in the file**, so all the sections below run against a row
+  containing a window that left and came back. That placement has now found the last two defects in
+  this suite.
+
+## Still open
+
+- **A live preview** — still the honest gap, now on both gestures.
+- **Two windows both standing on their own cannot be dropped onto each other** to form a stack: the
+  target has to be a window that is currently *in* one. Stated rather than discovered; `StackCanRejoin`
+  requires `JoinedCount() >= 1`.
+- **Rejoining is gated on stacking being on, not on `TabTearOff`.** With tearing off switched off
+  nothing can be outside the stack in the first place, so the case cannot arise — but it is a
+  reasoned answer rather than a measured one.

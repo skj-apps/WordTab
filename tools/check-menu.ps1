@@ -220,7 +220,8 @@ function Open-TabMenu($kind, $index, $tabs = 0) {
     }
 }
 
-$VK = @{ S = 0x53; C = 0x43; O = 0x4F; A = 0x41; N = 0x4E; M = 0x4D; W = 0x57; ESC = 0x1B; X = 0x58 }
+$VK = @{ S = 0x53; C = 0x43; O = 0x4F; A = 0x41; N = 0x4E; M = 0x4D; W = 0x57; ESC = 0x1B; X = 0x58
+         B = 0x42 }
 
 function Close-Menu {
     if ((Get-MenuWindow) -ne [IntPtr]::Zero) {
@@ -699,7 +700,59 @@ $menu = Open-TabMenu 'label' 0 1
 Assert ($menu.Window -ne [IntPtr]::Zero) 'the menu opens on the torn-off window'
 $move = @($menu.Items | Where-Object { $_.Text -eq '&Move to New Window' } | Select-Object -First 1)
 Assert ($move -and -not $move.Enabled) 'Move to New Window is greyed - it is the only tab there is'
-Close-Menu
+
+# ...and the way back is offered, on this window and nowhere else. The whole list is asserted rather
+# than just the new item: an item that is HIDDEN on other menus rather than greyed changes the shape
+# of this one, and the shape is what the rule about Close All never moving under the pointer is about.
+$ownItems = @($menu.Items | ForEach-Object { if ($_.Separator) { '-' } else { $_.Text } })
+$ownWanted = @(Get-TabMenuItems -OnItsOwn)
+Write-Note ("items: {0}" -f ($ownItems -join ', '))
+Assert (($ownItems -join '|') -eq ($ownWanted -join '|')) `
+       'a window on its own is offered Move Back to the Tab Row, and nothing else has changed'
+$back = @($menu.Items | Where-Object { $_.Text -eq 'Move &Back to the Tab Row' } | Select-Object -First 1)
+Assert ($back -and $back.Enabled) 'and it is available - there is a stack for it to go back to'
+
+# ---- and it works ------------------------------------------------------------------------------------
+#
+# Driven, not merely offered. An item asserted to be present and enabled and never invoked is a claim
+# about a menu, not about a feature - and the command behind this one moves a window, snaps it onto
+# the stack rectangle and rebuilds the row.
+#
+# The gesture that does the same thing is driven in check-reorder, which is where the drags live. Same
+# split as tearing off: the menu route is proven here, the drag route there, and both raise the one
+# command so neither is a second implementation.
+
+Set-LogMark
+if ($menu.Window -ne [IntPtr]::Zero) {
+    Invoke-ConfirmedKey -Vk $VK.B -What "the menu's Move Back to the Tab Row mnemonic" | Out-Null
+    Wait-Menu $false | Out-Null
+}
+Wait-Until { ([WordLayout]::RectOf($victim)).Left -eq $stackRect.Left } 10 | Out-Null
+Start-Sleep -Milliseconds 1000
+
+$wentBack = @(Get-LogSince 'put back into the stack')
+foreach ($line in $wentBack) { Write-Note $line.Trim() }
+Assert ($wentBack.Count -eq 1) "the add-in put exactly one window back ($($wentBack.Count))"
+Assert ((Get-FrameCount) -eq $stackCount) "still $stackCount windows ($((Get-FrameCount)))"
+
+$backState = Get-TearOffState $victim $stackRect
+Assert ($backState.Out.Count -eq 0) "no window is standing outside the stack any more ($($backState.Out.Count))"
+Assert ($backState.Shown.Count -eq 1) "and the stack is one taskbar button again ($($backState.Shown.Count))"
+
+# Out again, so the sections below meet the fixture they were written against: this section ends by
+# closing the torn-off document, and the assertion that the tear-off is forgotten with the DOCUMENT
+# rather than with the window is the one that caught a real bug three sections downstream.
+Write-Step 'Taking it back out to restore the fixture'
+Set-LogMark
+$menu = Open-TabMenu 'label' ($stackCount - 1)
+Assert ($menu.Window -ne [IntPtr]::Zero) 'the menu opens on the rejoined tab, which is now the last one'
+if ($menu.Window -ne [IntPtr]::Zero) {
+    Invoke-ConfirmedKey -Vk $VK.M -What "Move to New Window on the rejoined tab" | Out-Null
+    Wait-Menu $false | Out-Null
+}
+Wait-Until { ([WordLayout]::RectOf($victim)).Left -ne $stackRect.Left } 8 | Out-Null
+Start-Sleep -Milliseconds 800
+Assert (@(Get-LogSince 'torn off, now its own window').Count -eq 1) 'it is out of the stack again'
 
 # Back to a stack of four, which is what every section below was written against.
 Write-Step 'Closing the torn-off window'

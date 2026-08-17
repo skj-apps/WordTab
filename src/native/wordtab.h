@@ -273,6 +273,25 @@ void StackTearOffTab(HWND frame);
 // by the strip rather than read there, so the menu item and the drag gesture cannot disagree.
 BOOL StackCanTearOff(void);
 
+// Put a window that is standing on its own back into the stack - the inverse of StackTearOffTab, and
+// the reason tearing off is no longer a one-way door.
+//
+// Its tab arrives at the END of the row rather than at the place it used to hold. The window is
+// arriving, not being undone: the user may have torn it off ten minutes and three reorders ago, and a
+// tab that reappeared in the middle of a row they have since rearranged would be a surprise. Same
+// rule, and the same flag, as a recycled frame coming back with a new document in it.
+//
+// Refused for a window that is already a tab in a stack, for one Word will not let us place, and when
+// there is no stack to join - all silently, because the strip greys nothing here: it simply does not
+// start the gesture. See StackCanRejoin.
+void StackJoinTab(HWND frame);
+
+// Whether this window could be dropped back into a stack right now: stacking on, this window is a
+// member that is not joined, it is placeable, and there is at least one joined window for it to join.
+// Asked by the strip on every mouse-move of a rejoin drag, so it decides both what the pointer looks
+// like and what the drop does - one answer, not two that can disagree.
+BOOL StackCanRejoin(HWND frame);
+
 // Close the document behind a tab. Activates it first - see the comment on the definition, which is
 // about where a modal save prompt ends up in the z-order - and returns the user to the tab they were
 // on if it was not the one they closed.

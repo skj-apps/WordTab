@@ -465,14 +465,27 @@ function Get-WordDialog {
 <#
   What the tab context menu holds, top to bottom, with '-' for a separator.
 
-  Shared because two suites assert the whole list and they assert it about different things:
+  Shared because three suites assert the whole list and they assert it about different things:
   check-menu that the menu is built correctly, check-look that owner-drawing did not cost the labels
   their GetMenuString readback. Two copies agree right up until a menu item is added, and then one
   suite goes red for a reason that has nothing to do with what it measures - which is exactly what
-  happened when "Move to New Window" went in. The list is the same whatever the tab count, because
-  items are greyed rather than hidden.
+  happened when "Move to New Window" went in.
+
+  The list does not depend on how many tabs the row holds, because items are greyed rather than
+  hidden. It DOES depend on one thing: a window standing on its own outside the stack is offered a way
+  back in, and no other window is. That item is hidden rather than greyed, and deliberately so - on
+  every ordinary tab it would be a permanently grey line describing a state that tab is not in - so
+  the two shapes are two lists here rather than one list and a footnote.
+
+  -OnItsOwn is the menu on a window that has been torn off.
 #>
 function Get-TabMenuItems {
+    param([switch]$OnItsOwn)
+
+    if ($OnItsOwn) {
+        return @('&Save', '&Move to New Window', 'Move &Back to the Tab Row', '-', '&Close',
+                 'Close &Others', 'Close Tabs to the &Right', 'Close &All', '-', '&New Document')
+    }
     return @('&Save', '&Move to New Window', '-', '&Close', 'Close &Others',
              'Close Tabs to the &Right', 'Close &All', '-', '&New Document')
 }

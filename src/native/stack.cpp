@@ -1306,6 +1306,73 @@ void StackTearOffTab(HWND frame)
              (void*)frame, JoinedCount());
 }
 
+// ---------------------------------------------------------------------------------------------
+// Putting one back.
+//
+// The inverse of StackTearOffTab, and the reason tearing off is no longer a one-way door. Until this
+// existed the only way a torn-off window returned to the row was by losing its document, which is to
+// say by being closed - so "I pulled out the wrong one" had no answer that kept the document open.
+//
+// Almost all of it is machinery that was already here. Join snaps a window onto the stack rectangle,
+// puts its tab in the row and repaints every strip; the sticky flag is one line; and where the tab
+// lands is the rule written for recycled frames. What this adds is the decision that the user is
+// allowed to revoke a decision.
+// ---------------------------------------------------------------------------------------------
+
+BOOL StackCanRejoin(HWND frame)
+{
+    if (!g_enabled || !frame || !IsWindow(frame))
+        return FALSE;
+
+    Member* member = Find(frame);
+    if (!member || member->joined)
+        return FALSE;                  // not one of ours, or already a tab in the row
+
+    // The same test the janitor applies, so a window cannot be dropped into a stack that would then
+    // refuse to hold it: on screen, not minimised, big enough to place, and holding a document.
+    if (!EligibleToJoin(frame))
+        return FALSE;
+
+    // And there has to be something to join. A lone window "rejoining" would arrive at a stack of
+    // one, which is the state it is already standing in.
+    return JoinedCount() >= 1;
+}
+
+void StackJoinTab(HWND frame)
+{
+    if (!StackCanRejoin(frame))
+    {
+        // Silent in the sense that nothing is greyed - the strip does not start the gesture at all
+        // when this is false - but logged, because the drop is posted and the row can change between
+        // the release and the command arriving.
+        LogWrite(L"stack  hwnd=0x%p  rejoin refused - already a tab, not placeable, or no stack to "
+                 L"join", (void*)frame);
+        return;
+    }
+
+    Member* member = Find(frame);
+    if (!member)
+        return;
+
+    // Staying out was a decision about this window and this is the user revoking it. Cleared here
+    // rather than inside Join, because Join is also the janitor's path and a torn-off window has to
+    // go on failing there twice a second.
+    member->tornOff = FALSE;
+
+    // Its tab goes to the END of the row, not back to the place it used to hold - see the header.
+    // Same flag, and the same reasoning, as a frame Word has recycled for a new document.
+    member->rejoin = TRUE;
+
+    Join(member);
+
+    // After Join, not before: Join is what puts the window on the stack rectangle, and activating
+    // first would raise it while it was still standing where it was torn off to.
+    StackActivate(frame);
+
+    LogWrite(L"stack  hwnd=0x%p  put back into the stack  (%d in the stack)",
+             (void*)frame, JoinedCount());
+}
+
 // Close the document behind a tab.
 //
 // WM_CLOSE, posted, rather than the object model. That is the exact path Word takes when the user
