@@ -198,6 +198,39 @@ WHAT YOU CAN DO WITH IT
   x is. Rest the pointer on a tab and it tells you the document's full name and the folder it is in -
   which is what you want when there are enough documents open that the names get cut short.
 
+IF YOU HAVE TEN MINUTES, TRY THESE IN THIS ORDER
+
+  They are ordered by how likely each is to be wrong on a machine this has never run on, not by how
+  interesting they are. Everything above the line has been driven hundreds of times on the machine
+  it was built on; everything below it has not been possible to test there at all.
+
+  1. Open two documents.            One window, two tabs, one taskbar button.
+  2. Click between the tabs.        Instant, no flicker, the ribbon stays put.
+  3. Open six or seven more.        The row starts scrolling; the chevrons beside + step along it,
+                                    and holding one scrolls continuously.
+  4. Drag a tab along the row.      It reorders, and the tab follows your pointer.
+  5. Drag a tab downward, clear     It comes out into a window of its own, and the tab travels with
+     of the row, and let go.        your pointer while it is out. Drag it back onto the row to
+                                    put it back, or right-click it > Move Back to the Tab Row.
+  6. Ctrl+Tab / Ctrl+Shift+Tab.     Steps along the row and wraps at the ends.
+  7. Type in a document.            A dot replaces the x on that tab until you save.
+  8. Rest the pointer on a tab.     The document's full name and the folder it is in.
+  9. Open something from email      Word's Protected View. The tabs should stay the same colour as
+     or a download.                 the others and the strip should be the same height.
+  10. Close every document.         The row goes empty rather than showing a tab for nothing.
+
+  ---- and these have NEVER been tested, because the machine this was built on cannot ----
+
+  11. Move the Word window to your  Everything above should still be true, at that screen's own
+      OTHER monitor.                scaling. THIS IS THE MOST LIKELY THING TO BE WRONG. If the tab
+                                    row is the wrong height, the wrong size, or in the wrong place
+                                    on one screen and right on the other, that is the reason.
+  12. Maximize it on each screen.   The row should span the window and sit directly above the page.
+  13. Drag a tab out while Word is  The new window should land on the SAME screen, not jump to the
+      on the second screen.         other one.
+
+  If any of these is wrong, run the report below and send it. Say which screen Word was on.
+
 IF YOU WANT TO TURN SOMETHING OFF
 
   Every part of it is a separate switch, and none of this needs regedit:
