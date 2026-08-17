@@ -118,7 +118,8 @@ enum { HIT_NONE = 0, HIT_TAB, HIT_CLOSE, HIT_PLUS, HIT_PREV, HIT_NEXT };
 
 // The menu's command ids, which are also the ids TrackPopupMenu hands back. They start at 1 because
 // TPM_RETURNCMD answers 0 for "the user dismissed it without choosing".
-enum { CMD_NEW = 1, CMD_SAVE, CMD_CLOSE, CMD_CLOSE_OTHERS, CMD_CLOSE_ALL, CMD_CLOSE_RIGHT };
+enum { CMD_NEW = 1, CMD_SAVE, CMD_CLOSE, CMD_CLOSE_OTHERS, CMD_CLOSE_ALL, CMD_CLOSE_RIGHT,
+       CMD_TEAROFF };
 
 static const wchar_t* const kWwfClass    = L"_WwF";
 static const wchar_t* const kStripClass  = L"WordTabStrip";
@@ -2632,7 +2633,13 @@ struct MenuItemTag
     wchar_t label[40];      // empty for a separator
 };
 
-static MenuItemTag g_menuItems[8];
+// Sized with headroom on purpose. The menu is nine items at its longest (Save, Move to New Window, a
+// separator, four closes, a separator, New Document) and running out is not an assertion failure or a
+// crash - the item is simply left off the owner-draw path and Windows draws it in the default style,
+// which on a dark theme is one light grey row at the bottom of a dark menu. Every text and state
+// assertion in check-menu still passes while that is on screen, so the cap has to be generous and the
+// overflow has to say so. See MenuAddItem.
+static MenuItemTag g_menuItems[12];
 static int         g_menuItemCount = 0;
 static HMENU       g_openMenu      = NULL;
 static int         g_menuDpi       = 96;
@@ -2684,6 +2691,15 @@ static void MenuAddItem(HMENU menu, UINT id, const wchar_t* label, BOOL enabled)
     // MF_GRAYED has to stay on the item itself and not merely be drawn: it is the state
     // check-menu.ps1 reads through GetMenuState to assert that Close Others is unavailable with one
     // document open, and an owner-drawn item Windows does no graying for.
+    if (g_lookEnabled && g_menuItemCount >= (int)(sizeof(g_menuItems) / sizeof(g_menuItems[0])))
+    {
+        // Not fatal, and that is exactly why it is logged: what the user sees is one default-styled
+        // row in an otherwise themed menu, which reads as a rendering glitch rather than as a limit
+        // somebody needs to raise.
+        LogWrite(L"strip  menu item |%s| past the owner-draw limit of %d - Windows will draw it",
+                 label, (int)(sizeof(g_menuItems) / sizeof(g_menuItems[0])));
+    }
+
     if (g_lookEnabled && g_menuItemCount < (int)(sizeof(g_menuItems) / sizeof(g_menuItems[0])))
     {
         MenuItemTag* tag = &g_menuItems[g_menuItemCount++];
@@ -2898,6 +2914,17 @@ static void ShowTabMenu(HWND hwnd, POINT client, HWND target)
     if (target)
     {
         MenuAddItem(menu, CMD_SAVE, L"&Save", TRUE);
+
+        // Grouped with Save rather than with the closes, because it is the other item here that does
+        // not destroy anything - and it deliberately does not go next to "Close All". Greyed on a
+        // single tab by the same rule as Close Others: an item that appears and disappears makes the
+        // menu a different shape each time and moves everything below it.
+        //
+        // Offered only when the stack can actually do it, so TabTearOff=0 removes the item rather
+        // than leaving a permanently grey one that says the feature exists and refuses to work.
+        if (StackCanTearOff())
+            MenuAddItem(menu, CMD_TEAROFF, L"&Move to New Window", count > 1);
+
         MenuAddSeparator(menu);
         MenuAddItem(menu, CMD_CLOSE, L"&Close", TRUE);
         MenuAddItem(menu, CMD_CLOSE_OTHERS, L"Close &Others", count > 1);
@@ -3568,6 +3595,7 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
             PostMessageW(hwnd, WM_WORDTAB_SAVE, 0, (LPARAM)target);
             break;
 
+        case CMD_TEAROFF:      StackTearOffTab(target);   break;
         case CMD_CLOSE:        StackCloseTab(target);     break;
         case CMD_CLOSE_OTHERS: StackCloseOthers(target);  break;
         case CMD_CLOSE_RIGHT:  StackCloseToRight(target); break;

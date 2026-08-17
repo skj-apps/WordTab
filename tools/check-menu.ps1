@@ -45,7 +45,10 @@
 #>
 [CmdletBinding()]
 param(
-    [int]$Documents = 4,
+    # Five, not four, and the fifth belongs to one section. "Move to New Window" takes a window out of
+    # the stack and there is no way to put it back yet, so that section tears off the last tab and
+    # then closes it - which leaves the four windows every section after it was written against.
+    [int]$Documents = 5,
     [switch]$KeepOpen,
     [switch]$Screenshot,
     [string]$ShotDir = $env:TEMP
@@ -135,9 +138,14 @@ function Get-TopStrip {
 # Where to aim, measured now - see the note in the description.
 #   'label' - the left third of a tab, clear of its close button
 #   'empty' - the strip to the right of the new-document button, which belongs to no tab
-function Get-Spot($kind, $index) {
+# `$tabs` overrides how many tabs the row is assumed to hold. It defaults to the number of Word
+# windows, which is the same thing right up until one of them leaves the stack - after "Move to New
+# Window" there are five windows and the row in front of you has four. Getting that wrong does not
+# throw: the computed slots are simply narrower than the real ones and the click still lands, which is
+# the kind of passing-for-the-wrong-reason this suite is full of guards against.
+function Get-Spot($kind, $index, $tabs = 0) {
     $top = Get-TopStrip
-    $count = (Get-FrameCount)
+    $count = if ($tabs -gt 0) { $tabs } else { Get-FrameCount }
     $layout = [WordLayout]::Tabs($top.Strip.Hwnd, $count)
     $stripRect = [WordLayout]::RectOf($top.Strip.Hwnd)
 
@@ -190,13 +198,13 @@ function Wait-Dialog($seconds = 10) { return (Wait-WordDialog $true $seconds) }
 
 # Right-click a tab and return what came up. The menu's items are read through its owner frame,
 # which is what GetMenuItemRect needs to answer with screen rectangles.
-function Open-TabMenu($kind, $index) {
+function Open-TabMenu($kind, $index, $tabs = 0) {
     $owner = (Get-TopStrip).Frame
     # Confirmed onto the strip before the right button goes down. A right-click that lands on the
     # document opens WORD's context menu, which is also a visible #32768 - so "a context menu
     # appeared" would pass while measuring Word's menu instead of ours.
-    $spot = Get-Spot $kind $index
-    $aim = { $script:menuSpot = Get-Spot $kind $index; return $script:menuSpot }
+    $spot = Get-Spot $kind $index $tabs
+    $aim = { $script:menuSpot = Get-Spot $kind $index $tabs; return $script:menuSpot }
     if (Invoke-ConfirmedClick -What "right-clicking $kind $index" -Point $aim -Button right) {
         $spot = $script:menuSpot
     } else {
@@ -212,7 +220,7 @@ function Open-TabMenu($kind, $index) {
     }
 }
 
-$VK = @{ S = 0x53; C = 0x43; O = 0x4F; A = 0x41; N = 0x4E; ESC = 0x1B; X = 0x58 }
+$VK = @{ S = 0x53; C = 0x43; O = 0x4F; A = 0x41; N = 0x4E; M = 0x4D; W = 0x57; ESC = 0x1B; X = 0x58 }
 
 function Close-Menu {
     if ((Get-MenuWindow) -ne [IntPtr]::Zero) {
@@ -469,8 +477,7 @@ Write-Step 'Right-clicking a tab'
 $menu = Open-TabMenu 'label' 1
 Assert ($menu.Window -ne [IntPtr]::Zero) 'a context menu appeared'
 
-$expected = @('&Save', '-', '&Close', 'Close &Others', 'Close Tabs to the &Right', 'Close &All',
-              '-', '&New Document')
+$expected = @(Get-TabMenuItems)
 $actual = @($menu.Items | ForEach-Object { $_.Text })
 foreach ($item in $menu.Items) {
     Write-Note ("[{0}] id={1} enabled={2} {3} `"{4}`"" -f $item.Index, $item.Id, $item.Enabled,
@@ -479,7 +486,7 @@ foreach ($item in $menu.Items) {
 Assert ($actual.Count -eq $expected.Count) "the menu has $($expected.Count) entries ($($actual.Count))"
 Assert (($actual -join '|') -eq ($expected -join '|')) "the entries are exactly: $($expected -join ', ')"
 
-$others = @($menu.Items | Where-Object { $_.Text -eq 'Close &Others' })[0]
+$others = @($menu.Items | Where-Object { $_.Text -eq 'Close &Others' } | Select-Object -First 1)
 Assert ($others -and $others.Enabled) 'Close Others is available with more than one tab'
 
 # The tab the menu belongs to stays lit. The pointer is parked off the strip first, so what is being
@@ -557,6 +564,162 @@ $actual = @($menu.Items | ForEach-Object { $_.Text })
 Write-Note ("entries: {0}" -f ($actual -join ', '))
 Assert (($actual -join '|') -eq '&New Document') 'it offers only New Document - nothing that needs a tab'
 Close-Menu
+
+# ---- Move to New Window ------------------------------------------------------------------------------
+#
+# Taking a tab out of the stack, which is the first half of tear-off; the drag gesture is the second.
+#
+# The mechanism under test is not "a window moved". Every window in the stack sits at the same
+# rectangle, so a window that leaves and keeps its position is indistinguishable from one that never
+# left - and the two things this has to get right are both invisible in a screenshot. The first is
+# reachability: the stack takes a window's taskbar button and its Alt+Tab entry away, and a window
+# with neither, underneath another window at the same rectangle, cannot be got back to by any means
+# the user has. The second is that it STAYS out - membership is otherwise re-derived from what is true
+# about the window twice a second, and a torn-off window passes every one of those tests.
+#
+# The tab torn off is the LAST one, and it is identified by clicking it first. Which window a slot
+# belongs to is knowable from outside Word only by activating it and reading the title, which is the
+# same oracle check-stack's click loop uses - and it matters here, because "some window left the
+# stack" is a much weaker claim than "the one whose tab I right-clicked left the stack".
+
+Write-Step 'Move to New Window'
+$stackCount = Get-FrameCount
+$lastTab = $stackCount - 1
+Write-Note "$stackCount windows in the stack; tearing off tab $lastTab"
+
+# Click it first, so the window behind that slot is known before anything moves it.
+Invoke-StripClick "clicking tab $lastTab to learn which window it is" { Get-Spot 'label' $lastTab } | Out-Null
+Start-Sleep -Milliseconds 900
+$victim = [WordLayout]::GetForeground()
+$victimTitle = [WordLayout]::TitleOf($victim)
+$stackRect = [WordLayout]::RectOf($victim)
+Assert (@(Get-Frames) -contains $victim) "tab $lastTab activated a Word window (`"$victimTitle`")"
+Write-Note ("it is 0x{0:X} at {1}" -f [int64]$victim, (Format-Rect $stackRect))
+
+$menu = Open-TabMenu 'label' $lastTab
+Assert ($menu.Window -ne [IntPtr]::Zero) 'the menu opened on that tab'
+$move = @($menu.Items | Where-Object { $_.Text -eq '&Move to New Window' } | Select-Object -First 1)
+Assert ($move -and $move.Enabled) 'Move to New Window is offered and available with more than one tab'
+
+Set-LogMark
+if ($menu.Window -ne [IntPtr]::Zero) {
+    Invoke-ConfirmedKey -Vk $VK.M -What "the menu's Move to New Window mnemonic" | Out-Null
+    Wait-Menu $false | Out-Null
+}
+
+# Waiting for the window to get where it is going, not for the assertion. The move is one
+# SetWindowPos inside the command; what takes time is Word repainting the interior after StripRefit.
+Wait-Until { ([WordLayout]::RectOf($victim)).Left -ne $stackRect.Left } 8 | Out-Null
+Start-Sleep -Milliseconds 800
+
+function Get-TearOffState($victim, $stackRect) {
+    $frames = @(Get-Frames)
+    $out = @($frames | Where-Object { ([WordLayout]::RectOf($_)).Left -ne $stackRect.Left -or
+                                      ([WordLayout]::RectOf($_)).Top -ne $stackRect.Top })
+    $inStack = @($frames | Where-Object { $out -notcontains $_ })
+    return [pscustomobject]@{
+        Frames  = $frames
+        Out     = $out
+        InStack = $inStack
+        Shown   = @($frames | Where-Object { -not [WordLayout]::IsToolWindow($_) })
+    }
+}
+
+$state = Get-TearOffState $victim $stackRect
+foreach ($f in $state.Frames) {
+    Write-Note ("0x{0:X}  {1}  inAltTab={2}{3}" -f [int64]$f, (Format-Rect ([WordLayout]::RectOf($f))),
+                (-not [WordLayout]::IsToolWindow($f)), $(if ($f -eq $victim) { '  <- torn off' } else { '' }))
+}
+
+Assert (@(Get-Frames).Count -eq $stackCount) "nothing closed - still $stackCount windows ($((Get-FrameCount)))"
+Assert ($state.Out.Count -eq 1) "exactly one window left the stack ($($state.Out.Count))"
+Assert ($state.Out.Count -eq 1 -and $state.Out[0] -eq $victim) 'and it is the one whose tab was right-clicked'
+
+# Reachability, which is the safety property. Two windows are now presented to the shell: the one
+# torn off, and the active one in what is left of the stack. Anything less than two means a window
+# the user cannot get to.
+Assert ($state.Shown.Count -eq 2) "two windows are in Alt+Tab and the taskbar - the torn-off one and the stack's ($($state.Shown.Count))"
+Assert (-not [WordLayout]::IsToolWindow($victim)) 'the torn-off window got its Alt+Tab entry back'
+Assert ([WordLayout]::GetForeground() -eq $victim) 'and it is in front - the user asked for this window'
+
+# It has to have gone somewhere the user can see. Same size, offset by one caption-and-border, which
+# is the step the shell cascades new windows by.
+$tornRect = [WordLayout]::RectOf($victim)
+$dx = $tornRect.Left - $stackRect.Left
+$dy = $tornRect.Top - $stackRect.Top
+Write-Note "moved by ($dx,$dy)"
+Assert ($dx -gt 0 -and $dy -gt 0) "it moved down and right of the stack ($dx,$dy)"
+Assert ($dx -eq $dy) 'by the same step in both directions'
+Assert ((($tornRect.Right - $tornRect.Left) -eq ($stackRect.Right - $stackRect.Left)) -and
+        (($tornRect.Bottom - $tornRect.Top) -eq ($stackRect.Bottom - $stackRect.Top))) 'and it kept its size'
+
+# The windows left behind are still one stack.
+$stillOne = @($state.InStack | Where-Object {
+    $r = [WordLayout]::RectOf($_)
+    $r.Left -eq $stackRect.Left -and $r.Top -eq $stackRect.Top -and
+    $r.Right -eq $stackRect.Right -and $r.Bottom -eq $stackRect.Bottom
+})
+Assert ($state.InStack.Count -eq $stackCount - 1) "the other $($stackCount - 1) are still stacked ($($state.InStack.Count))"
+Assert ($stillOne.Count -eq $state.InStack.Count) 'and they are all still at one rectangle'
+
+$place = Get-StripPlacement (@(Get-Frames))
+Assert ($place.Measured -eq $stackCount) "all $stackCount windows could be measured for strip placement (measured $($place.Measured))"
+Assert $place.Ok ('every strip still sits between the chrome and the document' + $place.Text)
+
+# The add-in's own account. Asserted as a count rather than as "at least one", because a command that
+# ran twice - the menu posts, the janitor ticks underneath it - would leave two windows out and one
+# of the geometry assertions above would still pass.
+$said = @(Get-LogSince 'torn off, now its own window')
+foreach ($line in $said) { Write-Note $line }
+Assert ($said.Count -eq 1) "the add-in tore off exactly one window ($($said.Count) log lines)"
+Assert (@(Get-LogSince "($($stackCount - 1) left in the stack)").Count -eq 1) "and it says $($stackCount - 1) are left"
+
+# **The assertion this section exists for.** The janitor re-tests membership twice a second and the
+# torn-off window passes every test it applies - visible, sized, holding a document. Without the
+# sticky flag it rejoins within half a second and every assertion above still passes, because they
+# all ran inside the first tick. Three ticks, then ask again.
+Write-Step 'It stays out'
+Start-Sleep -Milliseconds 1800
+$after = Get-TearOffState $victim $stackRect
+Assert ($after.Out.Count -eq 1 -and $after.Out[0] -eq $victim) 'three janitor ticks later it is still out of the stack'
+Assert ($after.Shown.Count -eq 2) 'still two windows presented to the shell'
+Assert (([WordLayout]::RectOf($victim)).Left -eq $tornRect.Left) 'and nothing moved it back'
+
+# The last tab in a stack has nowhere to go, and the torn-off window is now a stack of one. Free to
+# check here and it is the case the guard in StackTearOffTab exists for.
+Write-Step 'Move to New Window on a window that is already on its own'
+# One tab, explicitly: the torn-off window is in front, its row holds a single tab, and there are
+# still five Word windows. See the note on Get-Spot.
+#
+# Which window this menu belongs to is asserted rather than assumed. Get-TopStrip takes the
+# foreground, and "the greyed item was on the torn-off window's own row" is the whole claim - reading
+# it off the stack's row instead would be a pass measuring the wrong window.
+Assert ((Get-TopStrip).Frame -eq $victim) 'the torn-off window is the one in front'
+$menu = Open-TabMenu 'label' 0 1
+Assert ($menu.Window -ne [IntPtr]::Zero) 'the menu opens on the torn-off window'
+$move = @($menu.Items | Where-Object { $_.Text -eq '&Move to New Window' } | Select-Object -First 1)
+Assert ($move -and -not $move.Enabled) 'Move to New Window is greyed - it is the only tab there is'
+Close-Menu
+
+# Back to a stack of four, which is what every section below was written against.
+Write-Step 'Closing the torn-off window'
+# Aimed at the one window, not at Word. Ctrl+W closes whatever is in front, and taking the foreground
+# generically here would close a document the sections below are about. Invoke-ConfirmedKeyOn focuses
+# the named window itself and refuses to press until the system agrees it is the foreground.
+Invoke-ConfirmedKeyOn -Hwnd $victim -Vk $VK.W -Ctrl -What 'Ctrl+W on the torn-off window' | Out-Null
+if (-not (Wait-Frames ($stackCount - 1) 30)) {
+    Write-Note "the torn-off window did not close; $((Get-FrameCount)) windows left"
+}
+Assert ((Get-FrameCount) -eq $stackCount - 1) "back to $($stackCount - 1) windows for the sections below ($((Get-FrameCount)))"
+
+# **And the tear-off has to be forgotten with the document, not with the window.** Word does not
+# destroy a frame when its last document closes - it hides it and puts the next document straight back
+# into it - so a flag that lived as long as the HWND outlived the decision it recorded. Left that way,
+# the next document opened anywhere in this Word lands in the recycled frame and silently refuses to
+# join the row: five windows, four tabs, and nothing on screen to explain it. Every section below this
+# one is what found that, three steps from its cause, so it is asserted here where it happens.
+$freed = Wait-Until { @(Get-LogSince 'no longer torn off').Count -ge 1 } 8
+Assert $freed 'the tear-off is forgotten once the document has gone - that frame is Word''s to reuse'
 
 # ---- Save writes the file ----------------------------------------------------------------------------
 
@@ -668,7 +831,7 @@ Write-Step 'Close, from the menu'
 $count = (Get-FrameCount)
 $victim = $count - 1
 $menu = Open-TabMenu 'label' $victim
-$item = @($menu.Items | Where-Object { $_.Text -eq '&Close' })[0]
+$item = @($menu.Items | Where-Object { $_.Text -eq '&Close' } | Select-Object -First 1)
 
 if ($item -and $item.HasRect) {
     $centre = [WordLayout]::Center($item.Rect)
@@ -783,9 +946,9 @@ Write-Step 'Close Others with only one tab'
 if ((Get-FrameCount) -eq 1) {
     $menu = Open-TabMenu 'label' 0
     Assert ($menu.Window -ne [IntPtr]::Zero) 'the menu still opens on the last tab'
-    $others = @($menu.Items | Where-Object { $_.Text -eq 'Close &Others' })[0]
+    $others = @($menu.Items | Where-Object { $_.Text -eq 'Close &Others' } | Select-Object -First 1)
     Assert ($others -and -not $others.Enabled) 'Close Others is greyed - there are no others'
-    $close = @($menu.Items | Where-Object { $_.Text -eq '&Close' })[0]
+    $close = @($menu.Items | Where-Object { $_.Text -eq '&Close' } | Select-Object -First 1)
     Assert ($close -and $close.Enabled) 'Close is still available'
     Close-Menu
 } else {

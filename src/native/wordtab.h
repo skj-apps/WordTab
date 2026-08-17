@@ -255,6 +255,24 @@ int  StackTabsRightOf(HWND frame);
 // position, and the two agree only until the user switches documents once. RESULT-keyboard.md §3.
 HWND StackNeighbourTab(HWND frame, int delta);
 
+// Take a tab out of the stack and leave it standing as a window of its own.
+//
+// Note the neighbour above: StackDetachFrame is a different operation with a similar name - that one
+// is a window being destroyed and forgotten, this one is a window the user still has. Nothing about
+// the subclass changes here; the window keeps its strip and draws itself as a single tab.
+//
+// Refused for a window that is not a tab in a stack and for the only tab in one, both silently -
+// the caller greys the menu item, and a command posted from a menu can arrive after the row has
+// changed underneath it.
+//
+// **It stays out.** Membership is otherwise re-tested twice a second from what is true about the
+// window, and a torn-off window passes every one of those tests. See the definition.
+void StackTearOffTab(HWND frame);
+
+// Whether tearing off is available: stacking on, and HKCU\Software\WordTab\TabTearOff not 0. Asked
+// by the strip rather than read there, so the menu item and the drag gesture cannot disagree.
+BOOL StackCanTearOff(void);
+
 // Close the document behind a tab. Activates it first - see the comment on the definition, which is
 // about where a modal save prompt ends up in the z-order - and returns the user to the tab they were
 // on if it was not the one they closed.

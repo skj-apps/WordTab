@@ -643,9 +643,11 @@ if ($menuWindow -ne [IntPtr]::Zero) {
     $items = @([WordLayout]::MenuItems($menuWindow, $frame))
     $texts = @($items | ForEach-Object { if ($_.Separator) { '-' } else { $_.Text } })
     Write-Note ("items: {0}" -f ($texts -join ', '))
-    Assert ($items.Count -eq 8) "the menu still has eight entries ($($items.Count))"
-    Assert (($texts -join '|') -eq
-            '&Save|-|&Close|Close &Others|Close Tabs to the &Right|Close &All|-|&New Document') `
+    # The list itself comes from the harness - see Get-TabMenuItems for why it is not written out
+    # here. This suite's claim is about the readback surviving owner-drawing, not about the contents.
+    $wanted = @(Get-TabMenuItems)
+    Assert ($items.Count -eq $wanted.Count) "the menu still has $($wanted.Count) entries ($($items.Count))"
+    Assert (($texts -join '|') -eq ($wanted -join '|')) `
         'and every label still reads back through GetMenuString, owner-drawn or not'
 
     $menuShot.Bitmap.Dispose()

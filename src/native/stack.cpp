@@ -48,6 +48,13 @@ struct Member
     RECT joinRect;      // where the window was before we stacked it, so it can be put back
     BOOL joinZoomed;
     int  repairs;       // consecutive attempts to put this one back in step - see Reconcile
+
+    // The user pulled this window out of the stack and it is to stay out. Every other reason a
+    // member is not joined is a fact about the window that the janitor re-tests twice a second -
+    // hidden, minimised, no document - and it rejoins the moment that fact changes. This one is not
+    // a fact about the window; it is a decision about it, and nothing the window does can revoke it.
+    // See StackTearOffTab.
+    BOOL tornOff;
 };
 
 static void Reconcile(void);
@@ -71,6 +78,7 @@ static BOOL   g_enabled     = TRUE;
 static BOOL   g_started     = FALSE;
 static BOOL   g_inSync      = FALSE;  // our own SetWindowPos calls come back through the subclass
 static BOOL   g_altTab      = TRUE;
+static BOOL   g_tearOff      = TRUE;
 static BOOL   g_minimized   = FALSE;  // the whole stack is down on the taskbar
 
 // Where to put the user back when the active tab goes away, set only by StackCloseTab. Closing a
@@ -284,6 +292,14 @@ static void Join(Member* member)
     if (member->joined)
         return;
 
+    // The one place a torn-off window is kept out, deliberately here rather than in the janitor's
+    // eligibility test. Eligibility answers "could this window be a tab", which is still yes - it is
+    // visible, sized and holds a document, which is exactly why the janitor would put it straight
+    // back half a second after the user pulled it out. This answers the different question of whether
+    // it may be, and putting it on the only path into the stack means a future caller cannot miss it.
+    if (member->tornOff)
+        return;
+
     member->joined = TRUE;
     GetWindowRect(member->frame, &member->joinRect);
     member->joinZoomed = IsZoomed(member->frame) ? TRUE : FALSE;
@@ -401,11 +417,20 @@ void StackStart(void)
 
     g_enabled = WordTabReadFlag(L"Stack", TRUE);
     g_altTab  = WordTabReadFlag(L"AltTab", TRUE);
+
+    // Off, a tab cannot be taken out of the stack at all: the menu item is not offered and the
+    // command is refused. Unlike most of these switches this one is not here to put a defect back -
+    // there is no previous behaviour to restore, because nothing could leave the stack before - it is
+    // here because a torn-off window is the one thing WordTab does that the user cannot undo from
+    // inside WordTab, and a machine where it misbehaves needs a way to stop offering it.
+    g_tearOff  = WordTabReadFlag(L"TabTearOff", TRUE);
+
     TaskbarStart();
 
-    LogWrite(L"StackStart  stacking=%s  altTab suppression=%s",
+    LogWrite(L"StackStart  stacking=%s  altTab suppression=%s  detach=%s",
              g_enabled ? L"on" : L"off (HKCU\\Software\\WordTab\\Stack=0)",
-             g_altTab ? L"on" : L"off");
+             g_altTab ? L"on" : L"off",
+             g_tearOff ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTearOff=0)");
 }
 
 void StackAttachFrame(HWND frame)
@@ -683,6 +708,27 @@ void StackJanitor(void)
 
         if (!member->joined)
         {
+            // A torn-off window stops being torn off when it stops holding a document.
+            //
+            // "It stays out until the window closes" was the intended rule and it was wrong, because
+            // the window does not close. Word hides the frame when its last document goes and reuses
+            // it for the next one - the same thing that gave an empty Word window a tab called "Word"
+            // for four slices - so the flag outlived the document it was a decision about. Measured:
+            // tear a tab off, close it, press +, and Word puts the new document straight back into
+            // that same HWND, which then refused to join the row for the rest of the process. Five
+            // windows and four tabs, with no way for the user to work out why.
+            //
+            // Tested on the document rather than on visibility on purpose. Word hides and re-shows
+            // frames of its own accord - closing one document was measured to hide a *different*
+            // window for a moment - and a rule keyed to that would drop a torn-off window back into
+            // the stack while the user was looking at it.
+            if (member->tornOff && (!IsWindow(member->frame) || !StripHasDocument(member->frame)))
+            {
+                member->tornOff = FALSE;
+                LogWrite(L"stack  hwnd=0x%p  no longer torn off - its document has gone and the "
+                         L"frame is Word's to reuse", (void*)member->frame);
+            }
+
             if (EligibleToJoin(member->frame))
                 Join(member);
         }
@@ -1022,6 +1068,168 @@ void StackActivate(HWND frame)
     SetForegroundWindow(frame);
 
     StackOnFrameActivate(frame);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Taking a tab out of the stack.
+// ---------------------------------------------------------------------------------------------
+
+// Whether detaching is available at all. Asked by the strip when it builds the menu, so the switch
+// is read in one place and the drag gesture that will call StackTearOffTab next gets the same answer
+// without reading the registry a second time - [[one-copy-of-what-decides-truth]] applied to a flag.
+BOOL StackCanTearOff(void)
+{
+    return g_enabled && g_tearOff;
+}
+
+// Where a torn-off window goes.
+//
+// **Not where it is now, and this is the whole reason there is a placement rule at all.** Every
+// window in the stack sits at the same rectangle, so a window that leaves the stack and keeps its
+// position is a window the user cannot see has left: it is exactly on top of, or exactly underneath,
+// the thing it was pulled out of. "Nothing happened" and "it worked perfectly" would be the same
+// picture. So it is offset, by the step Windows itself cascades new windows by.
+//
+// Not `joinRect` either, which is what Leave restores and is right there. That is where the window
+// was before it *ever* joined - usually wherever Word opened it on a cold start, which may be the
+// same place as the stack, off the side of the current monitor, or on a monitor that has since been
+// unplugged. It answers "undo the stacking", and this is not an undo.
+static void PlaceTornOff(HWND frame, const RECT* stackRect, BOOL stackZoomed)
+{
+    // The caption plus one border: the same step the shell uses to cascade, so a torn-off window
+    // lands where a new window would and the title bar of the one underneath stays visible.
+    int step = GetSystemMetrics(SM_CYCAPTION) + GetSystemMetrics(SM_CYSIZEFRAME);
+    if (step < 24)
+        step = 24;
+
+    RECT target = *stackRect;
+
+    // A maximized stack is the case where "it did nothing" is most convincing: two maximized windows
+    // are pixel-identical and an offset is not even possible. So the torn-off window comes down to a
+    // window-sized window. Three quarters of the work area, which is roughly what Word opens at.
+    if (stackZoomed)
+    {
+        MONITORINFO info;
+        memset(&info, 0, sizeof(info));
+        info.cbSize = sizeof(info);
+        HMONITOR monitor = MonitorFromWindow(frame, MONITOR_DEFAULTTONEAREST);
+        if (monitor && GetMonitorInfoW(monitor, &info))
+        {
+            LONG width  = (info.rcWork.right - info.rcWork.left) * 3 / 4;
+            LONG height = (info.rcWork.bottom - info.rcWork.top) * 3 / 4;
+            target.left   = info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2;
+            target.top    = info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height) / 2;
+            target.right  = target.left + width;
+            target.bottom = target.top + height;
+        }
+    }
+
+    OffsetRect(&target, step, step);
+
+    // Back onto the work area if the offset pushed it off. A window whose title bar is below the
+    // bottom of the screen cannot be dragged back, and the stack is often near the bottom-right
+    // already because that is where the user left it.
+    MONITORINFO info;
+    memset(&info, 0, sizeof(info));
+    info.cbSize = sizeof(info);
+    HMONITOR monitor = MonitorFromRect(&target, MONITOR_DEFAULTTONEAREST);
+    if (monitor && GetMonitorInfoW(monitor, &info))
+    {
+        LONG overRight  = target.right - info.rcWork.right;
+        LONG overBottom = target.bottom - info.rcWork.bottom;
+        if (overRight > 0)
+            OffsetRect(&target, -overRight, 0);
+        if (overBottom > 0)
+            OffsetRect(&target, 0, -overBottom);
+        if (target.left < info.rcWork.left)
+            OffsetRect(&target, info.rcWork.left - target.left, 0);
+        if (target.top < info.rcWork.top)
+            OffsetRect(&target, info.rcWork.top - target.top, 0);
+    }
+
+    g_inSync = TRUE;
+    SetZoomState(frame, FALSE);
+    SetWindowPos(frame, NULL, target.left, target.top,
+                 target.right - target.left, target.bottom - target.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    g_inSync = FALSE;
+
+    LogWrite(L"stack  hwnd=0x%p  torn off to (%ld,%ld %ldx%ld)%s",
+             (void*)frame, target.left, target.top,
+             target.right - target.left, target.bottom - target.top,
+             stackZoomed ? L" (the stack was maximized, so it comes down to a window)" : L"");
+}
+
+// Pull one tab out of the stack and make it a window of its own.
+//
+// The mechanism is the one that already existed: Leave puts back every single thing the stack did to
+// a window - its taskbar button, its Alt+Tab entry, its own rectangle - because a window with none of
+// those, sitting underneath another one, is unreachable by any means the user has. That rule was
+// written for shutdown and it is exactly what tearing off needs, so there is no second implementation
+// of "un-stack a window" here. What this adds is the two things shutdown does not need: the window
+// has to go somewhere the user can see it, and it has to *stay* out.
+//
+// Staying out is the part with teeth. The janitor re-tests membership twice a second and a torn-off
+// window still passes every test - visible, sized, holding a document - so without the sticky flag it
+// would snap back into the stack within half a second, and from the user's side the command would
+// simply not work. See Member::tornOff and the guard in Join.
+void StackTearOffTab(HWND frame)
+{
+    if (!frame || !IsWindow(frame))
+        return;
+
+    if (!StackCanTearOff())
+    {
+        LogWrite(L"stack  hwnd=0x%p  detach refused - switched off", (void*)frame);
+        return;
+    }
+
+    Member* member = Find(frame);
+    if (!member || !member->joined)
+    {
+        // Already its own window: stacking off, a lone window, or a tab torn off twice because the
+        // command was posted from a menu the janitor ticked underneath. Nothing to do, and doing
+        // nothing is the right answer rather than an error - the user asked for a state it is in.
+        LogWrite(L"stack  hwnd=0x%p  detach ignored - not a tab in a stack", (void*)frame);
+        return;
+    }
+
+    if (JoinedCount() < 2)
+    {
+        // The last tab has nowhere to go. Detaching it would produce the window that is already
+        // there, with the difference that nothing could ever put it back.
+        LogWrite(L"stack  hwnd=0x%p  detach ignored - it is the only tab", (void*)frame);
+        return;
+    }
+
+    RECT stackRect;
+    if (!GetWindowRect(frame, &stackRect))
+        return;
+    BOOL stackZoomed = IsZoomed(frame) ? TRUE : FALSE;
+
+    // Set before Leave, not after: Leave calls Present() and StripRefreshTabs(), and both of those
+    // ask what the membership is. Setting it afterwards would give them one pass over a window that
+    // is out of the stack but not yet known to be staying out.
+    member->tornOff = TRUE;
+
+    // FALSE, so Leave does not restore joinRect - the placement below is this command's answer to
+    // where the window goes, and letting Leave move it first would be two moves the user can see.
+    Leave(member, L"torn off by the user", FALSE);
+
+    PlaceTornOff(frame, &stackRect, stackZoomed);
+
+    // Word lays out only the window it is focused on, so the interior has to be refitted to the size
+    // it was just given or the document frame keeps the stack's dimensions. Same call and same reason
+    // as Leave's own restore path.
+    StripRefit(frame);
+
+    // The user asked for this window, so it is the one they get. Raising without focusing would leave
+    // them typing into a document that is no longer in front.
+    SetWindowPos(frame, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetForegroundWindow(frame);
+
+    LogWrite(L"stack  hwnd=0x%p  torn off, now its own window  (%d left in the stack)",
+             (void*)frame, JoinedCount());
 }
 
 // Close the document behind a tab.

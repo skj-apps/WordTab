@@ -462,6 +462,21 @@ function Get-WordDialog {
     return $null
 }
 
+<#
+  What the tab context menu holds, top to bottom, with '-' for a separator.
+
+  Shared because two suites assert the whole list and they assert it about different things:
+  check-menu that the menu is built correctly, check-look that owner-drawing did not cost the labels
+  their GetMenuString readback. Two copies agree right up until a menu item is added, and then one
+  suite goes red for a reason that has nothing to do with what it measures - which is exactly what
+  happened when "Move to New Window" went in. The list is the same whatever the tab count, because
+  items are greyed rather than hidden.
+#>
+function Get-TabMenuItems {
+    return @('&Save', '&Move to New Window', '-', '&Close', 'Close &Others',
+             'Close Tabs to the &Right', 'Close &All', '-', '&New Document')
+}
+
 # A popup menu of Word's, or IntPtr.Zero. Taking the foreground dismisses one, so several things
 # below have to ask first.
 function Get-WordMenu {
