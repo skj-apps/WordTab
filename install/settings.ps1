@@ -185,7 +185,15 @@ if ($Report) {
         Say "COM class       : NOT REGISTERED under HKCU - Word cannot create it"
     }
     $ours = Get-AddinStatus 'WordTab.Connect'
-    Say ("Add-in entry    : LoadBehavior={0} from {1}" -f $ours.Behavior, $ours.Hive)
+    if ($null -eq $ours.Behavior) {
+        # The case this report exists for. A null Behavior printed through the format string below
+        # came out as "LoadBehavior= from " - an empty answer to the most important question here.
+        Say  "Add-in entry    : NOT REGISTERED - Word has never been told this add-in exists"
+        Say  "                  HKCU\Software\Microsoft\Office\Word\Addins\WordTab.Connect is absent."
+        Say  "                  Re-run install\install.ps1."
+    } else {
+        Say ("Add-in entry    : LoadBehavior={0} from {1}" -f $ours.Behavior, $ours.Hive)
+    }
     if ($ours.Behavior -eq 2) { Say "                  ** 2 means Word TRIED to load it and gave up. The log below says why." }
     if ($ours.Behavior -eq 0) { Say "                  ** 0 means it is switched off in File > Options > Add-ins." }
     Say ("Disabled by Word: {0}" -f $(if ($ours.Blocked) { 'YES - Disabled Items beats LoadBehavior. File > Options > Add-ins > Manage: Disabled Items > Go.' } else { 'no' }))
