@@ -126,12 +126,79 @@ if ($Report) {
     Say ("64-bit OS       : {0}" -f [Environment]::Is64BitOperatingSystem)
     Say ("PowerShell      : {0}  ({1}-bit host)" -f $PSVersionTable.PSVersion, $(if ([Environment]::Is64BitProcess) { 64 } else { 32 }))
     Say ("User            : {0}" -f [Environment]::UserName)
+    # DPI IS THE FIRST THING TO ASK ABOUT A MACHINE NOBODY HERE HAS SEEN.
+    #
+    # Every size the tab row draws - the height of the strip, how wide a tab is, the radius of its
+    # corners, how far a tab has to be dragged before it comes out of the row - is a logical number
+    # scaled by the DPI of the window it is drawn in. The development rig runs at 200%. A laptop
+    # usually does not. "The tabs look wrong" and "the tabs look wrong AT 125%" are different reports
+    # and only one of them can be acted on.
+    # EVERY monitor, with its own DPI, not just the primary one.
+    #
+    # A laptop with an external monitor is the normal setup and the two are usually at DIFFERENT
+    # scaling - and that is the case this add-in has never been able to test, because the machine it
+    # was developed on has one screen. Dragging Word from one to the other fires WM_DPICHANGED and
+    # every size in the tab row is rebuilt from the new number. **If the tabs look wrong on one
+    # screen and right on the other, this section is the first thing to read.**
     try {
-        # Per-monitor DPI is what the strip scales every one of its sizes by, so a row that looks
-        # wrong on a machine nobody has tried is worth being able to ask about without a screenshot.
+        Add-Type -TypeDefinition @'
+using System; using System.Collections.Generic; using System.Runtime.InteropServices; using System.Text;
+public static class WordTabDpi {
+  delegate bool MonEnumProc(IntPtr mon, IntPtr dc, IntPtr rect, IntPtr data);
+  [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr dc, IntPtr clip, MonEnumProc cb, IntPtr data);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr mon, ref MONITORINFOEX info);
+  [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr mon, int type, out uint x, out uint y);
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct MONITORINFOEX {
+    public int cbSize; public RECT rcMonitor; public RECT rcWork; public uint dwFlags;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string szDevice;
+  }
+  public static string[] All() {
+    SetProcessDPIAware();
+    List<string> lines = new List<string>();
+    EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, delegate(IntPtr mon, IntPtr dc, IntPtr r, IntPtr d) {
+      MONITORINFOEX mi = new MONITORINFOEX();
+      mi.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+      string dpiText = "dpi unknown";
+      uint x, y;
+      // GetDpiForMonitor is Windows 8.1. Older than that has one scaling for everything anyway.
+      try { if (GetDpiForMonitor(mon, 0 /* MDT_EFFECTIVE_DPI */, out x, out y) == 0)
+              dpiText = string.Format("dpi {0} ({1}% scaling)", x, (int)(100 * x / 96)); }
+      catch {}
+      if (GetMonitorInfoW(mon, ref mi)) {
+        lines.Add(string.Format("{0,-14} {1,5}x{2,-5} at ({3},{4})  {5}{6}",
+          mi.szDevice,
+          mi.rcMonitor.Right - mi.rcMonitor.Left, mi.rcMonitor.Bottom - mi.rcMonitor.Top,
+          mi.rcMonitor.Left, mi.rcMonitor.Top,
+          dpiText, ((mi.dwFlags & 1) != 0 ? "  PRIMARY" : "")));
+      }
+      return true;
+    }, IntPtr.Zero);
+    return lines.ToArray();
+  }
+}
+'@ -ErrorAction Stop
+        $monitors = @([WordTabDpi]::All())
+        Say ("Monitors        : {0}" -f $monitors.Count)
+        foreach ($m in $monitors) { Say ("  {0}" -f $m) }
+        # Named explicitly rather than left to be spotted. Mixed scaling is the configuration most
+        # likely to show up a bug in code that was only ever run against one screen.
+        $scalings = @($monitors | ForEach-Object { if ($_ -match 'dpi (\d+)') { $Matches[1] } } | Sort-Object -Unique)
+        if ($scalings.Count -gt 1) {
+            Say "  ** These monitors are at DIFFERENT scaling. Say which screen Word was on."
+        }
+    } catch { Say "Monitors        : (could not be read: $($_.Exception.Message))" }
+
+    # Physical pixels, and that is worth saying rather than leaving to be worked out. The DPI block
+    # above calls SetProcessDPIAware, so these are the real numbers - the same ones the add-in works
+    # in. Without it Windows would report a 2548-wide screen as 1274 at 200% scaling, and a rectangle
+    # that disagrees with the log by exactly a factor of two is a confusing thing to be sent.
+    try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
         foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
-            Say ("Screen          : {0}  {1}  primary={2}" -f $screen.DeviceName, $screen.Bounds, $screen.Primary)
+            Say ("Screen          : {0}  {1}  primary={2}  (physical pixels)" -f $screen.DeviceName, $screen.Bounds, $screen.Primary)
         }
     } catch { Say "Screen          : (could not be read: $($_.Exception.Message))" }
 
@@ -197,6 +264,72 @@ if ($Report) {
     if ($ours.Behavior -eq 2) { Say "                  ** 2 means Word TRIED to load it and gave up. The log below says why." }
     if ($ours.Behavior -eq 0) { Say "                  ** 0 means it is switched off in File > Options > Add-ins." }
     Say ("Disabled by Word: {0}" -f $(if ($ours.Blocked) { 'YES - Disabled Items beats LoadBehavior. File > Options > Add-ins > Manage: Disabled Items > Go.' } else { 'no' }))
+
+    Head 'Word''s windows, right now'
+    #
+    # **Run the report WHILE the thing that looks wrong is on screen and this section is the answer.**
+    # Everything else in this file is about what is installed and configured; this is the only part
+    # that says what Word is actually doing. Three questions, in the order they rule things out:
+    # is the add-in even in there (is there a WordTabStrip at all), is it in EVERY window or only
+    # some, and is the strip where it should be - immediately above the document frame, spanning it.
+    #
+    # A stack is several OpusApp windows at ONE rectangle. Several rectangles means the stacking
+    # never happened, which is a completely different fault from a strip that is drawn in the wrong
+    # place.
+    if ($running.Count -eq 0) {
+        Say '(Word is not running, so there is nothing to look at. If something looks wrong, start'
+        Say ' Word, open two documents, leave it on screen and run this again.)'
+    } else {
+        try {
+            Add-Type -TypeDefinition @'
+using System; using System.Collections.Generic; using System.Runtime.InteropServices; using System.Text;
+public static class WordTabWin {
+  delegate bool EnumProc(IntPtr h, IntPtr p);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
+  [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr p);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  static string ClassOf(IntPtr h) { StringBuilder s = new StringBuilder(64); GetClassNameW(h, s, 64); return s.ToString(); }
+  static string TextOf(IntPtr h) { StringBuilder s = new StringBuilder(300); GetWindowTextW(h, s, 300); return s.ToString(); }
+  static string RectOf(IntPtr h) {
+    RECT r; if (!GetWindowRect(h, out r)) return "(no rect)";
+    return string.Format("({0},{1} {2}x{3})", r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
+  }
+  public static string[] Describe() {
+    List<string> lines = new List<string>();
+    List<IntPtr> frames = new List<IntPtr>();
+    EnumWindows(delegate(IntPtr h, IntPtr p) {
+      if (ClassOf(h) == "OpusApp" && IsWindowVisible(h)) frames.Add(h);
+      return true;
+    }, IntPtr.Zero);
+    lines.Add(string.Format("{0} visible OpusApp window(s)", frames.Count));
+    foreach (IntPtr f in frames) {
+      uint pid; GetWindowThreadProcessId(f, out pid);
+      lines.Add("");
+      lines.Add(string.Format("  frame 0x{0:X}  pid={1}  {2}", f.ToInt64(), pid, RectOf(f)));
+      lines.Add(string.Format("    title: {0}", TextOf(f)));
+      string strip = null, wwf = null;
+      IntPtr ff = f;
+      EnumChildWindows(f, delegate(IntPtr c, IntPtr p) {
+        string cls = ClassOf(c);
+        if (cls == "WordTabStrip" && strip == null) strip = RectOf(c) + (IsWindowVisible(c) ? " visible" : " HIDDEN");
+        if (cls == "_WwF" && wwf == null) wwf = RectOf(c);
+        return true;
+      }, IntPtr.Zero);
+      lines.Add(string.Format("    WordTabStrip: {0}", strip == null ? "ABSENT - the add-in has not attached to this window" : strip));
+      lines.Add(string.Format("    _WwF document frame: {0}", wwf == null ? "absent" : wwf));
+    }
+    return lines.ToArray();
+  }
+}
+'@ -ErrorAction Stop
+            foreach ($line in [WordTabWin]::Describe()) { Say $line }
+        } catch { Say "(could not be read: $($_.Exception.Message))" }
+    }
 
     Head 'Everything in Word''s Disabled Items'
     $disabled = @(Get-DisabledAddinPaths)
