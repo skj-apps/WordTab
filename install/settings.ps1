@@ -27,20 +27,42 @@
 .PARAMETER Quiet
   Skip the explanations and print just the table.
 
+.PARAMETER Report
+  Write everything needed to diagnose WordTab on this machine to a single text file, and print where
+  it went. Send that file. It is the answer to "it is not working" from a machine nobody else can
+  reach - which is the normal case, because this add-in is installed by one person on their own
+  work computer.
+
+  It reads only. Nothing is installed, changed or removed, and no document is opened or touched.
+
+.PARAMETER ReportPath
+  Where to write it. Defaults to wordtab-report-<date>.txt on your Desktop, falling back to the
+  current directory if there is no Desktop.
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File install\settings.ps1
   powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Set TabDrag=0
   powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Reset
+  powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Report
 #>
 [CmdletBinding()]
 param(
     [string[]]$Set,
     [switch]$Reset,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$Report,
+    [string]$ReportPath
 )
 
 $ErrorActionPreference = 'Stop'
 $Key = 'HKCU:\Software\WordTab'
+
+# The registry questions install.ps1 asks too. See common.ps1 for why they are not asked twice.
+$CommonFile = Join-Path $PSScriptRoot 'common.ps1'
+if (-not (Test-Path $CommonFile)) {
+    throw "install\common.ps1 is missing. It sits beside this script in both the repo and a package; copy the whole folder rather than settings.ps1 on its own."
+}
+. $CommonFile
 
 # What each switch does, in the terms somebody turning it off would think in. The names and defaults
 # are the add-in's, not this script's - see the note in the help above about which one is the
@@ -70,6 +92,148 @@ function Get-Current($name) {
     $p = Get-ItemProperty -Path $Key -Name $name -ErrorAction SilentlyContinue
     if ($p -and ($p.PSObject.Properties.Name -contains $name)) { return $p.$name }
     return $null
+}
+
+# ---- -Report ------------------------------------------------------------------------------------
+#
+# One file, everything, no questions asked of the person running it.
+#
+# The shape is deliberate. Somebody whose tab row has gone wrong is not going to be walked through
+# eight registry paths over email, and the answers that matter are exactly the ones they cannot be
+# expected to know they need: which build this is, whether Word disabled it, whether something else
+# is driving the same document frame, what DPI the screen is at, and what the add-in itself said
+# when Word last started.
+#
+# **The add-in's own log is the most valuable thing in here and it goes in whole, at the end.** Every
+# diagnosis this project has made from outside the machine came off those lines.
+
+if ($Report) {
+    if (-not $ReportPath) {
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        if (-not $desktop -or -not (Test-Path $desktop)) { $desktop = (Get-Location).Path }
+        $ReportPath = Join-Path $desktop ("wordtab-report-{0}.txt" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    }
+
+    $out = New-Object System.Collections.Generic.List[string]
+    function Say($text) { $out.Add([string]$text) }
+    function Head($text) { Say ''; Say $text; Say ('-' * $text.Length) }
+
+    Say "WordTab report"
+    Say ("written {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss K'))
+
+    Head 'This machine'
+    Say ("OS              : {0}" -f [Environment]::OSVersion.VersionString)
+    Say ("64-bit OS       : {0}" -f [Environment]::Is64BitOperatingSystem)
+    Say ("PowerShell      : {0}  ({1}-bit host)" -f $PSVersionTable.PSVersion, $(if ([Environment]::Is64BitProcess) { 64 } else { 32 }))
+    Say ("User            : {0}" -f [Environment]::UserName)
+    try {
+        # Per-monitor DPI is what the strip scales every one of its sizes by, so a row that looks
+        # wrong on a machine nobody has tried is worth being able to ask about without a screenshot.
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        foreach ($screen in [System.Windows.Forms.Screen]::AllScreens) {
+            Say ("Screen          : {0}  {1}  primary={2}" -f $screen.DeviceName, $screen.Bounds, $screen.Primary)
+        }
+    } catch { Say "Screen          : (could not be read: $($_.Exception.Message))" }
+
+    Head 'Word'
+    $wordExe = $null
+    try { $wordExe = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\winword.exe' -ErrorAction Stop).'(default)' } catch {}
+    if ($wordExe -and (Test-Path $wordExe)) {
+        $v = (Get-Item $wordExe).VersionInfo
+        Say ("Executable      : {0}" -f $wordExe)
+        Say ("Version         : {0}" -f $v.FileVersion)
+    } else {
+        Say "Executable      : NOT FOUND via App Paths - Word may not be installed for this user"
+    }
+    $c2r = $null
+    try { $c2r = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction Stop } catch {}
+    if ($c2r) {
+        Say ("Click-to-Run    : {0} v{1} {2}" -f $c2r.ProductReleaseIds, $c2r.VersionToReport, $c2r.Platform)
+    } else {
+        Say "Click-to-Run    : no ClickToRun key (an MSI install, or Office is absent)"
+    }
+    $running = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue)
+    Say ("Running now     : {0} WINWORD process(es)" -f $running.Count)
+
+    Head 'WordTab, as installed'
+    $ourDll = Join-Path $env:LOCALAPPDATA 'Programs\WordTab\WordTab.dll'
+    if (Test-Path $ourDll) {
+        $f = Get-Item $ourDll
+        Say ("DLL             : {0}" -f $ourDll)
+        Say ("Size            : {0:N0} bytes" -f $f.Length)
+        Say ("Modified        : {0:yyyy-MM-dd HH:mm:ss}" -f $f.LastWriteTime)
+        Say ("SHA256          : {0}" -f (Get-FileHash $ourDll -Algorithm SHA256).Hash)
+        # A mark-of-the-web on the installed copy is a policy refusal waiting to happen, and it looks
+        # exactly like a bad registration from the outside.
+        $zone = Get-Content -Path $ourDll -Stream Zone.Identifier -ErrorAction SilentlyContinue
+        Say ("Mark-of-the-web : {0}" -f $(if ($zone) { 'PRESENT - this can stop Word loading it' } else { 'none' }))
+    } else {
+        Say "DLL             : NOT PRESENT at $ourDll  - it is not installed, or it was installed elsewhere"
+    }
+    $payload = Join-Path $PSScriptRoot '..\PAYLOAD.txt'
+    if (Test-Path $payload) {
+        Say 'Package         :'
+        foreach ($line in (Get-Content $payload | Where-Object { $_ -match '^(Commit|Built|Sha256|Package)' })) { Say ("  {0}" -f $line.Trim()) }
+    }
+
+    Head 'Registration'
+    $clsidKey = 'HKCU:\Software\Classes\CLSID\{4BF75ED9-10EE-4866-BF4A-3D663A4149A1}\InprocServer32'
+    if (Test-Path $clsidKey) {
+        Say ("COM class       : {0}" -f (Get-ItemProperty $clsidKey).'(default)')
+        Say ("Threading       : {0}" -f (Get-ItemProperty $clsidKey).ThreadingModel)
+    } else {
+        Say "COM class       : NOT REGISTERED under HKCU - Word cannot create it"
+    }
+    $ours = Get-AddinStatus 'WordTab.Connect'
+    Say ("Add-in entry    : LoadBehavior={0} from {1}" -f $ours.Behavior, $ours.Hive)
+    if ($ours.Behavior -eq 2) { Say "                  ** 2 means Word TRIED to load it and gave up. The log below says why." }
+    if ($ours.Behavior -eq 0) { Say "                  ** 0 means it is switched off in File > Options > Add-ins." }
+    Say ("Disabled by Word: {0}" -f $(if ($ours.Blocked) { 'YES - Disabled Items beats LoadBehavior. File > Options > Add-ins > Manage: Disabled Items > Go.' } else { 'no' }))
+
+    Head 'Everything in Word''s Disabled Items'
+    $disabled = @(Get-DisabledAddinPaths)
+    if ($disabled.Count -eq 0) { Say '(empty)' } else { foreach ($d in $disabled) { Say "  $d" } }
+
+    Head 'Other tabbed-Word add-ins'
+    foreach ($r in (Get-RivalAddins)) {
+        Say ("{0,-28} LoadBehavior={1,-4} hive={2,-6} blocked={3}" -f $r.ProgId, $r.Behavior, $r.Hive, $r.Blocked)
+        if ($r.Dll) { Say ("  {0}" -f $r.Dll) }
+    }
+    Say ''
+    Say 'WordTab has never been tested beside a WORKING one - they carve up the same document frame.'
+    Say 'If any of the above shows LoadBehavior=3 with blocked=False, turn it off before judging WordTab.'
+
+    Head 'Settings'
+    foreach ($s in $Switches) {
+        $current = Get-Current $s.Name
+        Say ("{0,-16} {1}" -f $s.Name, $(if ($null -eq $current) { 'on (default, no value set)' } elseif ($current -eq 0) { 'OFF' } else { "on ($current)" }))
+    }
+
+    Head 'The add-in''s log, in full'
+    $logFile = Join-Path $env:LOCALAPPDATA 'WordTab\wordtab.log'
+    if (Test-Path $logFile) {
+        $log = @(Get-Content $logFile -ErrorAction SilentlyContinue)
+        Say ("{0} ({1:N0} lines, {2:N0} bytes)" -f $logFile, $log.Count, (Get-Item $logFile).Length)
+        Say ''
+        foreach ($line in $log) { Say $line }
+    } else {
+        Say "$logFile does not exist."
+        Say 'Nothing has been written there, which means Word has never loaded the add-in at all.'
+        Say 'Check the registration above before anything else.'
+    }
+
+    # Not Set-Content -Encoding UTF8: under Windows PowerShell 5.1 that means UTF-8 WITH a BOM and
+    # under pwsh 7 it means without, so the same script would produce two different files depending
+    # on which shell the machine happened to have. Driven, not assumed - the two were diffed.
+    [System.IO.File]::WriteAllLines($ReportPath, $out, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host ''
+    Write-Host 'WordTab report written to:' -ForegroundColor Cyan
+    Write-Host "  $ReportPath" -ForegroundColor Green
+    Write-Host ''
+    Write-Host 'It reads only - nothing was installed, changed or removed. Send that file.' -ForegroundColor Gray
+    Write-Host 'It contains the names of documents you have had open (they appear in the log as tab names).' -ForegroundColor Yellow
+    Write-Host ''
+    return
 }
 
 # ---- -Reset -------------------------------------------------------------------------------------

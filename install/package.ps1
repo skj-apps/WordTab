@@ -15,6 +15,8 @@
         README.txt                      what to do, in order
         install\install.ps1             VERBATIM COPY - not a second installer
         install\uninstall.ps1           VERBATIM COPY
+        install\settings.ps1           VERBATIM COPY
+        install\common.ps1             VERBATIM COPY - the other two dot-source it
         src\native\wordtab.h            the CLSID that install.ps1 checks itself against
         src\native\build\WordTab.dll    the build
 
@@ -117,9 +119,12 @@ Copy-Item (Join-Path $PSScriptRoot 'uninstall.ps1') (Join-Path $payload 'install
 # wrong colour on a machine nobody here has seen is exactly the case settings.ps1 exists for, and
 # leaving it behind would mean the answer to "turn that bit off" was regedit.
 Copy-Item (Join-Path $PSScriptRoot 'settings.ps1')  (Join-Path $payload 'install\settings.ps1')
+# Both of the above dot-source this and refuse to run without it. It is not optional payload: it
+# holds the one implementation of "has Word disabled this add-in" and "which rivals will load".
+Copy-Item (Join-Path $PSScriptRoot 'common.ps1')    (Join-Path $payload 'install\common.ps1')
 Copy-Item (Join-Path $NativeDir 'wordtab.h')        (Join-Path $payload 'src\native\wordtab.h')
 Copy-Item $BuiltDll                                 (Join-Path $payload 'src\native\build\WordTab.dll')
-Write-Ok 'install.ps1, uninstall.ps1 and settings.ps1 copied verbatim'
+Write-Ok 'install.ps1, uninstall.ps1, settings.ps1 and common.ps1 copied verbatim'
 
 # The Word this was built and checked against. A package that turns up on a machine with a different
 # Word is still worth trying, but the difference is the first thing to look at.
@@ -210,8 +215,19 @@ IF YOU WANT TO TURN SOMETHING OFF
 
 IF SOMETHING IS WRONG
 
-  The add-in writes %LOCALAPPDATA%\WordTab\wordtab.log from the moment it loads. That file is the
-  evidence for almost anything that can go wrong - send it.
+  RUN THIS AND SEND THE FILE IT WRITES:
+
+         powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Report
+
+  It writes one text file to your Desktop with everything needed to work out what happened: which
+  build is installed, whether Word registered it, whether Word DISABLED it, whether another tabbed-
+  Word add-in is set to load, your Word version, your screen, every setting, and the add-in's own
+  log in full. It reads only - nothing is installed, changed or removed, and no document is opened.
+
+  It does include the names of documents you have had open, because those appear in the log as tab
+  names. Read it before you send it if that matters.
+
+  The log on its own is at %LOCALAPPDATA%\WordTab\wordtab.log if you would rather send just that.
 
   Nothing in the log at all means Word never loaded the add-in. Check, in this order:
     - HKCU\Software\Microsoft\Office\Word\Addins\WordTab.Connect  - LoadBehavior should be 3.

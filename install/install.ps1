@@ -66,6 +66,17 @@ function Write-Step($text) { Write-Host "==> $text" -ForegroundColor Cyan }
 function Write-Ok  ($text) { Write-Host "    $text" -ForegroundColor Green }
 function Write-Note($text) { Write-Host "    $text" -ForegroundColor DarkGray }
 
+# The registry questions this script and settings.ps1 both ask. A package carries this file beside
+# the two scripts that need it; a repo has it in the same place. Named explicitly rather than
+# guarded with a Test-Path fallback, because a fallback would be a second implementation of the very
+# thing this file exists to have one of - and install.ps1 already depends on a sibling file
+# (src\native\wordtab.h, for the CLSID check below).
+$CommonFile = Join-Path $PSScriptRoot 'common.ps1'
+if (-not (Test-Path $CommonFile)) {
+    throw "install\common.ps1 is missing. It sits beside this script in both the repo and a package; copy the whole folder rather than install.ps1 on its own."
+}
+. $CommonFile
+
 # ---- preconditions ----------------------------------------------------------------------------
 
 Write-Step 'Checking preconditions'
@@ -221,45 +232,9 @@ Write-Step 'Verifying'
 # Word keeps a list of add-ins it killed after a crash or a failed load. An entry here beats
 # LoadBehavior=3 outright and is the classic "I registered it and nothing happens" cause.
 #
-# The entries are NAMED rather than counted, and that is the whole point of this block. Each value
-# is a binary blob carrying the add-in's DLL path and its friendly name as NUL-separated UTF-16, so
-# the question "is it US Word disabled, or somebody else" can be answered instead of raised. Those
-# are completely different situations with different fixes, and the old wording - a count - reported
-# them identically. On the dev rig this key holds two entries and BOTH are Office Tab.
-function Get-DisabledAddinPaths {
-    $key = 'HKCU:\Software\Microsoft\Office\16.0\Word\Resiliency\DisabledItems'
-    if (-not (Test-Path $key)) { return @() }
-    $found = @()
-    foreach ($name in @((Get-Item $key).Property)) {
-        $bytes = (Get-ItemProperty -Path $key -Name $name -ErrorAction SilentlyContinue).$name
-        if ($bytes -isnot [byte[]]) { continue }
-        # Trim: a blob is fixed-width and padded, so the tail of a field is NULs. Only the PATH
-        # fields are kept - each blob also carries the vendor's friendly name, and keeping those
-        # would double the count and give the matching below a second thing to be confused by.
-        foreach ($field in ([System.Text.Encoding]::Unicode.GetString($bytes) -split "`0")) {
-            $field = $field.Trim()
-            if ($field -match '\.dll$' -or $field -match '\.(vsto|xll|wll)$') { $found += $field }
-        }
-    }
-    return @($found)
-}
-
-# A ProgId's DLL, resolved the way Word resolves it. Used to tell a disabled entry apart from ours
-# by PATH rather than by a friendly name somebody else chose.
-function Get-AddinDllPath($progId) {
-    foreach ($hive in @('HKCU:', 'HKLM:')) {
-        $classKey = "$hive\Software\Classes\$progId\CLSID"
-        if (-not (Test-Path $classKey)) { continue }
-        $guid = (Get-ItemProperty -Path $classKey -ErrorAction SilentlyContinue).'(default)'
-        if (-not $guid) { continue }
-        $serverKey = "$hive\Software\Classes\CLSID\$guid\InprocServer32"
-        if (-not (Test-Path $serverKey)) { continue }
-        $path = (Get-ItemProperty -Path $serverKey -ErrorAction SilentlyContinue).'(default)'
-        if ($path) { return $path }
-    }
-    return $null
-}
-
+# The readers live in install\common.ps1 and are shared with settings.ps1 -Report, which asks the
+# same questions of the same keys. Two implementations of "has Word disabled this" would agree right
+# up until one of them was fixed, and this project has a scar for exactly that.
 $disabledPaths = @(Get-DisabledAddinPaths)
 $ourDll        = Join-Path $InstallDir $DllName
 $oursDisabled  = @($disabledPaths | Where-Object { $_ -and $_.ToLowerInvariant() -eq $ourDll.ToLowerInvariant() })
@@ -281,12 +256,13 @@ if ($oursDisabled.Count -gt 0) {
 # of, so whether one is going to LOAD is worth reporting accurately. Two things decide that, and
 # this used to get both wrong:
 #
-#   - **HKCU beats HKLM for the same ProgId.** Word reads the per-user value and stops; a machine-wide
-#     LoadBehavior=3 sitting under a per-user 0 or 2 is not an add-in that loads. The old code
-#     scanned both hives and reported a hit in either, so the dev rig - HKLM 3, HKCU 2 - was told an
-#     add-in would load that Word had already given up on.
+#   - **HKCU beats HKLM for the same ProgId.** The old code scanned both hives and reported a hit in
+#     either, so the dev rig - HKLM 3, HKCU 2 - was told an add-in would load that Word had already
+#     given up on.
 #   - **Disabled Items beats LoadBehavior.** An add-in Word killed after a failed load stays dead at
 #     LoadBehavior=3. The dev rig's Office Tab is in exactly that state.
+#
+# Both rules live in Get-AddinStatus in common.ps1 now, so the report reaches the same verdict.
 #
 # **And the claim that used to be here - that WordTab and Office Tab "have coexisted through every
 # check suite" - was measured on 2026-08-17 and is FALSE.** Office Tab is registered on the dev rig
@@ -300,33 +276,10 @@ if ($oursDisabled.Count -gt 0) {
 # Turning somebody else's software off on their machine is their call, so this prints the command
 # rather than running it. One warning, not one per registration: the dev rig alone has three of these
 # ProgIds in both hives, which came out as five warnings and buried the useful line.
-$rivals = @('OfficeTab.TabsforWord2013', 'OfficeTabs.Connect', 'TabsforOfficeHelper.Helper')
-$rivalsLoading = @(); $rivalsBlocked = @(); $rivalsPerUser = @()
-foreach ($rival in $rivals) {
-    $behavior = $null; $fromHive = $null
-    foreach ($hive in @('HKCU:', 'HKLM:')) {
-        $key = "$hive\Software\Microsoft\Office\Word\Addins\$rival"
-        if (-not (Test-Path $key)) { continue }
-        $value = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).LoadBehavior
-        if ($null -eq $value) { continue }
-        $behavior = [int]$value; $fromHive = $hive
-        break                       # per-user wins outright, so the first hive with a value decides
-    }
-    if ($null -eq $behavior -or $behavior -ne 3) { continue }
-
-    # Registered to load - but Word may already have disabled it. Matched on the DLL path rather
-    # than on a friendly name, because the name in Disabled Items is the vendor's, not the ProgId.
-    $dll = Get-AddinDllPath $rival
-    $isBlocked = $false
-    if ($dll) {
-        $isBlocked = @($disabledPaths | Where-Object { $_ -and $_.ToLowerInvariant() -eq $dll.ToLowerInvariant() }).Count -gt 0
-    }
-    if ($isBlocked) { $rivalsBlocked += $rival }
-    else {
-        $rivalsLoading += $rival
-        if ($fromHive -eq 'HKCU:') { $rivalsPerUser += $rival }
-    }
-}
+$rivalStatus   = @(Get-RivalAddins)
+$rivalsLoading = @($rivalStatus | Where-Object { $_.Registered } | ForEach-Object { $_.ProgId })
+$rivalsBlocked = @($rivalStatus | Where-Object { $_.Blocked }    | ForEach-Object { $_.ProgId })
+$rivalsPerUser = @($rivalStatus | Where-Object { $_.Registered -and $_.Hive -eq 'HKCU:' } | ForEach-Object { $_.ProgId })
 
 if ($rivalsLoading.Count -gt 0) {
     # "registered to load", not "will load". The registry says what Word has been ASKED to do; the
