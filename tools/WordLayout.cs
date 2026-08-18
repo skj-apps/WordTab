@@ -192,6 +192,14 @@ public static class WordLayout
     }
 
     public static void Close(IntPtr hwnd) { PostMessage(hwnd, 0x0010, IntPtr.Zero, IntPtr.Zero); }  // WM_CLOSE
+
+    // The window's own close, as the title bar's x raises it: WM_SYSCOMMAND with SC_CLOSE.
+    //
+    // Not the same message as Close above, and the difference is the point. WM_CLOSE is what the
+    // add-in itself posts to close one tab; SC_CLOSE is only ever the user. The add-in tells them
+    // apart to decide whether closing takes the whole stack with it, so a check of that behaviour
+    // has to send the one the user sends.
+    public static void SysClose(IntPtr hwnd) { PostMessage(hwnd, 0x0112, (IntPtr)0xF060, IntPtr.Zero); }  // WM_SYSCOMMAND, SC_CLOSE
     [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr w, IntPtr l);
     public static RECT RectOf(IntPtr hwnd) { RECT r; GetWindowRect(hwnd, out r); return r; }
     public static bool Maximized(IntPtr hwnd) { return IsZoomed(hwnd); }

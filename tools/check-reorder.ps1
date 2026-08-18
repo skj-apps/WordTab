@@ -998,7 +998,7 @@ if ($arrived) {
     $head = @($withNew | Select-Object -First @($before).Count)
     Assert (Test-SameOrder $head $before) 'the existing tabs kept the order they had been dragged into'
     Assert (-not ($before -contains $withNew[-1])) 'the new document is the last tab'
-    foreach ($line in @(Get-LogSince 'rejoining with a new document')) { Write-Note $line.Trim() }
+    foreach ($line in @(Get-LogSince 'never had a tab')) { Write-Note $line.Trim() }
     Test-OneRectangle 'After a new document'
 }
 
@@ -1341,7 +1341,12 @@ if (-not $KeepOpen) {
 
                 # Half two: and the only thing missing is the picture.
                 Assert (-not $sawGhost) 'and nothing at all is carried under the pointer'
-                Assert (@(Get-LogSince 'ghost').Count -eq 0) 'the add-in never even made the window'
+                # `ghost  hwnd=`, not `ghost`. Every line the carried card writes starts with that
+                # word and two spaces, and the bare pattern matched something else entirely: the
+                # add-in now logs the tab row with the document names in it, and this section's own
+                # fixtures are called wordtab-noghost-Alpha.rtf. A green suite went red on the name
+                # of its own scratch file.
+                Assert (@(Get-LogSince 'ghost  hwnd=').Count -eq 0) 'the add-in never even made the window'
 
                 # Put the torn-off window back, so this section leaves the same two-window fixture it
                 # found. A leftover window here would be the last thing the suite does before Word is

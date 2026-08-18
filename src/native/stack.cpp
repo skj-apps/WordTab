@@ -69,11 +69,35 @@ struct Member
     // who minimises Word and restores it must find the row exactly as they left it - a rule that sent
     // every rejoining window to the end would shuffle the tabs every time one blinked.
     BOOL rejoin;
+
+    // Consecutive janitor ticks on which this window - already in the row - has failed the test to
+    // stay in it. A tab is not given up on the first one.
+    //
+    // The user's report: "changing setting like view>page width closes tabs", and then, when asked
+    // whether the document had gone with it, "oh no it didnt it just opened a new word w/out it".
+    // So the window is EVICTED and comes back a plain Word window with no strip. A routine Word UI
+    // action costing somebody the whole row is the worst thing in the queue, and the shape of it is
+    // one this project has now met four times: a state that is true for a moment is read as a state
+    // that is true. See [[transient-state-must-be-an-event]] - the honest fix is to hear the event,
+    // and there is no event here, so the next best thing is to refuse to act on one reading.
+    //
+    // Held as the MOMENT it started rather than as a count of ticks, and that is not a detail. The
+    // janitor is not only the timer: WM_SHOWWINDOW calls it too, so a window being hidden produces
+    // two passes a few milliseconds apart, and a count of two was reached inside a quarter of a
+    // second by a window that was fine - measured, tools\check-row.ps1, first run. A window has to be
+    // wrong for a length of TIME, not for a number of looks, or the guard is only as good as how
+    // often something happened to ask.
+    DWORD missedAt;
 };
+
+// Longer than the janitor's own half second, so that at least one later tick has to agree before a
+// tab goes. Anything shorter can be satisfied by two passes of the same moment.
+#define STAY_GRACE_MS 700
 
 static void Reconcile(void);
 static void CloseBatchStep(void);
 static void CloseBatchEnd(const wchar_t* why);
+
 
 // **The order of this array is the order of the tabs.** There is no separate order field, and that
 // is a decision rather than an omission: an `order` int has to be kept consistent with the array by
@@ -93,6 +117,7 @@ static BOOL   g_started     = FALSE;
 static BOOL   g_inSync      = FALSE;  // our own SetWindowPos calls come back through the subclass
 static BOOL   g_altTab      = TRUE;
 static BOOL   g_tearOff      = TRUE;
+static BOOL   g_closeStack   = TRUE;  // the window's own close takes every tab with it
 static BOOL   g_minimized   = FALSE;  // the whole stack is down on the taskbar
 
 // Where to put the user back when the active tab goes away, set only by StackCloseTab. Closing a
@@ -100,6 +125,67 @@ static BOOL   g_minimized   = FALSE;  // the whole stack is down on the taskbar
 // were reading; this is how they get back to it rather than to whatever happens to be next in the
 // row. Always re-validated before use - the window may have closed in the meantime.
 static HWND   g_returnTo    = NULL;
+
+// The last window WE posted a WM_CLOSE to, single tab or batch.
+//
+// It exists so the janitor can tell a document that has gone because the user closed it from one
+// that merely looks gone for a moment. The row waits a tick before giving up on a window (see
+// STAY_MISSES); this is the one case where waiting would be wrong, because the disappearance is the
+// answer to something we asked and the user is watching for it.
+//
+// Deliberately not cleared on success - it is only ever compared against a window that is still a
+// member, and a handle Word has reused belongs to a window that has just been attached and so cannot
+// be in the row yet. It is overwritten when the next close is aimed somewhere else.
+static HWND   g_closeAimed  = NULL;
+
+static BOOL CloseWasAskedFor(HWND frame)
+{
+    return (frame && frame == g_closeAimed) ? TRUE : FALSE;
+}
+
+// The row, as the user sees it, written out when it changes and never otherwise.
+//
+// Two of the things in the queue are about ORDER - a window that leaves the row and does not come
+// back, and a new document whose tab arrives at the front instead of the end - and neither of them
+// was answerable from the log that reported them. There were lines for a window joining and a window
+// leaving, and none at all for what the row then WAS. A membership line that does not say what the
+// membership is cannot settle an argument about ordering.
+//
+// Only on change, by comparing the line it would write against the last one it wrote, so a row that
+// is sitting still costs a snprintf twice a second and no file write at all.
+static void LogRow(void)
+{
+    wchar_t line[1024];
+    int at = 0;
+    line[0] = L'\0';
+
+    for (int i = 0; i < g_memberCount; i++)
+    {
+        if (!g_members[i].joined)
+            continue;
+
+        wchar_t name[128];
+        WordTabFrameTitle(g_members[i].frame, name, 128);
+
+        int wrote = _snwprintf(line + at, (size_t)(1024 - at), L"%s0x%p |%s|",
+                               at ? L"  " : L"", (void*)g_members[i].frame, name);
+        if (wrote < 0 || at + wrote >= 1023)
+            break;
+        at += wrote;
+    }
+
+    static wchar_t last[1024] = L"";
+    if (wcscmp(line, last) == 0)
+        return;
+
+    wcsncpy(last, line, 1023);
+    last[1023] = L'\0';
+
+    if (at == 0)
+        LogWrite(L"stack  row: empty");
+    else
+        LogWrite(L"stack  row, left to right: %s", line);
+}
 
 static Member* Find(HWND frame)
 {
@@ -343,17 +429,25 @@ static BOOL Join(Member* member)
     if (member->rejoin)
     {
         member->rejoin = FALSE;
+
+        // Read before the move, not after. MoveToEnd memmoves the array, so `member` afterwards
+        // points at whatever slid down into that slot - a different window entirely - and the line
+        // this used to write named it. A log line that names the wrong window is worse than no line
+        // at all; the first run of check-row.ps1 caught this one naming an empty frame.
+        HWND moving = member->frame;
+
         Member* end = MoveToEnd(member);
         if (end != member)
         {
             compacted = TRUE;
-            LogWrite(L"stack  hwnd=0x%p  rejoining with a new document - its tab goes to the end",
-                     (void*)member->frame);
+            LogWrite(L"stack  hwnd=0x%p  a document that has never had a tab - it goes to the end "
+                     L"of the row", (void*)moving);
             member = end;
         }
     }
 
     member->joined = TRUE;
+    member->missedAt = 0;
     GetWindowRect(member->frame, &member->joinRect);
     member->joinZoomed = IsZoomed(member->frame) ? TRUE : FALSE;
 
@@ -479,12 +573,20 @@ void StackStart(void)
     // inside WordTab, and a machine where it misbehaves needs a way to stop offering it.
     g_tearOff  = WordTabReadFlag(L"TabTearOff", TRUE);
 
+    // Off, the title bar's x closes the document in front and nothing else - which is what Word does
+    // without us. The switch exists because this is the one thing WordTab now does that ends with
+    // several of the user's documents closed, and a machine where it surprises somebody needs a way
+    // to stop it without giving up the tabs. Every close still asks about unsaved work; the switch
+    // is about the scope of the command, not about safety.
+    g_closeStack = WordTabReadFlag(L"TabCloseStack", TRUE);
+
     TaskbarStart();
 
-    LogWrite(L"StackStart  stacking=%s  altTab suppression=%s  detach=%s",
+    LogWrite(L"StackStart  stacking=%s  altTab suppression=%s  detach=%s  close takes the stack=%s",
              g_enabled ? L"on" : L"off (HKCU\\Software\\WordTab\\Stack=0)",
              g_altTab ? L"on" : L"off",
-             g_tearOff ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTearOff=0)");
+             g_tearOff ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTearOff=0)",
+             g_closeStack ? L"on" : L"off (HKCU\\Software\\WordTab\\TabCloseStack=0)");
 }
 
 void StackAttachFrame(HWND frame)
@@ -495,6 +597,23 @@ void StackAttachFrame(HWND frame)
     Member* member = &g_members[g_memberCount++];
     memset(member, 0, sizeof(*member));
     member->frame = frame;
+
+    // **A window we have only just met has never had a tab, so its first one goes at the end of the
+    // row - wherever in the array this member ends up sitting.**
+    //
+    // Appending to the array already puts it there, and for a frame Word creates while the user
+    // watches that is the whole story. It is not the whole story for a frame Word made EARLIER and
+    // is only now filling: the user's report is "now newly opened docs popping infront lets make
+    // them pop to end", and their log shows empty frames attaching with no title at all - a frame
+    // that attached before the documents around it holds an early slot in the array and hands it to
+    // whatever document lands in it. This flag is what MoveToEnd keys off, and setting it here says
+    // the same thing for a frame we have just met that it already says for one Word has recycled:
+    // this document has never been a tab, so it becomes the last one.
+    //
+    // Order-preserving when several frames arrive together, which is every cold start with more than
+    // one document: they join in array order and each moves to the end in turn, which leaves them in
+    // the order they were in. Driven, not reasoned - see tools\check-reorder.ps1.
+    member->rejoin = TRUE;
 
     // Not joined here. At the moment a frame is subclassed it is usually not visible yet and has no
     // `_WwF` - measured, every cold start - so eligibility is decided by the janitor instead.
@@ -751,10 +870,8 @@ void StackOnFrameSize(HWND frame, WPARAM sizeType)
 // Membership, re-decided from what is true right now rather than from what happened. Cheap enough
 // to run on the strip's half-second janitor, and that cadence is what makes it robust against
 // Word hiding and showing frames without telling anyone.
-void StackJanitor(void)
+static void JanitorPass(void)
 {
-    if (!g_enabled)
-        return;
 
     for (int i = 0; i < g_memberCount; i++)
     {
@@ -806,7 +923,11 @@ void StackJanitor(void)
                     i--;
             }
         }
-        else if (!EligibleToStay(member->frame))
+        else if (EligibleToStay(member->frame))
+        {
+            member->missedAt = 0;
+        }
+        else
         {
             // Left where it is, deliberately, and for two different reasons now.
             //
@@ -821,9 +942,52 @@ void StackJanitor(void)
             // button and its Alt+Tab entry, and its strip is left showing an empty row and a +.
             //
             // Only StackStop puts windows back where they came from.
+            BOOL alive = IsWindow(member->frame) ? TRUE : FALSE;
             const wchar_t* why = L"gone";
-            if (IsWindow(member->frame))
+            if (alive)
                 why = IsWindowVisible(member->frame) ? L"no document open" : L"hidden or minimised";
+
+            DWORD now = GetTickCount();
+            BOOL  first = (member->missedAt == 0) ? TRUE : FALSE;
+            if (first)
+            {
+                member->missedAt = now ? now : 1;   // 0 is "eligible", so never store it as a time
+            }
+
+            // A window that has actually gone is not waited for: there is nothing to come back, and
+            // holding a tab for a destroyed HWND would draw a name read off a dead window. Nor is a
+            // close we asked for ourselves - the tab the user clicked the x on must not sit there
+            // for another second looking like it did not work, and we know that one is real because
+            // we posted the WM_CLOSE.
+            BOOL immediate = (!alive || CloseWasAskedFor(member->frame)) ? TRUE : FALSE;
+
+            DWORD waited = now - member->missedAt;
+
+            if (!immediate && waited < STAY_GRACE_MS)
+            {
+                // Once, on the first miss, with everything needed to tell the two mechanisms apart
+                // next time this is reported from a machine I cannot reach: which document frames
+                // the window has, which one the strip is bound to, and what is inside them. If the
+                // window comes back on the next tick this line is the only trace it left, and that
+                // is exactly the trace that was missing from the report that queued this.
+                if (first)
+                {
+                    wchar_t frames[512];
+                    StripDescribeDocumentFrames(member->frame, frames, 512);
+                    LogWrite(L"stack  hwnd=0x%p  would have left the stack (%s) - waiting %d ms "
+                             L"in case it is a moment rather than a fact.  %s",
+                             (void*)member->frame, why, STAY_GRACE_MS, frames);
+                }
+                continue;
+            }
+
+            if (!immediate)
+            {
+                LogWrite(L"stack  hwnd=0x%p  still %s %lu ms later - it is a fact, not a moment",
+                         (void*)member->frame, why, (unsigned long)waited);
+            }
+
+            member->missedAt = 0;
             Leave(member, why, FALSE);
         }
     }
@@ -843,6 +1007,38 @@ void StackJanitor(void)
     CloseBatchStep();
 
     Reconcile();
+
+    // Last, so it describes the row as this tick left it. Silent unless it changed.
+    LogRow();
+}
+
+// **A membership pass never runs inside another membership pass.**
+//
+// The janitor is not only the timer. `WM_SHOWWINDOW` calls it, and Join and Leave both show and hide
+// windows - so a pass can call, synchronously and several frames deep, straight back into itself.
+// The array is the tab order and `MoveToEnd` memmoves it, so a re-entrant Join leaves the outer pass
+// holding a `Member*` into a slot that now describes a different window.
+//
+// Measured rather than reasoned, and it cost a green suite: `check-reorder` went from 118/118 to
+// 110/118 the moment the WM_SHOWWINDOW handler started re-deciding membership *after* Word had shown
+// the window instead of before. That is the correct place to ask - the state before a show is the
+// state the window is leaving - but it is also the first time the answer could be "yes, join it",
+// which is the only branch that moves the array. The hazard was always there; the reordering is what
+// reached it. An A/B against a rebuilt binary of the previous commit is what found it, which is the
+// standing rule in this project for a reason.
+//
+// Skipping the nested pass loses nothing: the timer comes round in half a second, and the outer pass
+// is in the middle of deciding the very thing the nested one would have decided.
+static BOOL g_inJanitor = FALSE;
+
+void StackJanitor(void)
+{
+    if (!g_enabled || g_inJanitor)
+        return;
+
+    g_inJanitor = TRUE;
+    JanitorPass();
+    g_inJanitor = FALSE;
 }
 
 // Put back together anything that has come apart.
@@ -1117,6 +1313,7 @@ BOOL StackMoveTab(HWND frame, int toIndex)
     g_members[toSlot] = moving;
 
     LogWrite(L"stack  hwnd=0x%p  tab moved %d -> %d (of %d)", (void*)frame, from, toIndex, joined);
+    LogRow();
 
     // Every window in the stack draws the same row, so a reorder is a repaint of all of them.
     StripRefreshTabs();
@@ -1411,6 +1608,7 @@ void StackCloseTab(HWND frame)
         // Not stacked - a lone window with a strip of its own, or stacking switched off. Still a
         // document, still closable, and there is no z-order to worry about.
         LogWrite(L"stack  hwnd=0x%p  close requested (not in a stack)", (void*)frame);
+        g_closeAimed = frame;
         PostMessageW(frame, WM_CLOSE, 0, 0);
         return;
     }
@@ -1426,6 +1624,9 @@ void StackCloseTab(HWND frame)
              (void*)frame,
              g_returnTo ? L" (a background one - will return to where the user was)" : L"");
 
+    // Before the post, so the janitor cannot see the document go and read it as the transient it
+    // waits a tick for. This close is one we asked for.
+    g_closeAimed = frame;
     PostMessageW(frame, WM_CLOSE, 0, 0);
 }
 
@@ -1477,6 +1678,7 @@ static int  g_closeNext   = 0;      // where the queue has got to
 static HWND g_closeFlight = NULL;   // the one WM_CLOSE is out for
 static BOOL g_closeAsked  = FALSE;  // Word has put a question up about it at some point
 static int  g_closeIdle   = 0;      // consecutive ticks with no question and no progress
+
 
 // The event half of "Word is asking about this one", and the half that can be relied on. A modal
 // dialog disables the window that owns it, and EnableWindow sends WM_ENABLE - so the frame's
@@ -1717,6 +1919,76 @@ void StackCloseToRight(HWND from)
     // excludes it; passing it as `keep` too means a wrong answer from the range lookup still cannot
     // close the tab the user pointed at.
     CloseBatchStart(from, from, L"close to the right");
+}
+
+// The title bar's x, Alt+F4, and the window menu's Close - all of which arrive as SC_CLOSE.
+//
+// The user's words: "you have to close all tabs individually - that needs fixing next time we edit."
+// Confirmed in their log at 14:27-14:28, four frames going down one at a time. The stack is one
+// window to the user in every other respect - one taskbar button, one Alt+Tab entry, it moves and
+// resizes as one - so the button that closes a window has to close the window they can see, which is
+// all of it. Every tabbed application works this way.
+//
+// TRUE means the command has been taken over and the caller must swallow it. Everything that is not
+// unambiguously "the user pressed close on a stack of several documents" answers FALSE and lets
+// Word do exactly what it did before:
+//
+//   - not stacked, or a row of one: Word's own close is already right, and routing a single document
+//     through the batch machinery would only add a tick of latency
+//   - a batch already running: this IS the batch closing the tabs, and the WM_CLOSEs it posts must
+//     reach Word. They arrive as WM_CLOSE rather than SC_CLOSE, so they do not come through here at
+//     all - but a user pressing x again while a batch is part-way through must not start a second
+//     one on top of it
+//
+// The batch itself is what makes this safe: one close at a time, each with its own save prompt, and
+// a prompt the user cancels abandons the rest. Closing a stack of five documents with unsaved work
+// asks five questions in turn, and Cancel on the second one leaves the remaining three open.
+BOOL StackCloseWindowCommand(HWND frame)
+{
+    if (!g_enabled || !g_closeStack)
+        return FALSE;
+
+    Member* member = Find(frame);
+    if (!member || !member->joined)
+        return FALSE;
+
+    if (JoinedCount() < 2)
+        return FALSE;
+
+    if (StackCloseInFlight())
+    {
+        LogWrite(L"stack  hwnd=0x%p  close pressed while a batch is already running - left alone",
+                 (void*)frame);
+        return FALSE;
+    }
+
+    LogWrite(L"stack  hwnd=0x%p  the window's own close: %d tab(s) go with it",
+             (void*)frame, JoinedCount());
+    StackCloseAll(frame);
+    return TRUE;
+}
+
+// Where a window about to be created should be put, so that it is never seen anywhere else.
+//
+// The queue's last item: opening an EXISTING document shows the new window a few inches above the
+// stack for a moment before it joins. The user called it minor and it is, but its cause is not - the
+// window is created wherever Word asked for it, shown, and only then moved, because the CBT hook
+// POSTS and the placement happens after Word has already put it on screen. The fix is to answer the
+// question at the moment it is asked: a window created at the stack's rectangle has nowhere to flash
+// from. See CbtProc.
+//
+// FALSE when there is nothing to match - no stack, or one that is minimised or being moved by us -
+// and then Word's own choice stands, which is what happens today.
+BOOL StackProposeCreateRect(RECT* out)
+{
+    if (!g_enabled || !out || g_minimized || g_inSync)
+        return FALSE;
+    if (!g_active || !IsWindow(g_active) || IsIconic(g_active))
+        return FALSE;
+    if (JoinedCount() < 1)
+        return FALSE;
+
+    return GetWindowRect(g_active, out) ? TRUE : FALSE;
 }
 
 void StackCloseAll(HWND anyTab)

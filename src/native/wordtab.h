@@ -186,6 +186,17 @@ void StripStop(void);
 // is not a tab - and it is deliberately *not* the same question as "does it have a `_WwF`". Word
 // keeps the document frame for the life of the window and empties it when the last document closes.
 BOOL StripHasDocument(HWND frame);
+
+// Every `_WwF` this window has, which one the strip is bound to, and what is inside each - as one
+// line of text for the log.
+//
+// This is a diagnostic and it is here because the defect it is for cannot be reproduced on the
+// development machine. "A View change closes tabs" was reported from a rig I cannot reach, and the
+// log it produced said a window left the stack without saying anything about the state that decided
+// it. A window with two document frames and a window with one empty one are the same line otherwise,
+// and they are different bugs.
+void StripDescribeDocumentFrames(HWND frame, wchar_t* out, int chars);
+
 BOOL StripGetNatural(HWND frame, RECT* natural);
 // `why` names the path that asked, because this is the one writer of a window's natural rect that
 // did not come from Word laying that window out - see the note on the definition.
@@ -318,6 +329,16 @@ void StackCloseTab(HWND frame);
 // - stacking switched off, or a lone window - where "close all" means that one document.
 void StackCloseOthers(HWND keep);
 void StackCloseAll(HWND anyTab);
+
+// The window's own close button, Alt+F4, or the window menu - anything that arrives as SC_CLOSE.
+// TRUE means the stack has taken the command over and the frame must swallow it; FALSE means this
+// was not a stack of several documents and Word's own close is exactly right. See the definition.
+BOOL StackCloseWindowCommand(HWND frame);
+
+// Where a frame that is about to be created should be put, so that a new document's window is never
+// drawn anywhere but on the stack. FALSE when there is no stack to match, and then Word's own
+// choice stands. Asked from inside the CBT hook, before the window exists.
+BOOL StackProposeCreateRect(RECT* out);
 
 // The same queue, narrowed to the tabs after this one in the row. Refused when there are none, so
 // the caller does not have to check before asking.

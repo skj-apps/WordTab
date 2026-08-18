@@ -97,6 +97,7 @@ $Switches = @(
     @{ Name = 'TabMenu';        Does = 'The right-click menu on a tab.' }
     @{ Name = 'TabDrag';        Does = 'Dragging a tab - to reorder the row, to pull a document out into its own window, or to put one back.' }
     @{ Name = 'TabTearOff';     Does = 'Taking a document out of the stack into a window of its own. Off, neither the menu item nor the drag is offered.' }
+    @{ Name = 'TabCloseStack';  Does = 'The window''s own close button (and Alt+F4) closes every tab in the stack, asking about each unsaved one in turn. Off, it closes only the document in front, which is what Word does on its own.' }
     @{ Name = 'TabScroll';      Does = 'Scroll the row when there are more tabs than fit. Off, every tab is shown and they get narrower instead.' }
     @{ Name = 'TabTitleTrim';   Does = 'Trim "  -  Compatibility Mode" and the like off a tab''s name.' }
     @{ Name = 'TabDot';         Does = 'Show a dot instead of the x on a document with unsaved changes. Off, WordTab never asks Word about your documents.' }

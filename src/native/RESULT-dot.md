@@ -322,3 +322,71 @@ reported.
 - `tools\WordLayout.cs` — `PidOf`, `DocumentPane`, `NativeOm`
 - `tools\check-dot.ps1` — 61 checks
 - `tools\check-all.ps1` — the runner
+
+---
+
+## What it costs on a machine that is not this one
+
+**Added 2026-08-18, from the user's own report off the work rig.** Everything above was measured
+against local files on a development machine, and the number it produced — a two-window pass in about
+200us — is not the number this poll has anywhere else.
+
+| documents | where they live | mean | worst |
+|---|---|---|---|
+| 1 | local disk (this rig) | ~430us | 2.7ms cold |
+| 3-5 | SharePoint (their rig) | **96,000-155,000us** | **518,726us** |
+
+Half a second on Word's UI thread, twice a second. WordTab had never met a cloud-backed document, and
+`Document.Saved` on one is three orders of magnitude slower to answer than on a local file.
+
+There is nothing to fix in the *question*. The add-in asks Word for `Document.Saved`; how long Word
+takes to answer is Word's business, and the alternative — an `IConnectionPoint` sink — covers
+documents opening, closing and being saved but has no event for "the modified flag changed", which is
+the only thing this needs. So what changes is **how often**, and **how much is asked for**.
+
+### The governor
+
+`TicksFor` turns the last pass's cost into an interval, and the intervals are chosen so the poll
+holds to about 1% of the UI thread whatever the cost turns out to be:
+
+| a pass costs | ask again in |
+|---|---|
+| under 4ms | 500ms — twice a second, exactly as before |
+| 4-15ms | 2s |
+| 15-50ms | 6s |
+| 50-200ms | 20s |
+| over 200ms | 60s |
+
+**On this rig nothing changes at all.** A full pass is a few hundred microseconds, `TicksFor` returns
+1, and the cadence is the one it has always had. On theirs the whole-row pass backs off to once every
+thirty seconds and the stall goes with it.
+
+### ...and in between, only the window with the keyboard
+
+A document is edited in the window that has the focus and saved from the window that has the focus.
+So between whole-row passes the poll asks about the foreground window alone — one `Document.Saved`
+instead of five — on its own governed interval, and skips entirely when the foreground window belongs
+to another application, where nothing of ours can be changing.
+
+The periodic full pass is what covers the rest: a background document Word saves by itself, which is
+what AutoSave on a SharePoint document does. Being a few seconds late on one of those is a dot that
+appears late, not a dot that is wrong.
+
+### One slow answer is not a slow Word
+
+The interval is set from the **cheaper of the last two** passes. The very first pass of a process was
+already measured here at 27,547us — that is Word building its automation machinery, not a slow Word —
+and a single outlier of that size would otherwise put a healthy machine on a six-second cadence for
+no reason. Two slow passes in a row is a slow Word. Recovery is immediate in the other direction: one
+fast pass brings it back. That asymmetry is deliberate — being too eager costs a few milliseconds,
+being too slow costs a dot that is a minute late.
+
+The cadence is logged when it **changes** and never per pass, with both measurements on the line:
+
+```
+strip  dot poll: the whole row took 155000 us for 5 window(s) (and 149000 us the time before)
+       - now asking every 20000 ms
+```
+
+`TabDot=0` still turns the whole thing off, and that remains the mitigation for a machine where even
+this is too much.

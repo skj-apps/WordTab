@@ -4959,32 +4959,71 @@ static BOOL CreateStripWindow(StripState* state)
 // Binding a frame to its `_WwF`.
 // ---------------------------------------------------------------------------------------------
 
-struct FindChildArgs
+// ---------------------------------------------------------------------------------------------
+// WHICH document frame. Not "the" one - Word does not promise there is only ever one.
+//
+// FindChildOfClass answers with the first `_WwF` the enumeration meets and stops, which was fine
+// while the binding was made once at startup and only ever remade when the window it named was
+// *destroyed*. It is not fine for the case queued as "a View change closes tabs": if Word retires a
+// document frame by HIDING it and builds a second one beside it, then
+//
+//   - the old handle is still a window, so TryBind never comes back and the strip stays bound to it
+//   - the old frame is empty, so StripHasDocument answers "no document" for a window that has one
+//   - membership is decided from that answer, so the window is dropped out of the row and its strip
+//     is hidden with it - permanently, because nothing re-tests the binding
+//
+// which is exactly the shape the user reported: the document is fine, the tab is gone, and it never
+// comes back. **Not reproduced on this rig** - see tools\probe-view.ps1, which drives every View
+// command through Word's own object model and finds one `_WwF` per frame throughout - so this is a
+// guard against a mechanism, not a fix for a measured event. It costs nothing when there is one
+// document frame, which is every case this machine can produce.
+//
+// The score is the whole of the choice: something inside beats nothing inside, and among equals a
+// visible frame beats a hidden one. "Something inside" outranks "visible" because Backstage hides a
+// perfectly good document frame and that must not hand the binding to an empty spare.
+struct WwfHunt
 {
-    const wchar_t* cls;
-    HWND found;
+    HWND best;
+    int  bestScore;
 };
 
-static BOOL CALLBACK FindChildProc(HWND hwnd, LPARAM param)
+static BOOL CALLBACK WwfHuntProc(HWND hwnd, LPARAM param)
 {
-    FindChildArgs* args = (FindChildArgs*)param;
+    WwfHunt* hunt = (WwfHunt*)param;
+
     wchar_t cls[64] = L"";
     GetClassNameW(hwnd, cls, 64);
-    if (_wcsicmp(cls, args->cls) == 0)
+    if (_wcsicmp(cls, kWwfClass) != 0)
+        return TRUE;
+
+    int score = 0;
+    if (GetWindow(hwnd, GW_CHILD) != NULL)
+        score += 2;
+    if (IsWindowVisible(hwnd))
+        score += 1;
+
+    if (score > hunt->bestScore)
     {
-        args->found = hwnd;
-        return FALSE;
+        hunt->bestScore = score;
+        hunt->best      = hwnd;
     }
     return TRUE;
 }
 
-static HWND FindChildOfClass(HWND parent, const wchar_t* cls)
+// The best document frame in this window, and whether it holds anything. NULL when the window has
+// no `_WwF` at all, which is every Word window for the first moments of its life.
+static HWND PickWwf(HWND frame, BOOL* holdsDocument)
 {
-    FindChildArgs args;
-    args.cls = cls;
-    args.found = NULL;
-    EnumChildWindows(parent, FindChildProc, (LPARAM)&args);
-    return args.found;
+    WwfHunt hunt;
+    hunt.best      = NULL;
+    hunt.bestScore = -1;
+
+    if (frame && IsWindow(frame))
+        EnumChildWindows(frame, WwfHuntProc, (LPARAM)&hunt);
+
+    if (holdsDocument)
+        *holdsDocument = (hunt.bestScore >= 2) ? TRUE : FALSE;
+    return hunt.best;
 }
 
 static BOOL TitleEndsWith(const wchar_t* text, int len, const wchar_t* tail)
@@ -5177,13 +5216,103 @@ static void ApplyInitial(StripState* state)
 BOOL StripHasDocument(HWND frame)
 {
     StripState* state = FindByFrame(frame);
-    HWND wwf = (state && state->wwf && IsWindow(state->wwf))
-             ? state->wwf
-             // Not bound yet - the janitor may not have come round. Ask the window itself rather
-             // than reporting "no document" for what is really "not looked at yet".
-             : FindChildOfClass(frame, kWwfClass);
 
-    return (wwf != NULL) && (GetWindow(wwf, GW_CHILD) != NULL);
+    // The cheap answer, and the one that is right nearly always: one GetWindow on the document frame
+    // this strip is bound to. Nothing below runs while a window has a document in the ordinary way.
+    if (state && state->wwf && IsWindow(state->wwf) && GetWindow(state->wwf, GW_CHILD) != NULL)
+        return TRUE;
+
+    // Everything else lands here, and they are not the same thing: not bound yet (the janitor has
+    // not come round, which is every window for its first half second), bound to a frame Word has
+    // destroyed, or bound to one Word has emptied. The last of those is the interesting one - a
+    // window whose document frame has been REPLACED reads exactly like a window with no document,
+    // and answering FALSE from a stale binding is what would drop it out of the row for good.
+    //
+    // So the window itself is asked, and the answer is about the whole window rather than about one
+    // handle we happen to be holding. This is the only path that pays an enumeration, and it is the
+    // path where the alternative is a wrong answer. See PickWwf.
+    BOOL holds = FALSE;
+    PickWwf(frame, &holds);
+    return holds;
+}
+
+// Every document frame in this window, for the log. See the declaration for why this exists.
+struct WwfList
+{
+    wchar_t* out;
+    int      chars;
+    int      at;
+    HWND     bound;
+    HWND     frame;
+};
+
+static BOOL CALLBACK WwfListProc(HWND hwnd, LPARAM param)
+{
+    WwfList* list = (WwfList*)param;
+
+    wchar_t cls[64] = L"";
+    GetClassNameW(hwnd, cls, 64);
+    if (_wcsicmp(cls, kWwfClass) != 0)
+        return TRUE;
+
+    int left = list->chars - list->at;
+    if (left < 64)
+        return FALSE;
+
+    HWND inside = GetWindow(hwnd, GW_CHILD);
+    wchar_t what[64] = L"empty";
+    if (inside)
+        GetClassNameW(inside, what, 64);
+
+    // **Whose child it is, when the answer is not "the frame's".**
+    //
+    // Every rectangle in this file is computed in the FRAME's client coordinates and then handed to
+    // SetWindowPos, which reads them as the PARENT's - and those are the same space only while the
+    // document frame is a direct child of the frame. Office Tab injects a container of its own into
+    // this window and is loading on the machine that reports the document area laying out wrong; if
+    // it has taken `_WwF` in with it, every number here is off by that container's origin. Not fixed
+    // and not guessed at - measured from wherever this line next turns up, because it cannot be
+    // measured on a machine where the other add-in refuses to load.
+    HWND owner = GetParent(hwnd);
+    wchar_t reparented[48] = L"";
+    if (owner != list->frame)
+        _snwprintf(reparented, 48, L" PARENT=0x%p NOT THE FRAME", (void*)owner);
+
+    int wrote = _snwprintf(list->out + list->at, (size_t)left,
+                           L"  _WwF=0x%p%s visible=%d holds=%s%s",
+                           (void*)hwnd, hwnd == list->bound ? L"(bound)" : L"",
+                           (int)IsWindowVisible(hwnd), what, reparented);
+    if (wrote > 0)
+        list->at += wrote;
+    return TRUE;
+}
+
+void StripDescribeDocumentFrames(HWND frame, wchar_t* out, int chars)
+{
+    if (!out || chars <= 0)
+        return;
+
+    StripState* state = FindByFrame(frame);
+
+    WwfList list;
+    list.out   = out;
+    list.chars = chars;
+    list.at    = 0;
+    list.bound = (state && state->wwf) ? state->wwf : NULL;
+    list.frame = frame;
+
+    int wrote = _snwprintf(out, (size_t)chars, L"window visible=%d:", (int)IsWindowVisible(frame));
+    list.at = (wrote > 0) ? wrote : 0;
+    out[chars - 1] = L'\0';
+
+    if (frame && IsWindow(frame))
+        EnumChildWindows(frame, WwfListProc, (LPARAM)&list);
+
+    if (list.at <= wrote)
+    {
+        _snwprintf(out + list.at, (size_t)(chars - list.at), L"  no _WwF at all");
+    }
+    out[chars - 1] = L'\0';
 }
 
 BOOL StripGetNatural(HWND frame, RECT* natural)
@@ -5309,7 +5438,7 @@ static void TryBind(StripState* state)
     if (!IsWindow(state->frame))
         return;
 
-    HWND wwf = FindChildOfClass(state->frame, kWwfClass);
+    HWND wwf = PickWwf(state->frame, NULL);
     if (!wwf)
         return;                 // not built yet - the janitor will come back
 
@@ -5343,13 +5472,58 @@ static void TryBind(StripState* state)
 
     RECT rect;
     ChildRect(state->frame, wwf, &rect);
+
+    // Whose child the document frame is, said out loud the moment it is not the frame's. Every rect
+    // in this file is computed in the frame's client space and handed to SetWindowPos, which reads
+    // it as the parent's; the two are the same space only while `_WwF` hangs directly off the frame.
+    // See the note in WwfListProc - this is the one line that would catch another add-in having
+    // taken the document frame in under a container of its own.
+    HWND owner = GetParent(wwf);
     LogWrite(L"strip  hwnd=0x%p  bound _WwF=0x%p strip=0x%p  dpi=%d stripH=%d  "
-             L"_WwF at (%ld,%ld %ldx%ld)",
+             L"_WwF at (%ld,%ld %ldx%ld)%s",
              (void*)state->frame, (void*)wwf, (void*)state->strip,
              state->dpi, state->stripH,
-             rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+             rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+             owner == state->frame ? L""
+                                   : L"  *** ITS PARENT IS NOT THE FRAME - every rect here is in the "
+                                     L"wrong space ***");
 
     ApplyInitial(state);
+}
+
+// Let go of the document frame this strip is bound to, keeping the strip itself.
+//
+// The strip is a child of the FRAME, not of `_WwF`, so it survives this and is re-used by the next
+// TryBind - which matters: destroying and rebuilding it would lose the surface, the font and the
+// hover state, and would flicker.
+//
+// The old frame is put back the size Word wanted it before the subclass comes off, for the same
+// reason Restore does it. A retired document frame is one Word may yet show again, and one left
+// 48px short with nobody watching it is a defect that would surface minutes later with nothing to
+// connect it to.
+static void Unbind(StripState* state, const wchar_t* why)
+{
+    if (!state->wwf)
+        return;
+
+    LogWrite(L"strip  hwnd=0x%p  letting go of _WwF=0x%p - %s",
+             (void*)state->frame, (void*)state->wwf, why);
+
+    if (IsWindow(state->wwf))
+    {
+        if (state->hasApplied)
+        {
+            SetWindowPos(state->wwf, NULL,
+                         state->natural.left, state->natural.top,
+                         state->natural.right - state->natural.left,
+                         state->natural.bottom - state->natural.top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        RemoveWindowSubclass(state->wwf, WwfSubclassProc, kWwfSubclassId);
+    }
+
+    state->wwf        = NULL;
+    state->hasApplied = FALSE;
 }
 
 // Put Word's layout back exactly as we found it. Called on detach and on shutdown - an add-in that
@@ -5395,20 +5569,9 @@ static void Restore(StripState* state)
         state->strip = NULL;
     }
 
-    if (state->wwf && IsWindow(state->wwf))
-    {
-        if (state->hasApplied)
-        {
-            SetWindowPos(state->wwf, NULL,
-                         state->natural.left, state->natural.top,
-                         state->natural.right - state->natural.left,
-                         state->natural.bottom - state->natural.top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-        RemoveWindowSubclass(state->wwf, WwfSubclassProc, kWwfSubclassId);
-    }
-    state->wwf = NULL;
-    state->hasApplied = FALSE;
+    // One writer of "let go of the document frame", rather than a second copy here that has to be
+    // kept in step with it.
+    Unbind(state, L"the strip is being taken down");
 
     if (state->font)
     {
@@ -5443,7 +5606,87 @@ static void Restore(StripState* state)
 // question. The honest mechanism is the one that can actually observe the state.
 //
 // The whole row in one pass rather than one lookup per tab - see WordTabReadModified.
+//
+// **AND THE CADENCE IS NOT FIXED ANY MORE. Measured on the user's work rig, in their own report:
+// mean 96,000-155,000us and worst 518,726us with three to five SharePoint-backed documents open,
+// against ~430us for one local document.** Half a second on Word's UI thread, twice a second: this
+// is a poll that had only ever been measured against local files, and a document that lives on
+// SharePoint answers three orders of magnitude slower. There is nothing to fix in the question - the
+// add-in asks Word for Document.Saved, and how long Word takes to answer is Word's business - so
+// what changes is how often, and how much is asked for.
+//
+// Two rules, and each of them is a measurement rather than a preference:
+//
+//   1. **The whole row is asked for only as often as the whole row costs.** TicksFor turns the last
+//      pass's cost into an interval that holds the poll to about 1% of the UI thread, whatever that
+//      cost turns out to be. On this rig a full pass is a few hundred microseconds, TicksFor returns
+//      1, and the cadence is exactly what it has always been - twice a second, unchanged. On theirs
+//      it backs off to once every thirty seconds, and the stall goes with it.
+//
+//   2. **In between, only the ACTIVE window is asked about**, at the same governed cadence and by
+//      the same measurement. That is not a compromise on correctness so much as a statement of where
+//      the flag can change: a document is edited in the window that has the keyboard, and saved from
+//      the window that has the keyboard. What the periodic full pass is for is the rest - a
+//      background document Word saves by itself, which is what AutoSave on a SharePoint document
+//      does - and being a few seconds late on that is a dot that appears late, not a wrong one.
+//
+// The whole thing is off under `TabDot=0`, which is the switch the user was given as a mitigation.
 // ---------------------------------------------------------------------------------------------
+
+// Janitor ticks to wait before asking again, from what the last ask cost. Half a second a tick, so
+// the ratio of time spent asking to time elapsed comes out at or under about 1% at every step: a
+// 200ms answer is asked for once a minute, a 15ms answer once every six seconds, and anything under
+// 4ms is asked for on every tick, which is the behaviour this had before there was a governor.
+static int TicksFor(LONGLONG us)
+{
+    if (us > 200000) return 120;    // 60s
+    if (us > 50000)  return 40;     // 20s
+    if (us > 15000)  return 12;     // 6s
+    if (us > 4000)   return 4;      // 2s
+    return 1;                       // twice a second
+}
+
+// One ask, timed, with the flags and the log lines it produces. `count` frames in, TRUE if Word
+// answered. `us` receives what it cost whether or not it did - a refusal that took a fifth of a
+// second still cost a fifth of a second, and the governor has to see that or a Word that is slow to
+// say no would be asked twice a second forever.
+static BOOL AskModified(StripState** owners, HWND* frames, int count, LONGLONG* us)
+{
+    LARGE_INTEGER before, after, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&before);
+
+    BOOL modified[MAX_STRIPS];
+    BOOL answered = WordTabReadModified(frames, count, modified);
+
+    QueryPerformanceCounter(&after);
+    *us = (freq.QuadPart > 0) ? ((after.QuadPart - before.QuadPart) * 1000000 / freq.QuadPart) : 0;
+
+    if (!answered)
+        return FALSE;               // every flag keeps its last value - see WordTabReadModified
+
+    BOOL changed = FALSE;
+    for (int i = 0; i < count; i++)
+    {
+        if (owners[i]->modified == modified[i])
+            continue;
+
+        owners[i]->modified = modified[i];
+        changed = TRUE;
+
+        // A dot is drawn and never stored in a control, so there is no reading one from outside the
+        // process. This line is that way, and it is pipe-wrapped for the same reason the tab name's
+        // is: check-dot.ps1 asserts the state against it and then photographs the button, because a
+        // log line about what was computed is not evidence of what was drawn.
+        LogWrite(L"strip  hwnd=0x%p  dot |%s|  document |%s|",
+                 (void*)owners[i]->frame, owners[i]->modified ? L"on" : L"off", owners[i]->title);
+    }
+
+    if (changed)
+        StripRefreshTabs();
+
+    return TRUE;
+}
 
 static void PollModified(void)
 {
@@ -5485,37 +5728,78 @@ static void PollModified(void)
     if (count == 0)
         return;
 
-    LARGE_INTEGER before, after, freq;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&before);
+    // Which pass is due, if either.
+    //
+    // Two counters rather than one, and they are independent on purpose: a row that has backed off
+    // to once a minute must not take the window the user is typing in with it. Both run down every
+    // tick, and each is re-set from what its own kind of pass last cost.
+    static int fullIn   = 0;
+    static int activeIn = 0;
 
-    BOOL modified[MAX_STRIPS];
-    BOOL answered = WordTabReadModified(frames, count, modified);
+    if (fullIn > 0)   fullIn--;
+    if (activeIn > 0) activeIn--;
 
-    QueryPerformanceCounter(&after);
+    BOOL full = (fullIn == 0) ? TRUE : FALSE;
+    if (!full && activeIn > 0)
+        return;
 
-    if (!answered)
-        return;                 // every flag keeps its last value - see WordTabReadModified
-
-    BOOL changed = FALSE;
-    for (int i = 0; i < count; i++)
+    // Which window, when this is not the full pass. GetForegroundWindow rather than the stack's idea
+    // of the active tab: the question is which document can be being typed into, and that is the
+    // window with the keyboard. When the answer is not one of ours - another application is in front
+    // - nothing of ours can be changing, and the pass is skipped without asking Word anything.
+    int only = -1;
+    if (!full)
     {
-        if (owners[i]->modified == modified[i])
-            continue;
-
-        owners[i]->modified = modified[i];
-        changed = TRUE;
-
-        // A dot is drawn and never stored in a control, so there is no reading one from outside the
-        // process. This line is that way, and it is pipe-wrapped for the same reason the tab name's
-        // is: check-dot.ps1 asserts the state against it and then photographs the button, because a
-        // log line about what was computed is not evidence of what was drawn.
-        LogWrite(L"strip  hwnd=0x%p  dot |%s|  document |%s|",
-                 (void*)owners[i]->frame, owners[i]->modified ? L"on" : L"off", owners[i]->title);
+        HWND front = GetForegroundWindow();
+        for (int i = 0; i < count; i++)
+            if (frames[i] == front)
+                only = i;
+        if (only < 0)
+            return;
     }
 
-    if (changed)
-        StripRefreshTabs();
+    LONGLONG us    = 0;
+    int      asked = full ? count : 1;
+
+    if (full) AskModified(owners, frames, count, &us);
+    else      AskModified(&owners[only], &frames[only], 1, &us);
+
+    // The governor. Set from what this pass cost, including a pass Word refused to answer: a refusal
+    // that took a fifth of a second cost a fifth of a second, and a Word that is slow to say no would
+    // otherwise be asked twice a second forever.
+    //
+    // **From the cheaper of the last two passes, not from the last one.** One slow answer is not a
+    // slow Word: the very first pass of a process is measured at 27547us against a steady state
+    // three orders of magnitude below it, because it is where Word builds its automation machinery,
+    // and a single outlier of that size would put a healthy machine on a six-second cadence for no
+    // reason. Two slow passes in a row is a slow Word. Recovery is immediate in the other direction -
+    // one fast pass is enough to bring it back - which is the right asymmetry: being too eager costs
+    // a few milliseconds, being too slow costs a dot that is a minute late.
+    static LONGLONG prevFull   = 0;
+    static LONGLONG prevActive = 0;
+    LONGLONG* prev = full ? &prevFull : &prevActive;
+
+    LONGLONG lastTime = *prev;
+    *prev = us;
+    LONGLONG basis = (us < lastTime) ? us : lastTime;
+
+    int ticks = TicksFor(basis);
+    if (full) fullIn   = ticks;
+    else      activeIn = ticks;
+
+    // Said when the cadence changes and never per pass. A line here every half second would be a
+    // file write twice a second for a number that does not move; a line when it moves is the whole
+    // diagnosis of "Word went slow and the add-in noticed".
+    static int lastFull   = -1;
+    static int lastActive = -1;
+    int* last = full ? &lastFull : &lastActive;
+    if (ticks != *last)
+    {
+        *last = ticks;
+        LogWrite(L"strip  dot poll: %s took %lld us for %d window(s) (and %lld us the time before) "
+                 L"- now asking every %d ms",
+                 full ? L"the whole row" : L"the active window", us, asked, lastTime, ticks * 500);
+    }
 
     // What it costs. The out-of-process measurement in tools\probe-saved.ps1 put a two-window pass
     // at ~2ms across a process boundary, and in-process on one STA thread this is a direct call with
@@ -5528,16 +5812,11 @@ static void PollModified(void)
     // a steady state of about 200, so the record line described a cold start and then fell silent
     // forever. A worst case with no typical case beside it is not a measurement of what something
     // costs.
-    if (freq.QuadPart <= 0)
-        return;
-
-    LONGLONG us = (after.QuadPart - before.QuadPart) * 1000000 / freq.QuadPart;
-
     static LONGLONG worstEver = -1;
     if (us > worstEver)
     {
         worstEver = us;
-        LogWrite(L"strip  dot poll: %d window(s) in %lld us (the most it has ever taken)", count, us);
+        LogWrite(L"strip  dot poll: %d window(s) in %lld us (the most it has ever taken)", asked, us);
     }
 
     // ...and a summary: once ten seconds in, and every four minutes after that.
@@ -5561,7 +5840,7 @@ static void PollModified(void)
     if (passes >= reportAt)
     {
         LogWrite(L"strip  dot poll: %d window(s), %d passes, mean %lld us, worst %lld us",
-                 count, passes, total / passes, worst);
+                 asked, passes, total / passes, worst);
         passes   = 0;
         total    = 0;
         worst    = 0;
@@ -5596,6 +5875,33 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
         {
             TryBind(state);
             continue;
+        }
+
+        // Has the document frame been REPLACED rather than emptied?
+        //
+        // The test is deliberately narrow: only a binding that has gone empty or invisible is
+        // questioned at all, and it is only given up for a candidate that is both. So this never
+        // fires while a window is behaving - one `_WwF`, a document in it - and it cannot start a
+        // fight between two frames that both look usable. A window with genuinely nothing open
+        // reaches the enumeration and finds nothing better, which costs one EnumChildWindows a tick
+        // on windows showing Word's Start screen and nothing at all anywhere else.
+        //
+        // Queued as "a View change closes tabs", and NOT reproduced here - see PickWwf.
+        if (GetWindow(state->wwf, GW_CHILD) == NULL || !IsWindowVisible(state->wwf))
+        {
+            BOOL holds = FALSE;
+            HWND better = PickWwf(state->frame, &holds);
+            if (holds && better && better != state->wwf)
+            {
+                LogWrite(L"strip  hwnd=0x%p  Word has BUILT A SECOND document frame: bound to "
+                         L"0x%p (empty=%d visible=%d), rebinding to 0x%p which holds the document",
+                         (void*)state->frame, (void*)state->wwf,
+                         (int)(GetWindow(state->wwf, GW_CHILD) == NULL),
+                         (int)IsWindowVisible(state->wwf), (void*)better);
+                Unbind(state, L"it was replaced");
+                TryBind(state);
+                continue;
+            }
         }
 
         // Hidden -> shown. Everything Word did to this window's layout while it was hidden was

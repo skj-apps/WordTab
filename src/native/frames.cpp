@@ -394,6 +394,27 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
     case WM_SYSCOMMAND:
     {
         WPARAM command = wParam & 0xFFF0;
+
+        // The window's own close - the x in the title bar, Alt+F4, the window menu. The stack is
+        // one window to the user, so closing it closes every document in it.
+        //
+        // SC_CLOSE and not WM_CLOSE, and the difference is the whole of the safety. WM_CLOSE is what
+        // the add-in itself posts to close one tab, and what the batch posts to close them in turn;
+        // intercepting that would be the stack answering its own question and closing everything
+        // over and over. SC_CLOSE is only ever the user pressing close on this window.
+        //
+        // Returning without chaining, which this file does for exactly two other messages and under
+        // the same rule: only when the answer is provably ours. StackCloseWindowCommand says FALSE
+        // for anything that is not a stack of several documents, and then this falls through to
+        // Word untouched.
+        if (command == SC_CLOSE)
+        {
+            LogWrite(L"WM_SYSCOMMAND  hwnd=0x%p  SC_CLOSE", (void*)hwnd);
+            if (StackCloseWindowCommand(hwnd))
+                return 0;
+            break;
+        }
+
         if (command == SC_MAXIMIZE || command == SC_RESTORE ||
             command == SC_MINIMIZE || command == SC_MOVE || command == SC_SIZE)
         {
@@ -414,9 +435,19 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         // them. It also creates frames it never shows. So a tab strip must follow shown/hidden,
         // not creation and destruction, or it will show tabs for documents that do not exist and
         // miss ones that do.
+        //
+        // **Chained first, then asked.** WM_SHOWWINDOW is sent *before* the window's visibility
+        // actually changes, so a janitor run from here reads the state the window is leaving rather
+        // than the one it is arriving at - and on a show that means reading "hidden" about a window
+        // that is being shown. Measured, tools\check-row.ps1: a window hidden and re-shown a quarter
+        // of a second later produced two "this window is not visible" readings a few milliseconds
+        // apart, one from each edge of the gesture, and the second one evicted it from the row.
         LogWrite(L"WM_SHOWWINDOW  hwnd=0x%p  %s", (void*)hwnd, wParam ? L"shown" : L"hidden");
-        StackJanitor();          // membership is decided by what is visible, so re-decide it now
-        break;
+        {
+            LRESULT chained = DefSubclassProc(hwnd, msg, wParam, lParam);
+            StackJanitor();      // membership is decided by what is visible, so re-decide it now
+            return chained;
+        }
 
     case WM_DPICHANGED:
         // This rig runs at 150%. Every rectangle we compute has to survive a monitor change.
@@ -608,7 +639,32 @@ static LRESULT CALLBACK CbtProc(int code, WPARAM wParam, LPARAM lParam)
             HWND hwnd = (HWND)wParam;
             wchar_t cls[64] = L"";
             if (GetClassNameW(hwnd, cls, 64) > 0 && _wcsicmp(cls, kFrameClass) == 0)
+            {
+                // **Where it is born, decided here, because everything else happens too late.**
+                //
+                // Opening an existing document showed its window a few inches above the stack before
+                // it settled into it - the user called it minor, and its cause is that this hook
+                // posts. By the time the coordinator picks the window up, Word has created it at the
+                // position it chose and shown it there; the stack can only move it afterwards, and
+                // "afterwards" is a frame the user can see.
+                //
+                // `lpcs` is the CREATESTRUCT Word passed to CreateWindowEx and it is writable: this
+                // is the documented purpose of HCBT_CREATEWND. Writing the stack's own rectangle
+                // into it means the window is created where it belongs, and there is no first
+                // position to flash from. Word may still lay it out differently afterwards - a
+                // maximized stack maximizes it - and that is fine, because none of those is a move
+                // from somewhere else on screen.
+                RECT where;
+                if (StackProposeCreateRect(&where))
+                {
+                    create->lpcs->x  = where.left;
+                    create->lpcs->y  = where.top;
+                    create->lpcs->cx = where.right - where.left;
+                    create->lpcs->cy = where.bottom - where.top;
+                }
+
                 PostMessageW(g_coordinator, WM_WORDTAB_FRAME_CREATED, (WPARAM)hwnd, 0);
+            }
         }
     }
 

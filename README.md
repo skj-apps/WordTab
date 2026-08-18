@@ -5,7 +5,10 @@
 Open two or three documents and Word becomes a single window with a row of tabs across the top —
 each named after its document, in Word's own colours. Click a tab to switch. Drag one to reorder the
 row, or drag it clear of the row to pull that document out into a window of its own; drag it back to
-put it in again. Close a tab with its ×, or middle-click it. Press **+** for a new document.
+put it in again. Close a tab with its ×, or middle-click it; close the window itself and the whole row goes with it,
+asking about each unsaved document in turn. A newly opened document's tab arrives at the **end** of
+the row, so the ones you keep parked on the left stay where your muscle memory left them.
+Press **+** for a new document.
 Ctrl+Tab and Ctrl+Shift+Tab step along the row. A document with unsaved changes shows a dot where its
 × is. Rest the pointer on a tab and it gives you the document's full name and the folder it is in —
 which is the thing you want once there are enough documents open for the names to be cut short. The
@@ -164,8 +167,8 @@ The build is byte-for-byte reproducible: the same sources give the same DLL hash
 
 ## Checking it
 
-Eleven suites drive a real Word with real mouse and keyboard input and assert what happens — about
-560 checks, roughly fifteen minutes.
+Twelve suites drive a real Word with real mouse and keyboard input and assert what happens — about
+580 checks, roughly twenty minutes.
 
 ```
 pwsh -File tools\check-all.ps1 *>&1 | Tee-Object -FilePath "$env:TEMP\battery.txt"
@@ -197,3 +200,12 @@ that was built, measured and deliberately scrapped.
   ordinary document is in front, because a Protected View window has no ribbon body to sample.
 - Multi-monitor behaviour is unproven. Per-window DPI changes are handled, but this has only ever run
   on a single-monitor machine.
+- WordTab has never run beside a working copy of Office Tab, and one report of the document area
+  laying out wrong comes from a machine where Office Tab's helper is loading. Both carve up the same
+  document frame. The add-in now says so in its log if it finds that its document frame has been
+  taken in under somebody else's container, which is the shape that would explain it.
+- **A View change has been reported to drop a window out of the row on one machine** — the document
+  is never at risk, but the tab and the strip go. It has not been reproduced here
+  (`tools\probe-view.ps1` drives every View command Word's object model offers and the row never
+  moves). A window is no longer given up on a single reading, the binding is re-tested against the
+  window rather than against a handle, and the log now describes the state that decided it.

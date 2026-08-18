@@ -27,7 +27,7 @@ $ErrorActionPreference = 'Continue'
 
 # Ordered cheapest-first so a broken build fails fast, with soak last: it opens the most documents
 # and is the one whose leftovers used to poison whatever ran next.
-$suites = @('stack', 'strip', 'tabs', 'menu', 'reorder', 'startscreen', 'look', 'scroll', 'title', 'dot', 'soak-stack')
+$suites = @('stack', 'row', 'strip', 'tabs', 'menu', 'reorder', 'startscreen', 'look', 'scroll', 'title', 'dot', 'soak-stack')
 if ($Only) {
     # `pwsh -File script.ps1 -Only reorder,look` passes ONE literal string, not two: with -File every
     # argument arrives as text and PowerShell does no array parsing, so a [string[]] parameter gets a
