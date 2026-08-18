@@ -1090,8 +1090,15 @@ try {
 
         # Centred, then cascaded by one caption and border - so it sits exactly that step down and
         # right of where centring alone would have put it.
-        $centredLeft = $work.Left + [int]((($work.Right - $work.Left) - $wantW) / 2)
-        $centredTop  = $work.Top  + [int]((($work.Bottom - $work.Top) - $wantH) / 2)
+        #
+        # [Math]::Floor and not [int]. The add-in centres in C, where `/` on two LONGs truncates;
+        # PowerShell's [int] rounds, and rounds .5 to the nearest EVEN number. When the leftover is
+        # odd - a work area 2796px wide against three quarters of 2097 leaves 699 - the two
+        # arithmetics disagree by one, and this assertion went red with (49,50) on a placement that
+        # was correct. It only shows up on a work area of the wrong parity, which is why it passed
+        # for weeks: this is the check disagreeing with the product about how to halve an odd number.
+        $centredLeft = $work.Left + [int][Math]::Floor(((($work.Right - $work.Left) - $wantW) / 2))
+        $centredTop  = $work.Top  + [int][Math]::Floor(((($work.Bottom - $work.Top) - $wantH) / 2))
         $dx = $torn.Left - $centredLeft
         $dy = $torn.Top - $centredTop
         Write-Note "offset from centred: ($dx,$dy)"
