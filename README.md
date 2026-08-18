@@ -48,7 +48,8 @@ It verifies the DLL against a SHA256 recorded in the package, clears the mark-of
 downloaded zip leaves on it, registers the add-in, and checks the class actually activates. Then
 start Word and open two documents.
 
-Removing it leaves nothing behind:
+Removing it leaves nothing behind. The install lists itself in Settings > Apps > Installed apps,
+which is where anyone who did not read this will look, and that entry runs the same script:
 
 ```
 powershell -ExecutionPolicy Bypass -File install\uninstall.ps1

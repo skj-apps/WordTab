@@ -266,6 +266,20 @@ public static class WordTabDpi {
         Say 'Package         :'
         foreach ($line in (Get-Content $payload | Where-Object { $_ -match '^(Commit|Built|Sha256|Package)' })) { Say ("  {0}" -f $line.Trim()) }
     }
+    # Can this machine get rid of WordTab? Two separate answers, and either can be no on its own. The
+    # uninstaller is a file install.ps1 leaves beside the DLL; the listing is the registry entry that
+    # points Settings > Apps at it. A missing file with a present listing is the worse of the two -
+    # clicking Uninstall would fail with a path error - so name them apart rather than together.
+    $ourUninstaller = Join-Path $env:LOCALAPPDATA 'Programs\WordTab\uninstall.ps1'
+    Say ("Uninstaller     : {0}" -f $(if (Test-Path $ourUninstaller) { $ourUninstaller } else { "NOT PRESENT at $ourUninstaller" }))
+    $arp = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\WordTab'
+    if (Test-Path $arp) {
+        $a = Get-ItemProperty -Path $arp
+        Say ("Listed in Apps  : yes, as '{0}' version {1}" -f $a.DisplayName, $a.DisplayVersion)
+        Say ("  Uninstall runs: {0}" -f $a.UninstallString)
+    } else {
+        Say "Listed in Apps  : no - Settings > Apps will not show WordTab. Installed before this entry existed, or removed by hand."
+    }
 
     Head 'Registration'
     $clsidKey = 'HKCU:\Software\Classes\CLSID\{4BF75ED9-10EE-4866-BF4A-3D663A4149A1}\InprocServer32'

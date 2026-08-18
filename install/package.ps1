@@ -284,11 +284,16 @@ IF YOU ALREADY RUN OFFICE TAB (OR ANOTHER TABBED-WORD ADD-IN)
 
 TO REMOVE IT
 
+  Settings > Apps > Installed apps > WordTab > Uninstall. It is listed there like every other
+  program on the machine, and removing it needs no administrator rights either.
+
+  Or, if you still have this folder:
+
          powershell -ExecutionPolicy Bypass -File install\uninstall.ps1
 
-  That removes the registration, the files, the settings and the log directory. Word then starts
-  exactly as it did before - no strip, and the document back flush under the ribbon. Add -KeepLog to
-  keep the log for diagnosis.
+  Either way removes the registration, the files, the settings and the log directory. Word then
+  starts exactly as it did before - no strip, and the document back flush under the ribbon. Add
+  -KeepLog to the command above to keep the log for diagnosis.
 "@ | Set-Content -Path (Join-Path $payload 'README.txt') -Encoding ASCII
 
 Write-Ok 'PAYLOAD.txt and README.txt written'

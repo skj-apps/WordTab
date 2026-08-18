@@ -51,6 +51,13 @@ $DllName     = 'WordTab.dll'
 $FriendlyNm  = 'WordTab'
 $Description = 'Tabbed document interface for Word'
 
+# Which build this is, for the Windows uninstall entry's version column. WordTab has no version
+# number scheme and its DLL carries no version resource, so the commit is the version - the same
+# identifier the zip name, PAYLOAD.txt and settings.ps1 -Report already use. Filled in below from
+# whichever of the two is available; deliberately not a fallback chain, since a package has no git
+# and a repo has no manifest.
+$BuildId = 'unknown'
+
 $RepoRoot   = Split-Path -Parent $PSScriptRoot
 $NativeDir  = Join-Path $RepoRoot 'src\native'
 $HeaderFile = Join-Path $NativeDir 'wordtab.h'
@@ -61,6 +68,12 @@ $ClsidKey    = "HKCU:\Software\Classes\CLSID\{$Clsid}"
 $ProgIdKey   = "HKCU:\Software\Classes\$ProgId"
 $AddinKey    = "HKCU:\Software\Microsoft\Office\Word\Addins\$ProgId"
 $SettingsKey = 'HKCU:\Software\WordTab'
+
+# Windows' own list of installed programs. Per-user under HKCU, which is the same no-admin rule
+# everything else here follows, and Settings > Apps enumerates it alongside the machine-wide hives.
+# It is where a corporate user - or whoever they ask - looks first to remove something, and until now
+# WordTab was not anywhere Windows itself knew to enumerate.
+$ArpKey      = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\WordTab'
 
 function Write-Step($text) { Write-Host "==> $text" -ForegroundColor Cyan }
 function Write-Ok  ($text) { Write-Host "    $text" -ForegroundColor Green }
@@ -146,13 +159,19 @@ if ($IsPayload) {
         throw "$DllName does not match the package manifest. Expected SHA256 $wantHash, got $gotHash. The file was altered or truncated in transit - re-copy the package."
     }
     Write-Ok "$DllName matches the manifest (SHA256 $($gotHash.Substring(0,16))...)"
-    if ($builtAt) { Write-Note $builtAt.Trim() }
+    if ($builtAt) { Write-Note $builtAt.Trim(); $BuildId = $builtAt.Substring(7).Trim() }
 } else {
     $newestSource = Get-ChildItem -Path $NativeDir -Include '*.cpp', '*.h', '*.def' -File -Recurse |
                     Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($newestSource -and (Get-Item $BuiltDll).LastWriteTime -lt $newestSource.LastWriteTime) {
         throw "$DllName is older than $($newestSource.Name) - it does not contain the current sources. Build it (drop -SkipBuild, and check the build actually succeeded)."
     }
+    # A repo install is a dev install, and git is the manifest here. Not being able to answer is a
+    # cosmetic loss - the entry still installs and still uninstalls - so this never stops an install.
+    try {
+        $head = & git -C $RepoRoot rev-parse --short HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and $head) { $BuildId = "$head".Trim() }
+    } catch { }
 }
 
 # ---- install files ------------------------------------------------------------------------------
@@ -171,6 +190,23 @@ if (-not (Test-Path $installedDll)) { throw "Copy failed: $installedDll missing.
 try { Unblock-File -Path $installedDll -ErrorAction Stop; Write-Note 'cleared the mark-of-the-web, if it had one' } catch { }
 
 Write-Ok ("{0}  ({1:N0} bytes)" -f $installedDll, (Get-Item $installedDll).Length)
+
+# The uninstaller travels WITH the install, not only with the package it arrived in. A one-file .cmd
+# install unpacks the payload to a temp folder and deletes it again (install\make-onefile.ps1), so
+# before this line the machine kept the DLL and nothing that could remove it. The Windows uninstall
+# entry written further down has to name a file that is still there when someone clicks Uninstall
+# months later, and this is that file.
+$UninstallSrc = Join-Path $PSScriptRoot 'uninstall.ps1'
+if (-not (Test-Path $UninstallSrc)) {
+    throw "install\uninstall.ps1 is missing. It sits beside this script in both the repo and a package; copy the whole folder rather than install.ps1 on its own."
+}
+Copy-Item -Path $UninstallSrc -Destination $InstallDir -Force
+$installedUninstaller = Join-Path $InstallDir 'uninstall.ps1'
+# Same mark-of-the-web reasoning as the DLL above. A marked .ps1 is refused outright under the
+# RemoteSigned policy a corporate machine is likely to be on, and the failure would only show up at
+# uninstall time - long after anyone would connect it to how the file arrived.
+try { Unblock-File -Path $installedUninstaller -ErrorAction Stop } catch { }
+Write-Ok $installedUninstaller
 
 # ---- register ------------------------------------------------------------------------------------
 
@@ -318,6 +354,48 @@ if (-not $SkipSmokeTest) {
     }
 }
 
+# ---- tell Windows it is installed ---------------------------------------------------------------
+
+# Settings > Apps > Installed apps, and Control Panel's Programs and Features behind it, both
+# enumerate this key under HKCU as well as the machine hives. Eight values, and "how do I get rid of
+# this" stops being a question only this repo can answer.
+#
+# powershell.exe by absolute path rather than pwsh: Windows launches this string itself, with no
+# shell to resolve a bare name, and PowerShell 7 is not on a stock corporate Windows. System32
+# resolves to the 64-bit copy for the 64-bit Explorer that launches it - which is the view
+# uninstall.ps1 refuses to run outside of, so a wrong one would say so rather than half-work.
+Write-Step 'Listing in Settings > Apps'
+$psExe  = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$sizeKb = [int]([Math]::Ceiling(((Get-ChildItem -Path $InstallDir -File -Recurse | Measure-Object -Property Length -Sum).Sum) / 1KB))
+
+if (-not (Test-Path $ArpKey)) { New-Item -Path $ArpKey -Force | Out-Null }
+
+# -Pause on the visible one because Windows launches it from Explorer: the console it opens closes
+# the instant the script ends, so "close Word first" would flash past unread and a user who clicked
+# Uninstall would see a window blink and WordTab still installed. QuietUninstallString is the same
+# command without it, which is what anything removing WordTab unattended is supposed to use.
+$strings = [ordered]@{
+    DisplayName          = $FriendlyNm
+    DisplayVersion       = $BuildId
+    Publisher            = $FriendlyNm
+    Comments             = $Description
+    InstallLocation      = $InstallDir
+    InstallDate          = (Get-Date -Format 'yyyyMMdd')
+    UninstallString      = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Pause' -f $psExe, $installedUninstaller
+    QuietUninstallString = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $psExe, $installedUninstaller
+}
+foreach ($name in $strings.Keys) {
+    New-ItemProperty -Path $ArpKey -Name $name -Value $strings[$name] -PropertyType String -Force | Out-Null
+}
+# There is nothing to modify and nothing to repair; without these Windows offers both and each one
+# would do nothing. EstimatedSize is in KB and is what the size column reads.
+New-ItemProperty -Path $ArpKey -Name 'NoModify'      -Value 1       -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $ArpKey -Name 'NoRepair'      -Value 1       -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $ArpKey -Name 'EstimatedSize' -Value $sizeKb -PropertyType DWord -Force | Out-Null
+# No DisplayIcon. WordTab ships no icon resource - see src\native\NOTE-no-icons.md - and pointing the
+# value at a file that has none makes Windows draw a blank where the generic app icon would be.
+Write-Ok "'$FriendlyNm', version $BuildId, $sizeKb KB"
+
 Write-Host ''
 Write-Host 'Installed.' -ForegroundColor Green
 if ($NoBanner) {
@@ -327,4 +405,5 @@ if ($NoBanner) {
     Write-Host "  Start Word. Expect a 'WordTab is loaded inside Word' dialog." -ForegroundColor Gray
 }
 Write-Host "  Log: $env:LOCALAPPDATA\WordTab\wordtab.log" -ForegroundColor Gray
-Write-Host "  Remove with: pwsh -File install\uninstall.ps1" -ForegroundColor Gray
+Write-Host "  Remove it from Settings > Apps > Installed apps, like any other program." -ForegroundColor Gray
+Write-Host "  Or run: $installedUninstaller" -ForegroundColor Gray
