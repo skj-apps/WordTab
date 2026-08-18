@@ -100,6 +100,71 @@ function Format-Row($row) {
     return ($row -join ' | ')
 }
 
+# ---- the add-in's "what did the x mean" dialog -------------------------------------------------
+#
+# It is a task dialog, so its buttons are ordinary BUTTON controls with their text in them - which is
+# what they are found by here. Never by coordinate: the command links are laid out by Windows from
+# the text, at whatever DPI and font this machine runs, and a point computed from the dialog's corner
+# would be a guess that passes on this rig and misses on the next.
+
+function Wait-Ask($seconds = 15) {
+    Wait-Until { $null -ne (Get-WordTabAsk) } $seconds 250 | Out-Null
+    return Get-WordTabAsk
+}
+
+function Get-AskButton($ask, $startsWith) {
+    if ($null -eq $ask) { return $null }
+    foreach ($c in [WordLayout]::Children($ask.Hwnd)) {
+        if ($c.Class -ne 'Button') { continue }
+        $text = [WordLayout]::TitleOf($c.Hwnd)
+        if ($text -like "$startsWith*") {
+            $r = [WordLayout]::RectOf($c.Hwnd)
+            return [pscustomobject]@{
+                Hwnd = $c.Hwnd
+                Text = ($text -replace "`r?`n", ' / ')
+                X    = [int](($r.Left + $r.Right) / 2)
+                Y    = [int](($r.Top + $r.Bottom) / 2)
+            }
+        }
+    }
+    return $null
+}
+
+# Click one of them, having confirmed the pointer is over THAT button and not over whatever else the
+# desktop has put there. The window under the point is compared by handle, not by class: two of the
+# three buttons on this dialog are the same class as each other.
+function Invoke-AskButton($ask, $startsWith) {
+    for ($try = 1; $try -le 3; $try++) {
+        # The dialog first, every attempt. It is modal to Word and not to the desktop, so the window
+        # running this script sits in front of it - the first run of this section clicked
+        # CASCADIA_HOSTING_WINDOW_CLASS, which is the terminal, three times over. Measured, not
+        # guessed: the point was right and the window under it was not.
+        [WordLayout]::Focus($ask.Hwnd) | Out-Null
+        Start-Sleep -Milliseconds 400
+
+        $b = Get-AskButton $ask $startsWith
+        if ($null -eq $b) {
+            $seen = @(foreach ($c in [WordLayout]::Children($ask.Hwnd)) {
+                         if ($c.Class -eq 'Button') { '"' + (([WordLayout]::TitleOf($c.Hwnd)) -replace "`r?`n", ' / ') + '"' } })
+            Write-Note ("no button starting `"$startsWith`". The dialog has: " + ($seen -join ', '))
+            return $false
+        }
+
+        [WordLayout]::MouseTo($b.X, $b.Y)
+        $under = [WordLayout]::WindowAt($b.X, $b.Y)
+        if ($under -eq $b.Hwnd) {
+            Write-Note ("clicking `"{0}`"" -f $b.Text)
+            [WordLayout]::Click($b.X, $b.Y)
+            return $true
+        }
+
+        Write-Note ("attempt {0}: ({1},{2}) is over 0x{3:X} ({4}), not the button 0x{5:X}" -f
+                    $try, $b.X, $b.Y, [int64]$under, [WordLayout]::ClassOf($under), [int64]$b.Hwnd)
+        Start-Sleep -Milliseconds 600
+    }
+    return $false
+}
+
 Close-AllWord | Out-Null
 Reset-LogFile -Label 'row' -Quiet | Out-Null
 
@@ -230,7 +295,67 @@ if ($frames.Count -lt 2) {
     Write-Note ("row is still: " + (Format-Row $rowBefore))
 }
 
-# ---- 5. ...and it cannot take unsaved work with it ---------------------------------------------
+# ---- 5. the x asks what it meant, and Cancel means nothing happens ------------------------------
+#
+# The x closing a whole window's worth of documents is right, and it is also the one thing here that
+# ends with several of somebody's documents shut - so it asks first. Three answers, all three driven,
+# starting with the one that must do nothing at all.
+
+Write-Step 'The window close asks what it meant'
+$before = (Get-WordFrameTally)
+Assert ($before -ge 2) "at least two tabs, so the question is worth asking ($before)"
+
+if ($before -ge 2) {
+    Set-LogMark
+    [WordLayout]::SysClose((Get-WordFrameList)[0])
+    $ask = Wait-Ask 15
+    if ($ask) { Write-Note ("the add-in asked: {0} {1}x{2} `"{3}`"" -f $ask.Class, $ask.Width, $ask.Height, $ask.Title) }
+
+    Assert ($null -ne $ask) 'pressing the window close put the add-in''s question up'
+
+    # It is OURS, not Word's, and every guard in this harness has to agree. A `#32770` titled
+    # anything else is a Word prompt and stops a run; this one must not.
+    Assert ($null -eq (Get-WordDialog)) 'and the harness does not mistake it for Word asking something'
+    Assert ((Get-WordFrameTally) -eq $before) "nothing has closed while the question is up ($(Get-WordFrameTally))"
+
+    if ($ask) {
+        Assert (Invoke-AskButton $ask 'Cancel') 'the Cancel button was clicked'
+        Start-Sleep -Seconds 3
+        Assert ($null -eq (Get-WordTabAsk)) 'the question went away'
+        Assert ((Get-WordFrameTally) -eq $before) "Cancel closed nothing - all $before still open ($(Get-WordFrameTally))"
+        Assert ((Get-LogCount 'cancelled, nothing closed') -ge 1) 'and the add-in says so'
+    }
+}
+
+# ---- 6. ...and "close only this one" closes exactly one ----------------------------------------
+
+Write-Step 'Answering "close only this document"'
+$before = (Get-WordFrameTally)
+if ($before -lt 2) {
+    Write-Note 'fewer than two windows - skipping'
+} else {
+    $victim = (Get-WordFrameList)[0]
+    $name   = [WordLayout]::TitleOf($victim)
+    Set-LogMark
+    [WordLayout]::SysClose($victim)
+    $ask = Wait-Ask 15
+
+    Assert ($null -ne $ask) 'the question came up again'
+    if ($ask) {
+        Assert (Invoke-AskButton $ask 'Close only') 'the "close only this document" button was clicked'
+        Wait-Until { (Get-WordFrameTally) -lt $before } 20 250 | Out-Null
+        Start-Sleep -Seconds 3
+
+        Assert ((Get-WordFrameTally) -eq ($before - 1)) `
+               "exactly one document closed - $($before - 1) left of $before ($(Get-WordFrameTally))"
+        Assert ((Get-LogCount 'this document only') -ge 1) 'and the add-in took that route, not the whole-stack one'
+        $row = Get-Row
+        Write-Note ("row now: " + (Format-Row $row))
+        Assert (($null -ne $row) -and (@($row).Count -eq ($before - 1))) 'and the row is one shorter'
+    }
+}
+
+# ---- 7. ...and it cannot take unsaved work with it ---------------------------------------------
 #
 # The one thing about this command that could reach the user's documents. Closing the window now
 # closes several documents rather than one, so the question that matters is not "does it close them"
@@ -243,19 +368,45 @@ if ($frames.Count -lt 2) {
 # The document is dirtied through Word's own object model rather than by typing into it: this suite
 # has no confirmed-click apparatus, and a click that missed would leave the wrong document modified
 # and the failure three steps from its cause. It is a scratch .rtf this script authored in %TEMP%.
+#
+# **WHICH document is dirtied is the whole design of this section, and the first version got it
+# wrong.** A batch queues every tab except the active one, in row order, and puts the active one
+# last - so dirtying whichever window happened to be in front meant two clean documents closed
+# cleanly before Word ever asked, and "cancel kept everything" failed against a batch that was
+# behaving perfectly. Cancel abandons what is LEFT; it does not undo what has gone. So the dirty one
+# is made the FIRST in the queue - the leftmost tab, with the row's last tab left active - and then
+# the prompt genuinely does arrive before anything has closed. Same construction, and the same
+# reason, as the cancelled-batch section of check-menu.
+
+function Get-FrameNamed($name) {
+    foreach ($f in Get-WordFrameList) { if ([WordLayout]::TitleOf($f) -like "$name*") { return $f } }
+    return $null
+}
 
 Write-Step 'The same close, with a document that has unsaved changes'
-$frames = @(Get-WordFrameList)
+$row    = Get-Row
 $dirty  = $null
-if ($frames.Count -ge 2) {
-    $om = [WordLayout]::NativeOm($frames[0])
-    if ($null -eq $om) {
-        Write-Note 'Word would not hand over the object model - skipping'
+if (@($row).Count -ge 2) {
+    $first = Get-FrameNamed $row[0]
+    $last  = Get-FrameNamed $row[-1]
+
+    if ($null -eq $first -or $null -eq $last) {
+        Write-Note 'could not match the row back to windows - skipping'
     } else {
-        try {
-            $om.Document.Content.InsertAfter('WordTab close check.')
-            $dirty = $frames[0]
-        } catch { Write-Note "could not modify the document: $($_.Exception.Message)" }
+        # The last tab active, so the first tab is what the batch reaches first.
+        [WordLayout]::Focus($last) | Out-Null
+        Start-Sleep -Milliseconds 800
+
+        $om = [WordLayout]::NativeOm($first)
+        if ($null -eq $om) {
+            Write-Note 'Word would not hand over the object model - skipping'
+        } else {
+            try {
+                $om.Document.Content.InsertAfter('WordTab close check.')
+                $dirty = $first
+                Write-Note ("dirtied the leftmost tab: `"{0}`"" -f [WordLayout]::TitleOf($first))
+            } catch { Write-Note "could not modify the document: $($_.Exception.Message)" }
+        }
     }
 }
 
@@ -265,7 +416,16 @@ if ($null -eq $dirty) {
     Start-Sleep -Seconds 2
     $count = (Get-WordFrameTally)
     Set-LogMark
-    [WordLayout]::SysClose($dirty)
+
+    # Pressed on the window in FRONT, which is where a person's x is. Not on the dirty one - that is
+    # the tab this is about, and it is deliberately not the active one.
+    [WordLayout]::SysClose([WordLayout]::GetForeground())
+
+    # Through our own question first, answering "close all" - which is the answer that has to be
+    # safe. Word's prompt is what must arrive next, and it must arrive before anything has gone.
+    $ask = Wait-Ask 15
+    Assert ($null -ne $ask) 'the add-in asked what the x meant'
+    if ($ask) { Assert (Invoke-AskButton $ask 'Close all') 'and "close all" was clicked' }
 
     $prompt = $null
     Wait-Until { $script:p = Get-WordSavePrompt; $null -ne $script:p } 20 250 | Out-Null
@@ -298,20 +458,25 @@ if ($null -eq $dirty) {
     Start-Sleep -Seconds 1
 }
 
-# ---- 6. the window's own close takes the whole stack with it -----------------------------------
+# ---- 8. and "close all" closes every tab -------------------------------------------------------
 #
 # SC_CLOSE, which is the message the title bar's x raises. Posted rather than clicked: the x is
 # painted by Word inside its own caption and hitting it by coordinate is a guess, whereas the message
 # it produces is not. The add-in logs SC_CLOSE when it arrives, so a run that wanted to check the
-# real button can compare that line against this one.
+# real button can compare that line against this one. **The answer to the question that follows is a
+# real click**, on a button found by its own text.
 
-Write-Step "The window's own close button closes every tab"
+Write-Step "Answering `"close all`""
 $frames = @(Get-WordFrameList)
 Assert ($frames.Count -ge 2) "there are at least two windows to close together ($($frames.Count))"
 
 if ($frames.Count -ge 2) {
     Set-LogMark
     [WordLayout]::SysClose($frames[0])
+
+    $ask = Wait-Ask 15
+    Assert ($null -ne $ask) 'the question came up'
+    if ($ask) { Assert (Invoke-AskButton $ask 'Close all') '"close all" was clicked' }
 
     # Generously bounded. Each close is one WM_CLOSE stepped by the janitor at half a second, and any
     # of them may raise a save prompt - these are scratch files nobody has typed into, so none should,

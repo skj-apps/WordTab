@@ -1,18 +1,24 @@
 # The row: what order tabs are in, what keeps one, and what closing the window means
 
-**PASSED.** 25 checks in the new `tools\check-row.ps1`; the other eleven suites re-run —
-**719 checks, 0 failures across the twelve in one clean battery.** `check-row` has grown by four
-since that run — the unsaved-work section below — and passes 25 of 25 standalone; nothing in the
-add-in changed to add them, so the eleven other numbers are the ones the battery produced.
+**PASSED.** 42 checks in the new `tools\check-row.ps1`; the other eleven suites re-run —
+**740 checks across the twelve.**
 
 | suite | checks | | suite | checks |
 |---|---|---|---|---|
 | stack | 60 | | startscreen | 50 |
-| **row** | **25** | | look | 48 |
+| **row** | **42** | | look | 48 |
 | strip | 67 | | scroll | 62 |
 | tabs | 26 | | title | 105 |
 | menu | 71 | | dot | 69 |
 | reorder | 118 | | soak | 22 |
+
+**Said exactly:** the last full battery was eleven suites green and `reorder` at 117 of 118, on its
+"the carried card follows the pointer, pixel for pixel" check — which reads the ghost's position with
+no settle after an injected drag. The previous commit, rebuilt and run on the same rig in the same
+half hour, failed that suite too, on a *different* pointer check. So it is the machine's injected
+input after two and a half hours of continuous driving, not the change; `reorder` passes 118 of 118
+again since. **The A/B is the reason that can be said rather than hoped** — it is the same instrument
+that proved the one real regression in this slice was mine, and it has to be run in both directions.
 
 The queue the user left after their first full afternoon of real use, on the work machine, done in
 one pass. Five items, four of them in this file and one — the dot poll's cost — in
@@ -23,6 +29,7 @@ one pass. Five items, four of them in this file and one — the dot poll's cost 
 | "changing setting like view>page width closes tabs" | **not reproduced here.** Guarded, and made to explain itself next time |
 | "now newly opened docs popping infront lets make them pop to end" | a frame Word had already made held an early slot in the row |
 | "you have to close all tabs individually - that needs fixing" | nothing was listening for the window's own close |
+| "yeh lets do option to close all or just the one" | so it asks, with three answers |
 | the document area lays out wrong on the work rig | still open — waiting on their `LoadBehavior 0` A/B |
 | opening an existing document flashes above the stack | the placement happened after Word had shown the window |
 
@@ -158,7 +165,7 @@ because the tabs are painted rather than controls.
 
 ---
 
-## 3. Closing the window closes the stack
+## 3. Closing the window asks what you meant
 
 *"you have to close all tabs individually - that needs fixing next time we edit."* Confirmed in their
 log at 14:27-14:28, four frames going down one at a time.
@@ -178,17 +185,58 @@ unsaved work asks five questions in turn, and Cancel on the second leaves the re
 
 Everything that is not unambiguously *the user pressed close on a stack of several documents* answers
 FALSE and lets Word do exactly what it did before: not stacked, a row of one, a batch already running,
-or `TabCloseStack=0`. That switch is there because this is the one thing WordTab does that ends with
-several of the user's documents closed.
+or `TabCloseStack=0`.
 
-**And that is why the new route is checked against unsaved work rather than only against closing.**
-The question that matters about this command is not whether it closes them, it is whether it can
-close one somebody had not finished with. Driven: dirty a document, press the window's close, and
-Word's own prompt goes up **before anything has closed**; Cancel, and all four documents are still
-open, with the add-in's log saying it stopped *because the user declined* rather than because it ran
-out of patience. That last distinction is not pedantry — an earlier version of the batch concluded
-"declined" one second after posting `WM_CLOSE`, before Word had even asked, and passed every
-assertion that did not look for the reason.
+### And then it asks, because "close all" is not the only thing an × can mean
+
+The first version of this closed the whole stack outright. That is what was asked for, and it is also
+the one thing WordTab does that ends with several of somebody's documents shut — so when the user was
+told exactly that, the answer was *"yeh lets do option to close all or just the one"*. Which is
+right: nothing can be lost silently either way, but a person who meant "close this one" and got five
+closes has still been surprised by their own window.
+
+So the × puts up three answers — **Close all N tabs**, **Close only this document**, and Cancel —
+and `TabCloseStack` becomes a three-way rather than a switch: `1` asks (the default), `2` is the
+behaviour above with no question, `0` is Word's own.
+
+**A task dialog rather than a MessageBox**, because "Yes / No / Cancel" over "close all tabs?" is
+exactly the shape where people click the wrong one: these are two different *actions* and an escape,
+not a yes and a no, and command links let each one say what it does. Reached through
+`GetProcAddress` rather than by linking it — `TaskDialogIndirect` exists only in comctl32 version 6,
+which is there through Word's own activation context on every machine this will meet, and "almost
+certainly present" is not a thing to stake a close button on. The fallback is a `MessageBox` whose
+text names which button does which.
+
+Everything is re-read after the dialog and nothing is carried across it: a task dialog runs a modal
+loop, the janitor ticks inside it, and the row can be a different row by the time an answer comes
+back.
+
+**And it is a `#32770` titled `WordTab`, which is Word's save prompt's class and size exactly.** The
+harness classifies windows to decide whether Word is asking something — and a window *this add-in*
+puts up that reads as "Word is asking something" turns a whole battery red naming a prompt nobody
+raised. That is the tooltip's lesson, and it was paid for once already. `Get-WordWindowKind` now
+takes the title, our dialog is `ours`, and the self-test asserts both directions.
+
+All three answers are driven in `check-row`, with real clicks on buttons **found by their own text** —
+never by coordinate, since Windows lays command links out from the text at whatever DPI and font the
+machine runs.
+
+**And the route is checked against unsaved work rather than only against closing.** The question that
+matters about this command is not whether it closes them, it is whether it can close one somebody had
+not finished with. Driven: dirty a document, press the window's close, answer "close all", and Word's
+own prompt goes up **before anything has closed**; Cancel, and all three documents are still open,
+with the add-in's log saying it stopped *because the user declined* rather than because it ran out of
+patience. That last distinction is not pedantry — an earlier version of the batch concluded "declined"
+one second after posting `WM_CLOSE`, before Word had even asked, and passed every assertion that did
+not look for the reason.
+
+**Which document is dirtied is the whole design of that check, and the first version got it wrong.**
+A batch queues every tab except the active one, in row order, and puts the active one last — so
+dirtying whichever window happened to be in front meant two clean documents closed cleanly before
+Word ever asked, and "cancel kept everything" failed against a batch that was behaving perfectly.
+**Cancel abandons what is left; it does not undo what has gone.** The dirty one is now made the
+*first* in the queue — leftmost tab, last tab active — which is the same construction, for the same
+reason, as the cancelled-batch section of `check-menu`.
 
 ---
 
@@ -272,8 +320,8 @@ line, and it is worth it, but the next such line should come with the same sweep
 
 - `src\native\stack.cpp` — `Member::missedAt` and `STAY_GRACE_MS`, `g_closeAimed` /
   `CloseWasAskedFor`, `LogRow`, `rejoin` at `StackAttachFrame`, the `MoveToEnd` log fix,
-  `StackCloseWindowCommand` and `TabCloseStack`, `StackProposeCreateRect`, and
-  `StackJanitor`'s re-entrancy guard around `JanitorPass`
+  `StackCloseWindowCommand`, `AskWhatToClose` and the three-way `TabCloseStack`,
+  `StackProposeCreateRect`, and `StackJanitor`'s re-entrancy guard around `JanitorPass`
 - `src\native\strip.cpp` — `PickWwf` and `WwfHuntProc` (replacing `FindChildOfClass`),
   `StripHasDocument`'s fallback, `Unbind`, the janitor's rebind, `StripDescribeDocumentFrames`,
   the parent-of-`_WwF` warning, and the dot poll's `TicksFor` / `AskModified` governor
@@ -281,7 +329,10 @@ line, and it is worth it, but the next such line should come with the same sweep
   `WM_SHOWWINDOW` chaining before it asks
 - `src\native\wordtab.h` — four new declarations
 - `install\settings.ps1` — `TabCloseStack`
-- `tools\check-row.ps1` — 25 checks, including the window close over a document with unsaved changes
+- `tools\check-row.ps1` — 42 checks: all three answers to the window's ×, driven with real clicks on
+  buttons found by their text, and one of them over a document with unsaved changes
+- `tools\WordTabHarness.ps1` — `Get-WordWindowKind` takes a title, `Get-WordTabAsk`, three self-test
+  checks that our own dialog is not read as Word asking something
 - `tools\probe-view.ps1` — the measurement that found nothing, kept as evidence
 - `tools\WordLayout.cs` — `SysClose`
 - `tools\check-reorder.ps1` — two patterns that were matching the wrong thing

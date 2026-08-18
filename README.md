@@ -5,9 +5,9 @@
 Open two or three documents and Word becomes a single window with a row of tabs across the top —
 each named after its document, in Word's own colours. Click a tab to switch. Drag one to reorder the
 row, or drag it clear of the row to pull that document out into a window of its own; drag it back to
-put it in again. Close a tab with its ×, or middle-click it; close the window itself and the whole row goes with it,
-asking about each unsaved document in turn. A newly opened document's tab arrives at the **end** of
-the row, so the ones you keep parked on the left stay where your muscle memory left them.
+put it in again. Close a tab with its ×, or middle-click it; close the *window* and it asks whether you meant all the
+tabs or just the one in front. A newly opened document's tab arrives at the **end** of the row, so
+the ones you keep parked on the left stay where your muscle memory left them.
 Press **+** for a new document.
 Ctrl+Tab and Ctrl+Shift+Tab step along the row. A document with unsaved changes shows a dot where its
 × is. Rest the pointer on a tab and it gives you the document's full name and the folder it is in —
@@ -136,6 +136,20 @@ powershell -Command "Remove-ItemProperty 'HKCU:\Software\WordTab' TabFontSize"  
 
 Anything outside 8..16 is treated as a typo: the strip clamps to that range and says so in the log.
 Close Word completely for a change to take effect.
+
+### What the window's × does
+
+Closing the *window* is not the same as closing a tab, so it asks: **close all N tabs**, **close only
+this document**, or cancel. Every document with unsaved changes still gets Word's own save prompt in
+turn, and cancelling one of those abandons the rest — nothing closes behind a cancel.
+
+`TabCloseStack` has three settings rather than two, and the middle one is the default:
+
+```
+powershell -Command "Set-ItemProperty 'HKCU:\Software\WordTab' TabCloseStack 2 -Type DWord"   # always close all, no question
+powershell -Command "Set-ItemProperty 'HKCU:\Software\WordTab' TabCloseStack 0 -Type DWord"   # only the document in front, like Word
+powershell -Command "Remove-ItemProperty 'HKCU:\Software\WordTab' TabCloseStack"              # back to asking
+```
 
 ## How it works
 

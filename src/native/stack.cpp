@@ -36,8 +36,10 @@
 // test is StripHasDocument, and it looks *inside* the document frame. See RESULT-startscreen.md.
 
 #include "wordtab.h"
+#include <commctrl.h>
 #include <string.h>
 #include <wchar.h>
+#include <stdio.h>
 
 #define MAX_MEMBERS 256
 
@@ -117,7 +119,7 @@ static BOOL   g_started     = FALSE;
 static BOOL   g_inSync      = FALSE;  // our own SetWindowPos calls come back through the subclass
 static BOOL   g_altTab      = TRUE;
 static BOOL   g_tearOff      = TRUE;
-static BOOL   g_closeStack   = TRUE;  // the window's own close takes every tab with it
+static int    g_closeStack   = 1;     // 0 = one document, 1 = ask, 2 = the whole stack
 static BOOL   g_minimized   = FALSE;  // the whole stack is down on the taskbar
 
 // Where to put the user back when the active tab goes away, set only by StackCloseTab. Closing a
@@ -573,20 +575,27 @@ void StackStart(void)
     // inside WordTab, and a machine where it misbehaves needs a way to stop offering it.
     g_tearOff  = WordTabReadFlag(L"TabTearOff", TRUE);
 
-    // Off, the title bar's x closes the document in front and nothing else - which is what Word does
-    // without us. The switch exists because this is the one thing WordTab now does that ends with
-    // several of the user's documents closed, and a machine where it surprises somebody needs a way
-    // to stop it without giving up the tabs. Every close still asks about unsaved work; the switch
-    // is about the scope of the command, not about safety.
-    g_closeStack = WordTabReadFlag(L"TabCloseStack", TRUE);
+    // What the title bar's x does, and the one switch here that is not a boolean:
+    //
+    //   1 (default)  ask - "close all N tabs", "close only this document", or cancel
+    //   2            close the whole stack without asking, which is what this did before it asked
+    //   0            close only the document in front, which is what Word does without WordTab
+    //
+    // Three states because the two ends are both real answers somebody might want standing, and the
+    // question is only worth asking of a person who has not already answered it. Read as a number
+    // rather than a flag for that reason; `settings.ps1` still shows it as on or off, because that
+    // script speaks in on and off and 2 is documented in the README beside TabFontSize.
+    g_closeStack = (int)WordTabReadNumber(L"TabCloseStack", 1);
 
     TaskbarStart();
 
-    LogWrite(L"StackStart  stacking=%s  altTab suppression=%s  detach=%s  close takes the stack=%s",
+    LogWrite(L"StackStart  stacking=%s  altTab suppression=%s  detach=%s  the window's x=%s",
              g_enabled ? L"on" : L"off (HKCU\\Software\\WordTab\\Stack=0)",
              g_altTab ? L"on" : L"off",
              g_tearOff ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTearOff=0)",
-             g_closeStack ? L"on" : L"off (HKCU\\Software\\WordTab\\TabCloseStack=0)");
+             g_closeStack == 2 ? L"the whole stack, no question (TabCloseStack=2)"
+           : g_closeStack == 1 ? L"asks: all, this one, or cancel"
+                               : L"this document only (TabCloseStack=0)");
 }
 
 void StackAttachFrame(HWND frame)
@@ -1921,6 +1930,119 @@ void StackCloseToRight(HWND from)
     CloseBatchStart(from, from, L"close to the right");
 }
 
+// ---------------------------------------------------------------------------------------------
+// What the x means, asked rather than assumed.
+//
+// The first version of this closed the whole stack outright, which is what the user asked for -
+// "you have to close all tabs individually - that needs fixing" - and it is also the one thing
+// WordTab does that ends with several of somebody's documents shut. Every unsaved one still gets
+// Word's own prompt and a cancel still stops the rest, so nothing can be lost silently; but a person
+// who meant "close this one" and got five closes has still been surprised by their own window.
+//
+// So the x asks. Three answers, and the middle one is the whole point of the change:
+//
+//   Close all N tabs          - what the button used to do on its own
+//   Close only this document  - what Word does without WordTab
+//   Cancel                    - nothing happens
+//
+// A task dialog rather than a MessageBox, because "Yes / No / Cancel" over the question "close all
+// tabs?" is exactly the shape where people click the wrong one: the answers here are two different
+// actions, not a yes and a no, and command links let each one say what it does. Reached through
+// GetProcAddress rather than by linking it: TaskDialogIndirect exists only in version 6 of
+// comctl32, which is present through Word's own activation context on every machine this will meet
+// - and "almost certainly present" is not a thing to stake a close button on. If it is not there,
+// the MessageBox below asks the same question in the words that fit three fixed buttons.
+// ---------------------------------------------------------------------------------------------
+
+#define CLOSE_ASK_ALL     101
+#define CLOSE_ASK_ONE     102
+
+typedef HRESULT (WINAPI *TaskDialogIndirectFn)(const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+
+// Which answer, as one of the three IDs above. IDCANCEL for anything that is not a clear yes to one
+// of the two actions - a dialog that failed to appear included, because a close button that acts on
+// an answer nobody gave is worse than one that does nothing.
+static int AskWhatToClose(HWND frame, int tabs)
+{
+    wchar_t name[128];
+    WordTabFrameTitle(frame, name, 128);
+
+    wchar_t heading[160];
+    _snwprintf(heading, 160, L"Close all %d tabs in this window?", tabs);
+    heading[159] = L'\0';
+
+    wchar_t allText[160];
+    _snwprintf(allText, 160, L"Close all %d tabs\nWord will ask about any with unsaved changes.", tabs);
+    allText[159] = L'\0';
+
+    wchar_t oneText[320];
+    _snwprintf(oneText, 320, L"Close only this document\n\"%s\" closes; the other %d stay open.",
+               name, tabs - 1);
+    oneText[319] = L'\0';
+
+    HMODULE comctl = GetModuleHandleW(L"comctl32.dll");
+    TaskDialogIndirectFn ask = comctl
+        ? (TaskDialogIndirectFn)(void*)GetProcAddress(comctl, "TaskDialogIndirect")
+        : NULL;
+
+    if (ask)
+    {
+        TASKDIALOG_BUTTON buttons[2];
+        buttons[0].nButtonID     = CLOSE_ASK_ALL;
+        buttons[0].pszButtonText = allText;
+        buttons[1].nButtonID     = CLOSE_ASK_ONE;
+        buttons[1].pszButtonText = oneText;
+
+        TASKDIALOGCONFIG config;
+        memset(&config, 0, sizeof(config));
+        config.cbSize             = sizeof(config);
+        config.hwndParent         = frame;
+        config.hInstance          = g_module;
+        config.dwFlags            = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION |
+                                    TDF_POSITION_RELATIVE_TO_WINDOW;
+        config.dwCommonButtons    = TDCBF_CANCEL_BUTTON;
+        config.pszWindowTitle     = L"WordTab";
+        config.pszMainInstruction = heading;
+        config.pButtons           = buttons;
+        config.cButtons           = 2;
+        config.nDefaultButton     = CLOSE_ASK_ALL;
+
+        int pressed = 0;
+        HRESULT hr = ask(&config, &pressed, NULL, NULL);
+        if (SUCCEEDED(hr))
+        {
+            LogWrite(L"stack  hwnd=0x%p  asked what the x meant: %s", (void*)frame,
+                     pressed == CLOSE_ASK_ALL ? L"close all"
+                   : pressed == CLOSE_ASK_ONE ? L"close only this one"
+                                              : L"cancelled");
+            return pressed;
+        }
+
+        LogWrite(L"stack  hwnd=0x%p  TaskDialogIndirect failed (hr=0x%08lX) - falling back to a "
+                 L"message box", (void*)frame, (unsigned long)hr);
+    }
+
+    // The fallback, and it is worded for the buttons it has rather than being the same sentence with
+    // worse controls. Yes/No/Cancel can carry two actions and an escape only if the question names
+    // which is which.
+    wchar_t text[420];
+    _snwprintf(text, 420,
+               L"This window has %d tabs in it.\n\n"
+               L"Yes\tclose all %d\n"
+               L"No\tclose only \"%s\"\n"
+               L"Cancel\tleave everything open",
+               tabs, tabs, name);
+    text[419] = L'\0';
+
+    int answer = MessageBoxW(frame, text, L"WordTab", MB_YESNOCANCEL | MB_ICONQUESTION);
+    LogWrite(L"stack  hwnd=0x%p  asked what the x meant (message box): %s", (void*)frame,
+             answer == IDYES ? L"close all" : answer == IDNO ? L"close only this one" : L"cancelled");
+
+    if (answer == IDYES) return CLOSE_ASK_ALL;
+    if (answer == IDNO)  return CLOSE_ASK_ONE;
+    return IDCANCEL;
+}
+
 // The title bar's x, Alt+F4, and the window menu's Close - all of which arrive as SC_CLOSE.
 //
 // The user's words: "you have to close all tabs individually - that needs fixing next time we edit."
@@ -1962,9 +2084,52 @@ BOOL StackCloseWindowCommand(HWND frame)
         return FALSE;
     }
 
-    LogWrite(L"stack  hwnd=0x%p  the window's own close: %d tab(s) go with it",
-             (void*)frame, JoinedCount());
-    StackCloseAll(frame);
+    int tabs = JoinedCount();
+
+    // Straight through when the user has said they never want the question. See StackStart: 1 asks,
+    // 2 does what the first version of this did.
+    if (g_closeStack == 2)
+    {
+        LogWrite(L"stack  hwnd=0x%p  the window's own close: %d tab(s) go with it "
+                 L"(TabCloseStack=2, not asking)", (void*)frame, tabs);
+        StackCloseAll(frame);
+        return TRUE;
+    }
+
+    int answer = AskWhatToClose(frame, tabs);
+
+    // **Everything is re-read after the dialog, nothing is carried across it.** A task dialog runs a
+    // modal loop, the janitor ticks inside it, and the row can be a different row by the time an
+    // answer comes back - Word can close a document, or open one, while the question is on screen.
+    // The same rule the tab context menu follows, and for the same reason.
+    member = Find(frame);
+    if (!member || !member->joined || !IsWindow(frame))
+    {
+        LogWrite(L"stack  hwnd=0x%p  the tab the x was pressed on has left the row while the "
+                 L"question was up - nothing closed", (void*)frame);
+        return TRUE;
+    }
+
+    if (answer == CLOSE_ASK_ALL)
+    {
+        LogWrite(L"stack  hwnd=0x%p  the window's own close: %d tab(s) go with it",
+                 (void*)frame, JoinedCount());
+        StackCloseAll(frame);
+        return TRUE;
+    }
+
+    if (answer == CLOSE_ASK_ONE)
+    {
+        // Word's own behaviour, routed through StackCloseTab rather than let through to Word: that
+        // is the one path that knows about the row - which tab to leave the user standing on, and
+        // that a close aimed at a window whose document has already gone must be dropped rather
+        // than shutting Word down.
+        LogWrite(L"stack  hwnd=0x%p  the window's own close: this document only", (void*)frame);
+        StackCloseTab(frame);
+        return TRUE;
+    }
+
+    LogWrite(L"stack  hwnd=0x%p  the window's own close: cancelled, nothing closed", (void*)frame);
     return TRUE;
 }
 

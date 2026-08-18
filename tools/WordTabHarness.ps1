@@ -434,11 +434,21 @@ $script:WordTabClasses = @(
     'WordTabStrip'     # a child today, but it is ours and the answer must not depend on that
 )
 
-function Get-WordWindowKind($class, $width, $height) {
+function Get-WordWindowKind($class, $width, $height, $title = '') {
     if ($class -eq 'OpusApp')  { return 'frame' }
     if ($class -eq '#32768')   { return 'menu' }
     if ($script:WordTabClasses -contains $class)    { return 'ours' }
     if ($script:WordChromeClasses -contains $class) { return 'chrome' }
+
+    # **The one window of ours that is not one of our own classes.** The add-in asks what the title
+    # bar's x means with a task dialog, and a task dialog is a plain `#32770` of the host process -
+    # indistinguishable by class and size from Word's save prompt, which is the shape every guard in
+    # this harness is built to stop a run over. Its title is the only thing that identifies it, and
+    # it is ours to set.
+    #
+    # Exactly the lesson the tooltip cost: a window this add-in puts on screen that reads as "Word is
+    # asking something" turns a whole battery red, naming a prompt that does not exist.
+    if ($title -eq 'WordTab') { return 'ours' }
 
     # A floor, as a second filter and not as the first one. Both measured prompts are 920 wide, so
     # this rejects only slivers - Word's zero-size hidden helpers and the 1x1 windows it parks
@@ -467,7 +477,7 @@ function Get-WordWindows {
                 Hwnd = $w.Hwnd; Class = $w.Class; Title = $w.Title; Pid = $id; Visible = $true
                 Left = $w.Left; Top = $w.Top; Right = $w.Right; Bottom = $w.Bottom
                 Width = $width; Height = $height
-                Kind = (Get-WordWindowKind $w.Class $width $height)
+                Kind = (Get-WordWindowKind $w.Class $width $height $w.Title)
             }
         }
     }
@@ -515,6 +525,26 @@ function Get-OurTopLevel($class) {
                 Left   = $w.Left;  Top    = $w.Top
                 Right  = $w.Right; Bottom = $w.Bottom
                 Width  = $w.Right - $w.Left
+                Height = $w.Bottom - $w.Top
+            }
+        }
+    }
+    return $null
+}
+
+# The add-in's "what did the x mean" question, or $null. Found by TITLE, not by class: it is a task
+# dialog, so its class is `#32770` and Word's own prompts are `#32770` too. See Get-WordWindowKind.
+function Get-WordTabAsk {
+    foreach ($id in @(Get-WordPidList)) {
+        foreach ($w in [WordLayout]::TopLevel($id)) {
+            if (-not $w.Visible) { continue }
+            if ($w.Title -ne 'WordTab') { continue }
+            if ($w.Class -eq 'OpusApp') { continue }     # a Word window whose document is called WordTab
+            return [pscustomobject]@{
+                Hwnd  = $w.Hwnd; Class = $w.Class; Title = $w.Title; Pid = $id
+                Left  = $w.Left;  Top    = $w.Top
+                Right = $w.Right; Bottom = $w.Bottom
+                Width = $w.Right - $w.Left
                 Height = $w.Bottom - $w.Top
             }
         }
@@ -1365,6 +1395,13 @@ if ($script:HarnessSelfTest) {
     # it out, at every size, which is exactly the lesson the tooltip cost.
     Check ((Get-WordWindowKind 'WordTabGhost' 448 72) -eq 'ours') "WordTab's carried tab is ours, not a question"
     Check ((Get-WordWindowKind 'WordTabGhost' 78 72) -eq 'ours')  'and it is still ours when the row has squeezed it below the size floor'
+
+    # The add-in's own task dialog - the x asking what it meant. Class and size are Word's save
+    # prompt's exactly, so the title is the whole of the difference, and getting this wrong stops
+    # every run in the battery with a report of a prompt nobody raised.
+    Check ((Get-WordWindowKind '#32770' 800 400 'WordTab') -eq 'ours') "WordTab's own question is ours, not Word's"
+    Check ((Get-WordWindowKind '#32770' 800 400 'Microsoft Word') -eq 'question') 'and a #32770 that is NOT ours is still a question'
+    Check ((Get-WordWindowKind '#32770' 1440 960) -eq 'question')      'including one asked about with no title at all'
 
     $total = $script:selfPass + $script:selfFail
     Write-Host ''
