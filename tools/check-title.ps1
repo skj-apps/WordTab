@@ -384,6 +384,17 @@ if (Test-Path $dir) { Remove-Item -Path $dir -Recurse -Force }
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
 
 # wdFormatXMLDocument = 12, wdFormatDocument97 = 0, wdFormatRTF = 6
+#
+# These names are SHORT on purpose, and the shortness is load-bearing in two later sections: one draws
+# a trimmed name and asserts the ink stops short of the tab's right edge, and its partner turns the trim
+# off and asserts the restored annotation pushes that same name out to an ellipsis. Both need a name a
+# tab can hold, with the annotation as the only thing that overflows it.
+#
+# Lengthening them is therefore not a way to make a name be cut, and it was tried: when the label font
+# went from 12 to 10 logical px these names started FITTING, which broke the tooltip section below, and
+# names near 45 characters fixed that section by breaking five assertions in these two. The cut-name
+# path is driven by the annotation and by the single-document section at the end of this file, not by
+# the length of a filename.
 $fixtures = @(
     @{ Key = 'docx';      File = 'Quarterly report.docx';        Format = 12
        Expect = 'Quarterly report.docx';        Why = 'a plain .docx is left completely alone' }
@@ -622,11 +633,19 @@ for ($i = 0; $i -lt $tabCount; $i++) {
 $shown = @($hovered | Where-Object { $null -ne $_.Tip })
 Write-Note "$($shown.Count) of $tabCount tabs produced a tooltip"
 
-# At this width every one of the seven names is cut, so every one of them has something to add. A
-# tab that produced nothing here means a slot that was not a tab - which is what a scrolled row looks
-# like from outside, and is the failure this section's own width fixture exists to prevent.
-Assert ($shown.Count -eq $tabCount) `
-    "every one of the $tabCount tabs was reachable and produced a panel ($($shown.Count))"
+# Every SAVED fixture has something to add - a name the row had to cut, and a folder - so every one of
+# them must produce a panel. A fixture tab that produced nothing means a slot that was not a tab, which
+# is what a scrolled row looks like from outside, and is the failure this section's width fixture exists
+# to prevent.
+#
+# The unsaved document is not in that count, and this used to say $tabCount - all seven. It passed only
+# because `Document1` was being cut too, which was true at the width of the day and stopped being true
+# when the label font got smaller. Nine characters is not a name a tab cannot fit, the document has no
+# folder to name, so there is nothing for a panel to say and none appears. The loop above already
+# expects that ("a tooltip that is absent is a real answer here"); this line was the one place that
+# disagreed with it, and the count made the disagreement look like a product defect.
+Assert ($shown.Count -eq $fixtures.Count) `
+    "each of the $($fixtures.Count) saved fixtures produced a panel, and the unsaved document did not ($($shown.Count))"
 
 # ---- what it says --------------------------------------------------------------------------------
 #
@@ -696,9 +715,23 @@ if ($pvTip) {
 # - so an assertion here that `Document1` produces nothing would be an assertion about how wide Word
 # happened to be. It failed for exactly that reason on its first run inside the battery: at 900px the
 # name was cut, the panel was right to appear, and the suite was wrong to say it should not.
+#
+# It used to assert the counts were EQUAL, and that held only while every name in the row happened to be
+# cut. The label font going from 12 to 10 made these names fit, the panels were still right - they name a
+# folder the row never shows - and the equality turned a correct product into five red lines. What is
+# actually true is that a panel must have a reason, so that is what is asserted: every one of them names
+# a folder, and no tab was logged as cut without a panel to show for it.
 $cut = @(Get-LogSince 'name was cut')
-Assert ($cut.Count -eq $shown.Count) `
-    "each of the $($shown.Count) panels was raised on a tab whose name had been cut ($($cut.Count) logged)"
+#
+# Every one of them except the Protected View document, which is the one fixture Word will not place -
+# asserted directly above, where its missing folder line is the point rather than an exception to be
+# worked around. Its panel earns its place by naming the document at all, which is the only thing that
+# can be said about a file the object model will not admit to holding.
+$noReason = @($shown | Where-Object { $_.Tip.Folder -eq '' -and $_.Tip.Name -ne $pvFix.Expect })
+Assert ($noReason.Count -eq 0) `
+    "each panel had something to add - the folder, or in Protected View's case the name ($($noReason.Count) with nothing)"
+Assert ($cut.Count -le $shown.Count) `
+    "no tab was cut without a panel to say so ($($cut.Count) cut, $($shown.Count) panels)"
 
 # ---- and it is not a dialog ------------------------------------------------------------------------
 #

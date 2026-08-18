@@ -50,6 +50,28 @@
 #define PLUS_LOGICAL       26    // the new-document button's width
 #define CHEVRON_LOGICAL    20    // one scroll button, and there are two of them
 
+// The label's type size, in logical pixels. A tab is TAB_LOGICAL_W wide whatever this is - the row's
+// geometry is not derived from the text - so this is purely how many characters of a document's name
+// survive before the ellipsis.
+//
+// 10 rather than 11, and that is the measurement rather than a preference. Segoe UI in the label rect
+// this layout leaves (TAB_LOGICAL_W less the inset, the close button and the pad), against three
+// ordinary Word filenames:
+//
+//     12px   31/34   32/47   29/31     every one of them cut
+//     11px   33/34   33/47   30/31     every one of them still cut
+//     10px   34/34   40/47   31/31     two of the three now whole
+//
+// 11 is the size that looks like it helps and does not: it buys one or two characters and leaves the
+// ellipsis exactly where it was. The step that crosses the threshold for a normal filename is 10.
+//
+// Deliberately not Word's 12. Matching the ribbon is the right instinct for a control sitting under
+// it, and the wrong trade here: this strip's job is to tell one document from another at a glance,
+// which wants more of the name rather than type that matches. Anybody who disagrees has TabFontSize.
+#define TAB_LOGICAL_FONT   10
+#define TAB_FONT_MIN        8    // below this the name is a texture, not a word
+#define TAB_FONT_MAX       16    // above this the descenders meet STRIP_LOGICAL_H
+
 // How fast the row scrolls while a tab is being carried against one end of it. Per tick of
 // DRAG_SCROLL_MS, so this is 16 logical px every 60ms - about a tab a second at the minimum width,
 // which is fast enough to cross a full row while the hand stays still and slow enough to stop on the
@@ -317,6 +339,12 @@ static BOOL g_titleTrimEnabled = TRUE;   // HKCU\Software\WordTab\TabTitleTrim
 static BOOL g_dotEnabled = TRUE;         // HKCU\Software\WordTab\TabDot
 static BOOL g_tipEnabled = TRUE;         // HKCU\Software\WordTab\TabTip
 static BOOL g_ghostEnabled = TRUE;       // HKCU\Software\WordTab\TabGhost
+
+// HKCU\Software\WordTab\TabFontSize - the label's size in logical pixels, absent meaning the default.
+// A number rather than a switch, and offered because "small enough to read the name, large enough to
+// read at all" is a judgement about one person's monitor and eyes, not a fact this file can hold. The
+// work rig is a laptop beside a 40" panel and nobody here can see either of them.
+static int g_fontLogical = TAB_LOGICAL_FONT;
 
 // Set once at StripStart, and only when HKCU\Software\WordTab\TabDpi already held a usable value.
 // It makes the janitor watch for that value changing; see the janitor for why the real event cannot
@@ -977,7 +1005,7 @@ static void MakeFont(StripState* state)
 
     LOGFONTW lf;
     memset(&lf, 0, sizeof(lf));
-    lf.lfHeight  = -Scaled(12, state->dpi);
+    lf.lfHeight  = -Scaled(g_fontLogical, state->dpi);
     lf.lfWeight  = FW_NORMAL;
     lf.lfCharSet = DEFAULT_CHARSET;
     lf.lfQuality = CLEARTYPE_QUALITY;
@@ -1019,11 +1047,13 @@ static void ApplyMetrics(StripState* state)
     MakeFont(state);
     ReleaseSurface(state);        // its size is in physical pixels, so it is DPI-dependent too
 
-    // The two numbers every other size in this file is derived from. Logged here rather than at the
-    // call sites because this is the one place they are set, and a suite that wants to know what
-    // scale a strip was built at should not have to infer it from a rectangle.
-    LogWrite(L"strip  hwnd=0x%p  metrics: dpi=%d  stripH=%dpx (%d logical)",
-             (void*)state->frame, state->dpi, state->stripH, STRIP_LOGICAL_H);
+    // The numbers every other size in this file is derived from. Logged here rather than at the call
+    // sites because this is the one place they are set, and a suite that wants to know what scale a
+    // strip was built at should not have to infer it from a rectangle. The type size is here too for
+    // the same reason: a label that comes out the wrong size on a machine nobody here can see is
+    // answered by reading what it was built at, not by measuring a screenshot.
+    LogWrite(L"strip  hwnd=0x%p  metrics: dpi=%d  stripH=%dpx (%d logical)  font=%d logical",
+             (void*)state->frame, state->dpi, state->stripH, STRIP_LOGICAL_H, g_fontLogical);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5812,6 +5842,22 @@ void StripStart(void)
     // document with a window this add-in owns, and that is the kind of thing a machine somewhere
     // will render badly; the tear-off itself should not have to be given up over it.
     g_ghostEnabled = WordTabReadFlag(L"TabGhost", TRUE);
+
+    // Clamped rather than trusted. This is a DWORD anybody can type into regedit, it is fed to
+    // CreateFontIndirect, and the two ends of the range fail differently: 0 means "let the mapper
+    // choose", which is a font this file did not pick, and a large number draws a label taller than
+    // the strip that clips instead of erroring. A value out of range is a typo, so the clamp keeps
+    // the tabs legible and says so in the log rather than honouring it.
+    {
+        DWORD wanted = WordTabReadNumber(L"TabFontSize", (DWORD)TAB_LOGICAL_FONT);
+        int   size   = (int)wanted;
+        if (size < TAB_FONT_MIN) size = TAB_FONT_MIN;
+        if (size > TAB_FONT_MAX) size = TAB_FONT_MAX;
+        if ((DWORD)size != wanted)
+            LogWrite(L"strip  TabFontSize=%lu is outside %d..%d - using %d",
+                     (unsigned long)wanted, TAB_FONT_MIN, TAB_FONT_MAX, size);
+        g_fontLogical = size;
+    }
 
     if (!g_stripClass)
     {
