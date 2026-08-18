@@ -79,6 +79,16 @@ foreach ($key in $keys) {
 }
 
 Write-Step 'Removing files'
+# Before the folder, because this points into it. A shortcut left behind in the Start menu is the
+# kind of residue that outlives everything else and makes an uninstall look like it did not work.
+$StartMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'WordTab Report.lnk'
+if (Test-Path $StartMenu) {
+    Remove-Item -Path $StartMenu -Force
+    Write-Ok "removed $StartMenu"
+} else {
+    Write-Note "not present  $StartMenu"
+}
+
 if (Test-Path $InstallDir) {
     # This folder holds the copy of THIS script that Settings > Apps runs, and deleting it out from
     # under itself is fine: PowerShell reads a -File script in full and closes the handle before the

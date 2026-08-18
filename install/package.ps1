@@ -248,7 +248,10 @@ IF YOU WANT TO TURN SOMETHING OFF
 
 IF SOMETHING IS WRONG
 
-  RUN THIS AND SEND THE FILE IT WRITES:
+  PRESS START, TYPE  WordTab , OPEN  "WordTab Report"  - AND SEND THE FILE IT WRITES.
+
+  The installer puts it there. There is nothing to find and no shell to open. From this folder,
+  if you still have it, the same thing is:
 
          powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Report
 

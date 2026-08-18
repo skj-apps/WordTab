@@ -48,6 +48,10 @@ It verifies the DLL against a SHA256 recorded in the package, clears the mark-of
 downloaded zip leaves on it, registers the add-in, and checks the class actually activates. Then
 start Word and open two documents.
 
+An install leaves `settings.ps1` and a double-clickable `WordTab Report.cmd` beside the DLL, with a
+Start menu shortcut to it - so on a machine you cannot reach, "press Start, type WordTab, send me the
+file" is the whole of the diagnostic procedure.
+
 Removing it leaves nothing behind. The install lists itself in Settings > Apps > Installed apps,
 which is where anyone who did not read this will look, and that entry runs the same script:
 

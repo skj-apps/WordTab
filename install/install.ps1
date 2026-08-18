@@ -208,6 +208,45 @@ $installedUninstaller = Join-Path $InstallDir 'uninstall.ps1'
 try { Unblock-File -Path $installedUninstaller -ErrorAction Stop } catch { }
 Write-Ok $installedUninstaller
 
+# The diagnostic travels with the install for the same reason the uninstaller does, and for one more:
+# it is the ONLY way to see a machine nobody here can reach. Asking for it after something has gone
+# wrong is too late if it went out of existence with the temp folder the .cmd unpacked into.
+#
+# common.ps1 as well, because settings.ps1 dot-sources it and says so by name rather than guessing.
+foreach ($tool in @('settings.ps1', 'common.ps1')) {
+    $from = Join-Path $PSScriptRoot $tool
+    if (-not (Test-Path $from)) {
+        throw "install\$tool is missing. It sits beside this script in both the repo and a package; copy the whole folder rather than install.ps1 on its own."
+    }
+    Copy-Item -Path $from -Destination $InstallDir -Force
+    try { Unblock-File -Path (Join-Path $InstallDir $tool) -ErrorAction Stop } catch { }
+}
+
+# And something to double-click. A .ps1 is no more runnable at diagnosis time than it was at install
+# time - that is the whole reason install\make-onefile.ps1 exists - and the moment someone needs this
+# is the moment they are least able to be walked through opening a shell in a hidden folder.
+#
+# It clears PSModulePath for the reason written out at length in make-onefile.ps1: inherited from a
+# PowerShell 7 terminal it makes Windows PowerShell lose Get-FileHash, which this report needs, and
+# the failure reads as a broken tool rather than a borrowed variable.
+$ReportCmd = Join-Path $InstallDir 'WordTab Report.cmd'
+@'
+@echo off
+setlocal
+title WordTab report
+echo.
+echo   Collecting everything needed to work out what WordTab is doing on this PC.
+echo   This only READS. Nothing is installed, changed or removed.
+echo.
+set "PSModulePath="
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1" -Report
+echo.
+echo   Send the file named above.
+echo.
+pause
+'@ | Set-Content -Path $ReportCmd -Encoding ASCII
+Write-Ok $ReportCmd
+
 # ---- register ------------------------------------------------------------------------------------
 
 function Set-Default($path, $value) {
@@ -396,6 +435,26 @@ New-ItemProperty -Path $ArpKey -Name 'EstimatedSize' -Value $sizeKb -PropertyTyp
 # value at a file that has none makes Windows draw a blank where the generic app icon would be.
 Write-Ok "'$FriendlyNm', version $BuildId, $sizeKb KB"
 
+# One shortcut in the user's own Start menu, so the report is found the way everything else on
+# Windows is found: press Start, type WordTab. The alternative was telling somebody to navigate to a
+# folder under AppData, which is hidden by default - a diagnostic nobody can reach is not one.
+#
+# Per-user Programs, not All Users: the same no-admin rule as the rest of this script.
+$StartMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'WordTab Report.lnk'
+try {
+    $shell = New-Object -ComObject WScript.Shell
+    $link  = $shell.CreateShortcut($StartMenu)
+    $link.TargetPath       = $ReportCmd
+    $link.WorkingDirectory = $InstallDir
+    $link.Description      = 'Write a WordTab diagnostic report to your Desktop. Reads only.'
+    $link.Save()
+    Write-Ok "Start menu: type WordTab to find '$(Split-Path $StartMenu -Leaf)'"
+} catch {
+    # Not fatal. The report is still on disk and the installer prints where; a missing shortcut costs
+    # discoverability, not the diagnostic itself.
+    Write-Note "could not add the Start menu shortcut ($($_.Exception.Message))"
+}
+
 Write-Host ''
 Write-Host 'Installed.' -ForegroundColor Green
 if ($NoBanner) {
@@ -405,5 +464,6 @@ if ($NoBanner) {
     Write-Host "  Start Word. Expect a 'WordTab is loaded inside Word' dialog." -ForegroundColor Gray
 }
 Write-Host "  Log: $env:LOCALAPPDATA\WordTab\wordtab.log" -ForegroundColor Gray
+Write-Host '  If anything looks wrong: press Start, type WordTab, open "WordTab Report".' -ForegroundColor Gray
+Write-Host '  It writes a file to your Desktop. Send that file.' -ForegroundColor Gray
 Write-Host "  Remove it from Settings > Apps > Installed apps, like any other program." -ForegroundColor Gray
-Write-Host "  Or run: $installedUninstaller" -ForegroundColor Gray
