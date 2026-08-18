@@ -273,3 +273,70 @@ assertion about the stack's member array, which is `check-reorder`'s subject.
   that it went in far less time than the auto-hide would take — which is the check that matters. That
   the panel *would* eventually go on its own is untested; it is one `SetTimer` and it would cost the
   suite five seconds of standing still.
+
+---
+
+## 2026-08-17: the intermittent, found and measured
+
+`check-title`'s `title` suite went red once in a battery: **one tab of seven produced no tooltip in
+4020ms and NO LOG LINE AT ALL**, and then never did it again in 208 further attempts. The reading
+recorded at the time - "so `TipShow` was never reached" - was wrong, and the way it was wrong is the
+useful part: **`TipShow` had four exits that returned without writing anything**, so a tooltip
+abandoned before it was shown and a hover that never happened produced identical evidence. "No panel
+and nothing logged" meant three different things and named none of them.
+
+### The mechanism
+
+`StripRefreshTabs` called `TipStop`, and `TipStop` does two jobs: it takes down a panel that is UP,
+and it cancels a timer that is merely PENDING. Only the first is what a row change wants.
+
+A pointer resting on a tab sends no further `WM_MOUSEMOVE`. So nothing re-arms it. **Any change to
+the row inside that half second - a dot coming on in another document, a title Word rewrote, a window
+activating - meant the tooltip never appeared at all, for as long as the hand stayed still.** Not
+delayed: never. And silently, because a tooltip that was never shown has nothing to log about being
+hidden.
+
+Nothing about a pending arm can be made stale by a row change, which is what makes the cancel pure
+loss. `TipShow` re-reads everything when it fires: it hit-tests where the pointer is *now*, reads the
+tab's name *now*, and asks Word for the folder *now*.
+
+### The measurement
+
+`tools\probe-tip.ps1`, three documents, the pointer parked off the row before each hover. `-Churn`
+flips `Document.Saved` on document 1 - **never the document being hovered** - immediately before the
+pointer arrives, so the janitor's next 500ms poll refreshes the row somewhere inside the window where
+the tooltip is being waited for.
+
+| build | quiet | with churn |
+|---|---|---|
+| before | 12 of 12 tooltips | **0 of 12**, and **0 log lines** |
+| after  | 12 of 12 tooltips | 12 of 12 tooltips |
+
+The 0-of-12 with 0 log lines is the reported failure reproduced exactly, including its silence. The
+quiet column is the control that says the churn is what did it.
+
+### What changed
+
+- **`TipRowChanged`**, which is what `StripRefreshTabs` now calls. It takes down a panel that is
+  visible and leaves a pending arm alone.
+- **Every exit in `TipShow` says so.** Four were silent.
+- **A pointer that is on a different tab when the timer fires restarts the wait there** instead of
+  dropping it. Same defect in a second dress: half a second is long enough for the row to have
+  scrolled under a still hand, and a still hand sends no `WM_MOUSEMOVE` to start the clock again. It
+  terminates - the next fire hit-tests the same point against the same layout and matches.
+
+### What this does not explain
+
+The `title` failure it reproduces is the same shape, but the archived log for that run shows **no
+`dot`, `tab name`, `stack` or `relayout` line anywhere in the 6.5 seconds** the tab was being
+hovered. Almost every caller of `StripRefreshTabs` logs before calling it; the two that can reach it
+silently are a scroll step inside the 250ms log throttle and the drag re-layout in `DragMove`, and
+neither was happening - nothing was being dragged, and the suite widens Word specifically so the
+seven tabs do not scroll.
+
+So the mechanism is measured but **the trigger on that particular day is still not named**, and it
+may be a fourth thing rather than a refresh at all: a `WM_MOUSEMOVE` that never reached the strip
+would look identical, and this project has already been bitten twice by injected input that did not
+take. That is what the logging half is for. **If `title` goes red again the log now says which of
+these it was** - a restart on another tab, an abandonment with its reason, or still nothing at all,
+which would rule the whole `TipShow` family out by elimination and point at the arm never happening.

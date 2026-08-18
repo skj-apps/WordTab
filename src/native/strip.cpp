@@ -4017,6 +4017,25 @@ static void TipStop(void)
     g_tipFolder[0] = L'\0';
 }
 
+// What a change to the row wants, which is not the same thing as TipStop.
+//
+// A panel that is UP describes a row that has just changed underneath it, so it goes. A timer that
+// is merely PENDING describes nothing yet: TipShow re-hit-tests the pointer, re-reads the tab's name
+// and re-asks Word for the folder when it fires, so there is nothing about a pending arm that a row
+// change can make stale.
+//
+// Killing it anyway was a real defect and not a tidy one. A pointer resting on a tab sends no
+// further WM_MOUSEMOVE, so nothing re-arms: any row change landing inside that half second - a dot
+// coming on in another document, a title Word rewrote, a window activating - meant the tooltip never
+// appeared at all, for as long as the hand stayed still. Silently, because a tooltip that was never
+// shown has nothing to log about being hidden.
+static void TipRowChanged(void)
+{
+    StripState* state = g_tipStrip ? FindByStrip(g_tipStrip) : NULL;
+    if (state && state->tip && IsWindow(state->tip) && IsWindowVisible(state->tip))
+        TipStop();
+}
+
 // Start the clock on a tab the pointer has arrived at.
 //
 // The early return on "already this tab" is what makes the delay mean what it says. WM_MOUSEMOVE
@@ -4174,24 +4193,54 @@ static void TipShow(StripState* state, HWND hwnd)
     // Where the pointer is *now*, not where it was when the timer was armed. Half a second is long
     // enough for the row to have scrolled under a still hand, for that document to have been closed,
     // or for the pointer to have been moved by something that sends no mouse message at all.
+    //
+    // Every exit below says so in the log, and that is the point of them rather than a courtesy. An
+    // intermittent red `title` - one tab of seven producing no panel, once in a hundred - could not
+    // be told apart from a hover that never happened at all, because a tooltip that is abandoned
+    // before it is shown had nothing to say. "No tooltip and no log line" meant three different
+    // things and named none of them.
     POINT cursor;
     POINT client;
     if (!GetCursorPos(&cursor))
     {
+        LogWrite(L"tip: hwnd=0x%p  abandoned - Windows would not say where the pointer is",
+                 (void*)g_tipFrame);
         TipStop();
         return;
     }
     client = cursor;
     if (!ScreenToClient(hwnd, &client))
     {
+        LogWrite(L"tip: hwnd=0x%p  abandoned - the pointer could not be put in strip coordinates",
+                 (void*)g_tipFrame);
         TipStop();
         return;
     }
 
     StripHit hit = HitTestStrip(state, hwnd, client);
-    if (!hit.frame || hit.frame != g_tipFrame)
+    if (hit.frame != g_tipFrame)
     {
+        // Half a second is long enough for the row to have scrolled under a still hand, for the tab
+        // to have gone, or for the pointer to have been moved by something that sends no mouse
+        // message at all. Dropping it silently was wrong twice: nothing recorded it, and nothing
+        // brought it back either - a still pointer sends no WM_MOUSEMOVE, so the wait that would
+        // have started the clock again never happens.
+        //
+        // Starting again on whatever tab IS under the pointer terminates: the next fire hit-tests
+        // the same point against the same layout and matches. It only repeats while the row is
+        // being rearranged twice a second, which the log is already full of when it is true.
+        HWND armed = g_tipFrame;
         TipStop();
+        if (hit.frame)
+        {
+            LogWrite(L"tip: hwnd=0x%p  the pointer is on 0x%p now - starting the wait again there",
+                     (void*)armed, (void*)hit.frame);
+            TipArm(hwnd, hit.frame);
+        }
+        else
+        {
+            LogWrite(L"tip: hwnd=0x%p  abandoned - the pointer is no longer on a tab", (void*)armed);
+        }
         return;
     }
 
@@ -4234,6 +4283,8 @@ static void TipShow(StripState* state, HWND hwnd)
 
     if (!TipEnsure(state))
     {
+        LogWrite(L"tip: hwnd=0x%p  abandoned - the panel window could not be created",
+                 (void*)hit.frame);
         TipStop();
         return;
     }
@@ -4246,6 +4297,8 @@ static void TipShow(StripState* state, HWND hwnd)
         HDC dc = GetDC(hwnd);
         if (!dc)
         {
+            LogWrite(L"tip: hwnd=0x%p  abandoned - no device context to measure the text with",
+                     (void*)hit.frame);
             TipStop();
             return;
         }
@@ -5204,7 +5257,10 @@ void StripRefreshTabs(void)
     // has to know about the tooltip, rather than each of them. A tab that scrolls out from under its
     // own tooltip, or closes while it is up, would otherwise leave a panel naming a document that is
     // no longer there for as long as the auto-hide takes.
-    TipStop();
+    //
+    // TipRowChanged and not TipStop: this used to cancel a tooltip that had been ARMED and not yet
+    // shown, which no row change can invalidate and which nothing re-arms while the hand is still.
+    TipRowChanged();
 
     for (int i = 0; i < g_stripCount; i++)
     {
