@@ -247,6 +247,42 @@ pause
 '@ | Set-Content -Path $ReportCmd -Encoding ASCII
 Write-Ok $ReportCmd
 
+# And an off switch that is a thing you can double-click, for the same reason the report is one.
+#
+# Word already has an off switch - the tick box in File > Options > Add-ins > COM Add-ins - and these
+# files write the value that dialog writes rather than a second one. Two reasons they exist anyway: a
+# corporate policy can hide that dialog, and "press Start, type WordTab" is findable by somebody who
+# does not know Word has an add-ins page at all. Neither file decides anything; both hand off to
+# settings.ps1, which holds the one implementation.
+$OffCmd = Join-Path $InstallDir 'WordTab Off.cmd'
+@'
+@echo off
+setlocal
+title WordTab off
+echo.
+echo   Turning WordTab OFF. Word will start with no tabs, exactly as it did before it was installed.
+echo   WordTab stays installed and nothing else is changed - put it back with "WordTab On".
+echo.
+set "PSModulePath="
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1" -Off
+pause
+'@ | Set-Content -Path $OffCmd -Encoding ASCII
+Write-Ok $OffCmd
+
+$OnCmd = Join-Path $InstallDir 'WordTab On.cmd'
+@'
+@echo off
+setlocal
+title WordTab on
+echo.
+echo   Turning WordTab back ON.
+echo.
+set "PSModulePath="
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0settings.ps1" -On
+pause
+'@ | Set-Content -Path $OnCmd -Encoding ASCII
+Write-Ok $OnCmd
+
 # ---- register ------------------------------------------------------------------------------------
 
 function Set-Default($path, $value) {
@@ -440,20 +476,36 @@ Write-Ok "'$FriendlyNm', version $BuildId, $sizeKb KB"
 # folder under AppData, which is hidden by default - a diagnostic nobody can reach is not one.
 #
 # Per-user Programs, not All Users: the same no-admin rule as the rest of this script.
-$StartMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'WordTab Report.lnk'
-try {
-    $shell = New-Object -ComObject WScript.Shell
-    $link  = $shell.CreateShortcut($StartMenu)
-    $link.TargetPath       = $ReportCmd
-    $link.WorkingDirectory = $InstallDir
-    $link.Description      = 'Write a WordTab diagnostic report to your Desktop. Reads only.'
-    $link.Save()
-    Write-Ok "Start menu: type WordTab to find '$(Split-Path $StartMenu -Leaf)'"
-} catch {
-    # Not fatal. The report is still on disk and the installer prints where; a missing shortcut costs
-    # discoverability, not the diagnostic itself.
-    Write-Note "could not add the Start menu shortcut ($($_.Exception.Message))"
+#
+# Three of them now, and the off switch is the reason the list is worth being: somebody whose Word is
+# behaving strangely should be able to find the way to stand this add-in down by typing its name into
+# Start, without knowing that the answer lives in Word's own options or in a folder under AppData.
+$Shortcuts = @(
+    @{ Name = 'WordTab Report.lnk'; Target = $ReportCmd
+       Desc = 'Write a WordTab diagnostic report to your Desktop. Reads only.' }
+    @{ Name = 'WordTab Off.lnk';    Target = $OffCmd
+       Desc = 'Stop WordTab loading into Word, leaving it installed.' }
+    @{ Name = 'WordTab On.lnk';     Target = $OnCmd
+       Desc = 'Let WordTab load into Word again.' }
+)
+$Programs = [Environment]::GetFolderPath('Programs')
+foreach ($s in $Shortcuts) {
+    $path = Join-Path $Programs $s.Name
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $link  = $shell.CreateShortcut($path)
+        $link.TargetPath       = $s.Target
+        $link.WorkingDirectory = $InstallDir
+        $link.Description      = $s.Desc
+        $link.Save()
+        Write-Ok "Start menu: $($s.Name)"
+    } catch {
+        # Not fatal. Every one of these is a .cmd on disk that the installer has already printed the
+        # path of; a missing shortcut costs discoverability, not the thing itself.
+        Write-Note "could not add $($s.Name) ($($_.Exception.Message))"
+    }
 }
+Write-Note 'Press Start and type WordTab to find them.'
 
 Write-Host ''
 Write-Host 'Installed.' -ForegroundColor Green

@@ -25,20 +25,37 @@ measured, not assumed — so the add-in is native C++ with no framework dependen
 
 ## Installing
 
+**On the machine you actually want tabs on: download the one file from
+[Releases](https://github.com/skj-apps/WordTab/releases/latest), close Word, and double-click it.**
+That is the whole procedure. `WordTab-Install-<commit>.cmd` carries the entire package inside itself —
+nothing to unzip, no shell to open, no admin rights, and the commit in its name says which build it
+is before you run it.
+
+Everything below is for building it, not for installing it.
+
 On a machine with the toolchain (see *Building*):
 
 ```
 pwsh -File install\install.ps1 -NoBanner
 ```
 
-On a machine with **no compiler** — which is the point — build a package on a machine that has one:
+On a machine with **no compiler** — which is the point — build and publish from a machine that has
+one:
 
 ```
-pwsh -File install\package.ps1
+pwsh -File install\publish.ps1
 ```
 
-That writes a ~113KB zip to `dist\`. Copy it to the target machine by any means, unzip it, close
-Word, and from a PowerShell prompt in that folder:
+That packages the current commit, wraps it into the one-file installer, and attaches that file to a
+GitHub release, which is the download link above. To stop before publishing:
+
+```
+pwsh -File install\package.ps1        # -> dist\WordTab-<date>-<commit>.zip
+pwsh -File install\make-onefile.ps1   # -> dist\WordTab-Install-<commit>.cmd
+```
+
+The zip is the same payload for anyone who would rather see the parts. Copy it to the target machine
+by any means, unzip it, close Word, and from a PowerShell prompt in that folder:
 
 ```
 powershell -ExecutionPolicy Bypass -File install\install.ps1
@@ -58,6 +75,25 @@ which is where anyone who did not read this will look, and that entry runs the s
 ```
 powershell -ExecutionPolicy Bypass -File install\uninstall.ps1
 ```
+
+## Turning it off and on
+
+The whole add-in, in or out, without uninstalling it. Three ways, and the first needs nothing but Word:
+
+- **In Word:** File > Options > Add-ins > *Manage: COM Add-ins* > Go, and untick **WordTab**. This is
+  Word's own switch, so it is the one to reach for first.
+- **Press Start, type WordTab** and open **WordTab Off** (or **WordTab On**). The installer leaves both
+  as double-clickable shortcuts, for the case where corporate policy has hidden Word's add-ins page, or
+  where somebody does not know Word has one.
+- `settings.ps1 -Off` / `settings.ps1 -On`, which is what those two shortcuts run.
+
+All three write the same `LoadBehavior` value under the add-in's own key rather than inventing a second
+idea of "off", so Word's tick box and these agree. Off means Word never loads the DLL at all — measured
+rather than assumed: with it off, starting Word and opening a document adds **0 bytes** to the add-in's
+log; with it on, the same actions add about 4.5KB. Nothing is removed and no setting is changed, so
+turning it back on restores exactly the WordTab that was there.
+
+Word reads this when it starts, so close Word completely either way.
 
 ## Turning parts of it off
 
@@ -79,6 +115,24 @@ startup, so close Word completely after changing one. The two most likely to be 
 
 `settings.ps1` also prints what the add-in itself reported at the last Word startup. If that
 disagrees with the table, believe the add-in.
+
+### The size of the tab names
+
+Tab labels are drawn at 10 logical pixels, which is smaller than Word's own ribbon on purpose: a tab
+is TAB_LOGICAL_W wide whatever the type size, so the size decides only how much of a document's name
+survives before the ellipsis. Measured against ordinary Word filenames in the label rect this layout
+leaves, 12px cut all three of them, 11px still cut all three, and 10px left two of the three whole.
+
+Whether that is small enough — or too small — is a judgement about one person's monitor, so it is a
+number rather than a switch. It is not offered by `settings.ps1`, which speaks in on and off:
+
+```
+powershell -Command "Set-ItemProperty 'HKCU:\Software\WordTab' TabFontSize 12 -Type DWord"
+powershell -Command "Remove-ItemProperty 'HKCU:\Software\WordTab' TabFontSize"   # back to 10
+```
+
+Anything outside 8..16 is treated as a typo: the strip clamps to that range and says so in the log.
+Close Word completely for a change to take effect.
 
 ## How it works
 

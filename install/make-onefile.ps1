@@ -29,7 +29,8 @@
   The package .zip to embed. Defaults to the newest in dist\.
 
 .PARAMETER OutFile
-  Where to write the .cmd. Defaults to dist\WordTab-Install.cmd.
+  Where to write the .cmd. Defaults to dist\WordTab-Install-<commit>.cmd, taking the commit from the
+  zip's own name so the build is legible without running it.
 #>
 [CmdletBinding()]
 param(
@@ -50,7 +51,19 @@ if (-not $Zip) {
     $Zip = $newest.FullName
 }
 if (-not (Test-Path $Zip)) { throw "No such package: $Zip" }
-if (-not $OutFile) { $OutFile = Join-Path $DistDir 'WordTab-Install.cmd' }
+if (-not $OutFile) {
+    # Carry the commit into the file name. The zip is already named <date>-<commit>, and dropping that
+    # on the way to the .cmd costs the one question that matters on a machine you cannot reach: is the
+    # file sitting on it the current build? A fixed WordTab-Install.cmd cannot answer it - a stale copy
+    # and a fresh one are the same name and the same icon - so the answer needed an install and a look
+    # at Settings > Apps. Named this way it is answerable before running it, by reading it.
+    $base = [IO.Path]::GetFileNameWithoutExtension($Zip)
+    $OutFile = if ($base -match '^WordTab-\d{8}-(?<c>[0-9a-zA-Z]+)$') {
+        Join-Path $DistDir "WordTab-Install-$($Matches.c).cmd"
+    } else {
+        Join-Path $DistDir 'WordTab-Install.cmd'
+    }
+}
 
 Write-Host "==> Embedding $(Split-Path $Zip -Leaf)" -ForegroundColor Cyan
 

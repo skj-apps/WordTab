@@ -81,12 +81,18 @@ foreach ($key in $keys) {
 Write-Step 'Removing files'
 # Before the folder, because this points into it. A shortcut left behind in the Start menu is the
 # kind of residue that outlives everything else and makes an uninstall look like it did not work.
-$StartMenu = Join-Path ([Environment]::GetFolderPath('Programs')) 'WordTab Report.lnk'
-if (Test-Path $StartMenu) {
-    Remove-Item -Path $StartMenu -Force
-    Write-Ok "removed $StartMenu"
-} else {
-    Write-Note "not present  $StartMenu"
+#
+# All three by name rather than a WordTab*.lnk wildcard: this folder is the user's own Start menu and
+# a glob here would delete a shortcut somebody made themselves and named after the thing it points at.
+$Programs = [Environment]::GetFolderPath('Programs')
+foreach ($name in @('WordTab Report.lnk', 'WordTab Off.lnk', 'WordTab On.lnk')) {
+    $lnk = Join-Path $Programs $name
+    if (Test-Path $lnk) {
+        Remove-Item -Path $lnk -Force
+        Write-Ok "removed $lnk"
+    } else {
+        Write-Note "not present  $lnk"
+    }
 }
 
 if (Test-Path $InstallDir) {

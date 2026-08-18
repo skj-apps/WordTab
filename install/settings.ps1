@@ -24,6 +24,21 @@
 .PARAMETER Reset
   Remove every WordTab setting, putting all of them back to their defaults.
 
+.PARAMETER Off
+  Stop WordTab loading into Word at all, leaving it installed. Word looks and behaves exactly as it
+  does on a machine that never had it.
+
+  This writes the SAME registry value Word's own tick box writes - LoadBehavior under the add-in's
+  key - rather than inventing a second idea of "off". There is already one: `-Set Stack=0` leaves the
+  add-in loaded and inert. Both are legitimate, and they answer different questions: Stack=0 asks
+  "what does Word look like without the tabs", -Off asks "is WordTab responsible for this at all".
+  The second is the one worth having when something is wrong and nobody knows what is causing it.
+
+.PARAMETER On
+  Put it back. Reports Word's Disabled Items as well, because that list beats LoadBehavior: an add-in
+  Word killed after a bad load stays dead at LoadBehavior=3, and turning it "on" without saying so
+  would be a lie the log would have to correct later.
+
 .PARAMETER Quiet
   Skip the explanations and print just the table.
 
@@ -44,6 +59,8 @@
   powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Set TabDrag=0
   powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Reset
   powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Report
+  powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Off
+  powershell -ExecutionPolicy Bypass -File install\settings.ps1 -On
 #>
 [CmdletBinding()]
 param(
@@ -51,7 +68,9 @@ param(
     [switch]$Reset,
     [switch]$Quiet,
     [switch]$Report,
-    [string]$ReportPath
+    [string]$ReportPath,
+    [switch]$Off,
+    [switch]$On
 )
 
 $ErrorActionPreference = 'Stop'
@@ -441,6 +460,71 @@ public static class WordTabWin {
     Write-Host 'It reads only - nothing was installed, changed or removed. Send that file.' -ForegroundColor Gray
     Write-Host 'It contains the names of documents you have had open (they appear in the log as tab names).' -ForegroundColor Yellow
     Write-Host ''
+    return
+}
+
+# ---- -Off and -On -------------------------------------------------------------------------------
+#
+# The whole add-in, in or out, without uninstalling it. Everything else in this file turns a FEATURE
+# off inside a WordTab that is still loading; this is the one that answers "is WordTab doing this at
+# all", which is the question somebody actually has when Word starts behaving oddly and there is a
+# new add-in on the machine.
+#
+# LoadBehavior, not a WordTab value of our own, because Word already owns this decision - the tick box
+# in File > Options > Add-ins > COM Add-ins writes the same value name under the same key. A private
+# WordTabEnabled flag would have been a second answer to a question that already has one, and the two
+# would agree right up until somebody used the dialog.
+#
+# 0 rather than 2: 0 is Disconnected outright, it is the number install.ps1 already prints when it
+# tells somebody how to stand a rival add-in down, and Word writes 2 itself when a load FAILS - so
+# leaving 2 to mean "it broke" and 0 to mean "somebody asked" keeps the two apart in a log.
+
+if ($Off -and $On) {
+    throw "-Off and -On cannot both be given. Pick one."
+}
+
+if ($Off -or $On) {
+    $ProgId   = 'WordTab.Connect'
+    $AddinKey = "HKCU:\Software\Microsoft\Office\Word\Addins\$ProgId"
+
+    if (-not (Test-Path $AddinKey)) {
+        throw "WordTab is not registered for your account, so there is nothing to turn on or off. Run install.ps1 (or the one-file installer) first."
+    }
+
+    $want = if ($On) { 3 } else { 0 }
+    Set-ItemProperty -Path $AddinKey -Name 'LoadBehavior' -Value $want -Type DWord
+
+    # Read back through the same function install.ps1 and -Report use, rather than trusting the write.
+    # This is the file that tells somebody whether WordTab is on; it should not be the one place that
+    # believes its own last statement.
+    $now = Get-AddinStatus $ProgId
+
+    Write-Host ''
+    if ($On) {
+        Write-Host 'WordTab is ON.' -ForegroundColor Green
+        Write-Host "  $AddinKey  LoadBehavior=$($now.Behavior)" -ForegroundColor DarkGray
+
+        # The one case where LoadBehavior=3 is not the whole story, and it is not hypothetical - it is
+        # the state the dev rig's Office Tab has been stuck in since somebody's bad load.
+        if ($now.Blocked) {
+            Write-Host ''
+            Write-Host '  But Word has this add-in in its Disabled Items list, which beats LoadBehavior.' -ForegroundColor Yellow
+            Write-Host '  It will not load until that is cleared:' -ForegroundColor Yellow
+            Write-Host '    Word > File > Options > Add-ins > Manage: Disabled Items > Go > select WordTab > Enable' -ForegroundColor Gray
+        }
+    } else {
+        Write-Host 'WordTab is OFF.' -ForegroundColor Yellow
+        Write-Host "  $AddinKey  LoadBehavior=$($now.Behavior)" -ForegroundColor DarkGray
+        Write-Host '  It is still installed. Nothing was removed, and no setting was changed.' -ForegroundColor Gray
+        Write-Host '  Turn it back on with -On, or by ticking WordTab in Word:' -ForegroundColor Gray
+        Write-Host '    File > Options > Add-ins > Manage: COM Add-ins > Go' -ForegroundColor Gray
+    }
+    Write-Host ''
+    Write-Host 'Close Word completely and start it again for this to take effect.' -ForegroundColor Yellow
+    Write-Host ''
+
+    # Deliberately the end of the run. The table below is about which PARTS of a loaded WordTab are on,
+    # and printing it under the words "WordTab is OFF" would read as a contradiction.
     return
 }
 
