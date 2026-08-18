@@ -1,12 +1,14 @@
 # The row: what order tabs are in, what keeps one, and what closing the window means
 
-**PASSED.** 21 checks in the new `tools\check-row.ps1`; the other eleven suites re-run —
-**719 checks, 0 failures across the twelve.**
+**PASSED.** 25 checks in the new `tools\check-row.ps1`; the other eleven suites re-run —
+**719 checks, 0 failures across the twelve in one clean battery.** `check-row` has grown by four
+since that run — the unsaved-work section below — and passes 25 of 25 standalone; nothing in the
+add-in changed to add them, so the eleven other numbers are the ones the battery produced.
 
 | suite | checks | | suite | checks |
 |---|---|---|---|---|
 | stack | 60 | | startscreen | 50 |
-| **row** | **21** | | look | 48 |
+| **row** | **25** | | look | 48 |
 | strip | 67 | | scroll | 62 |
 | tabs | 26 | | title | 105 |
 | menu | 71 | | dot | 69 |
@@ -179,6 +181,15 @@ FALSE and lets Word do exactly what it did before: not stacked, a row of one, a 
 or `TabCloseStack=0`. That switch is there because this is the one thing WordTab does that ends with
 several of the user's documents closed.
 
+**And that is why the new route is checked against unsaved work rather than only against closing.**
+The question that matters about this command is not whether it closes them, it is whether it can
+close one somebody had not finished with. Driven: dirty a document, press the window's close, and
+Word's own prompt goes up **before anything has closed**; Cancel, and all four documents are still
+open, with the add-in's log saying it stopped *because the user declined* rather than because it ran
+out of patience. That last distinction is not pedantry — an earlier version of the batch concluded
+"declined" one second after posting `WM_CLOSE`, before Word had even asked, and passed every
+assertion that did not look for the reason.
+
 ---
 
 ## 4. A window is born on the stack
@@ -270,7 +281,7 @@ line, and it is worth it, but the next such line should come with the same sweep
   `WM_SHOWWINDOW` chaining before it asks
 - `src\native\wordtab.h` — four new declarations
 - `install\settings.ps1` — `TabCloseStack`
-- `tools\check-row.ps1` — 21 checks
+- `tools\check-row.ps1` — 25 checks, including the window close over a document with unsaved changes
 - `tools\probe-view.ps1` — the measurement that found nothing, kept as evidence
 - `tools\WordLayout.cs` — `SysClose`
 - `tools\check-reorder.ps1` — two patterns that were matching the wrong thing

@@ -230,7 +230,75 @@ if ($frames.Count -lt 2) {
     Write-Note ("row is still: " + (Format-Row $rowBefore))
 }
 
-# ---- 5. the window's own close takes the whole stack with it -----------------------------------
+# ---- 5. ...and it cannot take unsaved work with it ---------------------------------------------
+#
+# The one thing about this command that could reach the user's documents. Closing the window now
+# closes several documents rather than one, so the question that matters is not "does it close them"
+# but "can it close one the user had not finished with". It routes into the same batch the tab menu's
+# Close All has always used - one WM_CLOSE at a time, each with its own prompt, and a prompt the user
+# cancels abandons the rest - and check-menu drives that machinery hard through the menu. What is new
+# here is only the message that starts it, so what is checked here is only that the new route inherits
+# the old guarantee.
+#
+# The document is dirtied through Word's own object model rather than by typing into it: this suite
+# has no confirmed-click apparatus, and a click that missed would leave the wrong document modified
+# and the failure three steps from its cause. It is a scratch .rtf this script authored in %TEMP%.
+
+Write-Step 'The same close, with a document that has unsaved changes'
+$frames = @(Get-WordFrameList)
+$dirty  = $null
+if ($frames.Count -ge 2) {
+    $om = [WordLayout]::NativeOm($frames[0])
+    if ($null -eq $om) {
+        Write-Note 'Word would not hand over the object model - skipping'
+    } else {
+        try {
+            $om.Document.Content.InsertAfter('WordTab close check.')
+            $dirty = $frames[0]
+        } catch { Write-Note "could not modify the document: $($_.Exception.Message)" }
+    }
+}
+
+if ($null -eq $dirty) {
+    Write-Note 'no dirty document to close over - skipping'
+} else {
+    Start-Sleep -Seconds 2
+    $count = (Get-WordFrameTally)
+    Set-LogMark
+    [WordLayout]::SysClose($dirty)
+
+    $prompt = $null
+    Wait-Until { $script:p = Get-WordSavePrompt; $null -ne $script:p } 20 250 | Out-Null
+    $prompt = Get-WordSavePrompt
+    if ($prompt) { Write-Note ("Word asked: `"{0}`" ({1})" -f $prompt.Title, $prompt.Class) }
+    Assert ($null -ne $prompt) 'the unsaved document raised Word''s own save prompt before anything closed'
+
+    if ($prompt) {
+        # Escape is Cancel. Not "Don't Save" - the point of this check is the answer that must stop
+        # the batch, because that is the one where being wrong costs somebody their work.
+        [WordLayout]::Press(0x1B) | Out-Null
+        Start-Sleep -Seconds 10          # the grace after the question goes, and then some
+
+        Assert ($null -eq (Get-WordDialog)) 'the prompt went away'
+        Assert ((Get-WordFrameTally) -eq $count) `
+               "cancelling kept every document - all $count still open ($(Get-WordFrameTally))"
+
+        # ...and for the right reason. Every assertion above is also satisfied by a batch that gave
+        # up before Word had even asked, which is exactly what an earlier version of that code did.
+        $reason = Get-LogLast 'close batch'
+        if ($reason) { Write-Note $reason.Trim() }
+        Assert (($null -ne $reason) -and ($reason -match 'declined')) `
+               'the add-in stopped because the user declined, not because it ran out of patience'
+    }
+
+    # Put the fixture back to a state the section below can close without a question. Setting Saved
+    # on a scratch file this script wrote is the same act check-stack.ps1 documents: the rule that
+    # the add-in only ever READS this flag protects the user's documents from the ADD-IN.
+    try { ([WordLayout]::NativeOm($dirty)).Document.Saved = $true } catch { Write-Note 'could not mark the fixture saved' }
+    Start-Sleep -Seconds 1
+}
+
+# ---- 6. the window's own close takes the whole stack with it -----------------------------------
 #
 # SC_CLOSE, which is the message the title bar's x raises. Posted rather than clicked: the x is
 # painted by Word inside its own caption and hitting it by coordinate is a guess, whereas the message
