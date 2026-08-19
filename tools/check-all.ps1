@@ -27,7 +27,12 @@ $ErrorActionPreference = 'Continue'
 
 # Ordered cheapest-first so a broken build fails fast, with soak last: it opens the most documents
 # and is the one whose leftovers used to poison whatever ran next.
-$suites = @('stack', 'row', 'strip', 'tabs', 'menu', 'reorder', 'startscreen', 'look', 'scroll', 'title', 'dot', 'soak-stack')
+#
+# `governor` is first and is not like the others: it starts no Word at all, runs in about a second,
+# and is pure arithmetic, so it cannot be flaky. It is also the only suite that can see the branch
+# the dot poll's governor exists for, because this machine cannot produce a slow Document.Saved -
+# see tools\check-governor.ps1. Cheapest-first therefore puts it at the front by its own rule.
+$suites = @('governor', 'stack', 'row', 'strip', 'tabs', 'menu', 'reorder', 'startscreen', 'look', 'scroll', 'title', 'dot', 'soak-stack')
 if ($Only) {
     # `pwsh -File script.ps1 -Only reorder,look` passes ONE literal string, not two: with -File every
     # argument arrives as text and PowerShell does no array parsing, so a [string[]] parameter gets a

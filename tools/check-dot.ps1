@@ -543,6 +543,24 @@ $poll = @(Get-LogSince 'dot poll:')
 Assert ($poll.Count -gt 0) 'the add-in is polling Word for the modified state at all'
 if ($poll.Count -gt 0) { Write-Note $poll[$poll.Count - 1].Trim() }
 
+# The FIRST pass of a process is a cold one - Word building its automation machinery, measured here
+# at 26,621us and 27,898us on consecutive runs - and the governor discards it rather than measuring
+# it. That used to be free: the cadence came from `min(this pass, last pass)` and min(anything, 0) is
+# 0. It is not free any more, because the cadence now comes from the DEARER of the two, so a cold
+# start left in would put this machine on a six-second cadence and cost four more passes to walk back
+# off it. The dev rig is the only place that discard can be observed - a rig where passes are slow
+# has bigger things in the log - so it is asserted here.
+#
+# The FIRST cadence line only. A later one means a genuinely slow pass, which is a real event on a
+# real machine and not this suite's business to forbid.
+$cadence = @($poll | Where-Object { $_ -match 'now asking every \d+ ms' })
+Assert ($cadence.Count -gt 0) 'the governor said what cadence it settled on'
+if ($cadence.Count -gt 0) {
+    $firstMs = [int]([regex]::Match($cadence[0], 'now asking every (\d+) ms').Groups[1].Value)
+    Write-Note $cadence[0].Trim()
+    Assert ($firstMs -eq 500) "the cold first pass was discarded - the cadence starts at 500ms (it says ${firstMs}ms)"
+}
+
 Write-Step 'And both tabs draw an x, not a dot'
 $cleanAlpha = Read-TabButton 0 'Alpha-clean'
 Assert $cleanAlpha.IsCross 'an unmodified Alpha draws the x (ink on the diagonal)'

@@ -346,20 +346,23 @@ the only thing this needs. So what changes is **how often**, and **how much is a
 
 ### The governor
 
-`TicksFor` turns the last pass's cost into an interval, and the intervals are chosen so the poll
-holds to about 1% of the UI thread whatever the cost turns out to be:
+`RungFor` turns a pass's cost into a rung on a ladder, and the rungs are chosen so the poll holds to
+about 1% of the UI thread whatever the cost turns out to be:
 
-| a pass costs | ask again in |
-|---|---|
-| under 4ms | 500ms — twice a second, exactly as before |
-| 4-15ms | 2s |
-| 15-50ms | 6s |
-| 50-200ms | 20s |
-| over 200ms | 60s |
+| a pass costs | rung | ask again in |
+|---|---|---|
+| under 4ms | 0 | 500ms — twice a second, exactly as before |
+| 4-15ms | 1 | 2s |
+| 15-50ms | 2 | 6s |
+| 50-200ms | 3 | 20s |
+| over 200ms | 4 | 60s |
 
-**On this rig nothing changes at all.** A full pass is a few hundred microseconds, `TicksFor` returns
-1, and the cadence is the one it has always had. On theirs the whole-row pass backs off to once every
-thirty seconds and the stall goes with it.
+**On this rig nothing changes at all.** A full pass is a few hundred microseconds, `RungFor` returns
+rung 0, and the cadence is the one it has always had.
+
+> **2026-08-19: the first cut of this shipped in `f333349` and did not work on the work rig.** The
+> ladder was right; the way it was walked was not. See *The governor that could not settle* below,
+> which is the version that is actually in the code.
 
 ### ...and in between, only the window with the keyboard
 
@@ -372,14 +375,72 @@ The periodic full pass is what covers the rest: a background document Word saves
 what AutoSave on a SharePoint document does. Being a few seconds late on one of those is a dot that
 appears late, not a dot that is wrong.
 
-### One slow answer is not a slow Word
+### The governor that could not settle
 
-The interval is set from the **cheaper of the last two** passes. The very first pass of a process was
-already measured here at 27,547us — that is Word building its automation machinery, not a slow Word —
-and a single outlier of that size would otherwise put a healthy machine on a six-second cadence for
-no reason. Two slow passes in a row is a slow Word. Recovery is immediate in the other direction: one
-fast pass brings it back. That asymmetry is deliberate — being too eager costs a few milliseconds,
-being too slow costs a dot that is a minute late.
+**`f333349` set the interval from the cheaper of the last two passes, and documented the fast
+recovery as deliberate:** *"being too eager costs a few milliseconds, being too slow costs a dot that
+is a minute late."* The work rig's next report showed that on a SharePoint machine the first half of
+that sentence is false.
+
+There, a pass costs **either ~300-600us with the answer warm or 90,000-518,000us with it cold, and
+nothing in between**. So the cheaper of two was nearly always the warm one, and one lucky sample
+undid every backoff:
+
+```
+10:20:18  took 268 us    (and 494927 us before)  -> now asking every 500 ms
+10:20:27  took 95044 us  (and 486406 us before)  -> now asking every 20000 ms
+10:20:46  took 344 us    (and 95044 us before)   -> now asking every 500 ms
+10:20:49  took 92637 us  (and 501877 us before)  -> now asking every 20000 ms
+```
+
+That cycle ran about every 22 seconds for hours, at **mean 135,302us over 480 passes in twenty
+minutes — about 5.5% of Word's UI thread against the 1% the ladder was drawn for**, and spent as
+half-second freezes of the thread Word draws with rather than as a smear. It bought two dot
+transitions in a 25-hour log.
+
+**The reason it could not settle is not a tuning problem.** The governor's *input* is not independent
+of its *output*: asking often keeps SharePoint's answer warm and therefore cheap, and backing off
+lets it go cold and therefore expensive. A governor reading a quantity its own cadence controls has
+two stable states and flips between them — which is exactly what the log shows, thrashing at 500ms or
+pinned at 60s for two hours and twenty minutes with every single pass slow. Nothing in between was
+reachable.
+
+### So it climbs in one step and comes down one rung at a time
+
+For the **whole-row** pass:
+
+- the basis is the **dearer** of the last two passes, so one slow pass backs off at once
+- recovery walks the ladder a rung per pass. That is five cheap passes from 60s back to 500ms, not
+  four: because the basis is the dearer of two, the first cheap pass only clears the slow sample out
+  and moves nothing. **A single lucky warm answer changes the cadence not at all.**
+- the first pass of a process is now discarded **explicitly**. It was free under `min` —
+  `min(anything, 0)` is 0 — but a 27,547us cold start is Word building its automation machinery, and
+  under `max` it would put a healthy machine on a six-second cadence and cost four more passes to
+  walk back off it.
+
+For the **active-window** pass, none of that applies and it is governed on its own cost alone, with
+nothing carried between passes. The two-sample rule is only meaningful when consecutive passes
+measure the same thing; the row is the same set every time and the foreground window is not, so
+"the dearer of the last two" would let one slow document set the cadence for every tab the user
+afterwards moves to. It does not need the stickiness either, because the feedback that made the row
+bistable is absent: Word keeps the document being looked at live. On the work rig the active pass
+**never once exceeded 4ms across five and a half hours** while its row passes were running to half a
+second. If that ever stops being true the log says so in its own words, and that line is the one to
+look for.
+
+### Proving it, when the rig cannot reproduce it
+
+The dev rig cannot produce a slow pass, so `check-dot.ps1` exercises none of the above — which is
+precisely how the first version got out. Both state machines were therefore replayed side by side
+over the cost sequence in the work rig's own log:
+
+```
+old returned to 500ms 11 times in 15 passes; new 0 after pass 2
+```
+
+with the cold start discarded, one slow pass reaching 60s immediately, and recovery measured at five
+cheap passes. The check that matters most on *this* rig is the opposite one: a 26,621us cold start
+was discarded and **no cadence-change line fired for the whole run**.
 
 The cadence is logged when it **changes** and never per pass, with both measurements on the line:
 

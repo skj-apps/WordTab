@@ -5617,11 +5617,16 @@ static void Restore(StripState* state)
 //
 // Two rules, and each of them is a measurement rather than a preference:
 //
-//   1. **The whole row is asked for only as often as the whole row costs.** TicksFor turns the last
-//      pass's cost into an interval that holds the poll to about 1% of the UI thread, whatever that
-//      cost turns out to be. On this rig a full pass is a few hundred microseconds, TicksFor returns
-//      1, and the cadence is exactly what it has always been - twice a second, unchanged. On theirs
-//      it backs off to once every thirty seconds, and the stall goes with it.
+//   1. **The whole row is asked for only as often as the whole row costs.** RungFor turns a pass's
+//      cost into a rung on a ladder that holds the poll to about 1% of the UI thread, whatever that
+//      cost turns out to be. On this rig a full pass is a few hundred microseconds, RungFor returns
+//      rung 0, and the cadence is exactly what it has always been - twice a second, unchanged.
+//
+//      **On theirs the first cut of this did not work, and the report that came back is why the
+//      governor now looks the way it does.** Backing off is not enough on its own if coming back is
+//      free: f333349 oscillated between 500ms and 20s about three times a minute for hours, spending
+//      ~5.5% of Word's UI thread in half-second lumps. See PollModified for the measurement and for
+//      what replaced it.
 //
 //   2. **In between, only the ACTIVE window is asked about**, at the same governed cadence and by
 //      the same measurement. That is not a compromise on correctness so much as a statement of where
@@ -5633,17 +5638,24 @@ static void Restore(StripState* state)
 // The whole thing is off under `TabDot=0`, which is the switch the user was given as a mitigation.
 // ---------------------------------------------------------------------------------------------
 
-// Janitor ticks to wait before asking again, from what the last ask cost. Half a second a tick, so
-// the ratio of time spent asking to time elapsed comes out at or under about 1% at every step: a
-// 200ms answer is asked for once a minute, a 15ms answer once every six seconds, and anything under
-// 4ms is asked for on every tick, which is the behaviour this had before there was a governor.
-static int TicksFor(LONGLONG us)
+// The ladder the poll backs off along, in janitor ticks. Half a second a tick, so the ratio of time
+// spent asking to time elapsed comes out at or under about 1% at every rung: a 200ms answer is asked
+// for once a minute, a 15ms answer once every six seconds, and anything under 4ms is asked for on
+// every tick, which is the behaviour this had before there was a governor.
+//
+// Rungs rather than bare intervals, because the governor now moves along them a step at a time in one
+// direction and jumps in the other. See PollModified for why that asymmetry is the whole fix.
+static const int kRungTicks[] = { 1, 4, 12, 40, 120 };   // 500ms, 2s, 6s, 20s, 60s
+static const int kRungCount   = (int)(sizeof(kRungTicks) / sizeof(kRungTicks[0]));
+
+// Which rung a pass of this cost belongs on.
+static int RungFor(LONGLONG us)
 {
-    if (us > 200000) return 120;    // 60s
-    if (us > 50000)  return 40;     // 20s
-    if (us > 15000)  return 12;     // 6s
-    if (us > 4000)   return 4;      // 2s
-    return 1;                       // twice a second
+    if (us > 200000) return 4;      // 60s
+    if (us > 50000)  return 3;      // 20s
+    if (us > 15000)  return 2;      // 6s
+    if (us > 4000)   return 1;      // 2s
+    return 0;                       // twice a second
 }
 
 // One ask, timed, with the flags and the log lines it produces. `count` frames in, TRUE if Word
@@ -5768,22 +5780,100 @@ static void PollModified(void)
     // that took a fifth of a second cost a fifth of a second, and a Word that is slow to say no would
     // otherwise be asked twice a second forever.
     //
-    // **From the cheaper of the last two passes, not from the last one.** One slow answer is not a
-    // slow Word: the very first pass of a process is measured at 27547us against a steady state
-    // three orders of magnitude below it, because it is where Word builds its automation machinery,
-    // and a single outlier of that size would put a healthy machine on a six-second cadence for no
-    // reason. Two slow passes in a row is a slow Word. Recovery is immediate in the other direction -
-    // one fast pass is enough to bring it back - which is the right asymmetry: being too eager costs
-    // a few milliseconds, being too slow costs a dot that is a minute late.
+    // **It climbs in one step and comes down one rung at a time.** That is the reverse of what
+    // f333349 shipped, and the work rig's own log is why it had to be turned round. That version took
+    // the cadence from the *cheaper* of the last two passes and let a single cheap pass restore
+    // twice-a-second, reasoning that being too eager costs a few milliseconds. On a rig whose
+    // documents live on SharePoint it does not. Measured there a pass costs either ~300-600us with
+    // the answer warm or 90,000-518,000us with it cold and nothing in between, so the cheaper of two
+    // was nearly always the warm one and the cadence snapped back to 500ms after every cheap sample.
+    // The log has that cycle repeating about every twenty-two seconds for hours:
+    //
+    //     10:20:18  took 268 us    (and 494927 us before)  -> now asking every 500 ms
+    //     10:20:27  took 95044 us  (and 486406 us before)  -> now asking every 20000 ms
+    //     10:20:46  took 344 us    (and 95044 us before)   -> now asking every 500 ms
+    //     10:20:49  took 92637 us  (and 501877 us before)  -> now asking every 20000 ms
+    //
+    // ...costing, by its own summary line, mean 135302us over 480 passes in twenty minutes. That is
+    // about 5.5% of Word's UI thread against the 1% this ladder was drawn for, and it is spent as
+    // half-second freezes of the thread Word draws with, not as a smear.
+    //
+    // The reason it could not settle is worth stating plainly, because it is not a tuning problem:
+    // **the governor's input is not independent of its output.** Asking often keeps SharePoint's
+    // answer warm and therefore cheap; backing off lets it go cold and therefore expensive. A
+    // governor reading a quantity its own cadence controls has two stable states and flips between
+    // them, which is exactly what the log shows - thrashing at 500ms, or pinned at 60s for two hours
+    // and twenty minutes with every single pass slow.
+    //
+    // So the basis is the **dearer** of the last two passes, one slow pass backs off at once, and
+    // coming back takes a rung at a time. That is five cheap passes from once a minute to twice a
+    // second, not four: because the basis is the dearer of two, the first cheap pass only clears the
+    // slow sample out of `prev` and moves nothing, and the four rungs come after it. A single lucky
+    // warm answer in the middle of trouble therefore changes the cadence not at all. Being too slow
+    // now costs a background dot that is late; being too eager costs a visible stutter, and the
+    // report says which of those is actually happening.
+    //
+    // What makes the staleness affordable is rule 2 above: the active window keeps its own counter
+    // and its own rung, so the tab being typed into is still asked twice a second however far the row
+    // has backed off. What goes late is a background document Word saved by itself.
+    static int      fullRung   = 0;
+    static int      activeRung = 0;
     static LONGLONG prevFull   = 0;
     static LONGLONG prevActive = 0;
+    static BOOL     seenFull   = FALSE;
+    static BOOL     seenActive = FALSE;
+
+    int*      rung = full ? &fullRung : &activeRung;
     LONGLONG* prev = full ? &prevFull : &prevActive;
+    BOOL*     seen = full ? &seenFull : &seenActive;
 
+    // The first pass of a process is thrown away rather than measured. It is where Word builds its
+    // automation machinery - 27547us against a steady state three orders of magnitude below it - and
+    // under the old min it was harmless for free, because min(anything, 0) is 0. Taking the dearer of
+    // two makes it the opposite of harmless: one cold start would put a healthy machine on a
+    // six-second cadence and cost four more passes to walk back off it. It is not stored either, so
+    // the pass after it is judged on itself rather than against the cold one.
     LONGLONG lastTime = *prev;
-    *prev = us;
-    LONGLONG basis = (us < lastTime) ? us : lastTime;
+    if (!*seen)
+    {
+        *seen = TRUE;
+    }
+    else if (full)
+    {
+        *prev = us;
+        LONGLONG basis = (us > lastTime) ? us : lastTime;
 
-    int ticks = TicksFor(basis);
+        int want = RungFor(basis);
+        if (want > *rung)
+            *rung = want;                                   // a slow Word stops being asked, at once
+        else if (want < *rung)
+            (*rung)--;                                      // and is trusted back a rung at a time
+    }
+    else
+    {
+        // **The active pass is judged on itself alone, and carries nothing between passes.** The
+        // two-sample rule above is only meaningful when consecutive passes measure the same thing,
+        // and the whole row is the same set every time. The active pass is not: switching tabs
+        // changes which document is being asked about, so "the dearer of the last two" would let one
+        // slow document set the cadence for every other tab the user then moves to. Memoryless is
+        // the honest reading when the subject changes underneath the sampler.
+        //
+        // Nor does it need the stickiness. What made the row sticky is that its cost depends on its
+        // own cadence, and one foreground window does not have that feedback: Word keeps the
+        // document being looked at live. That is why the work rig's active pass never once exceeded
+        // 4ms across five and a half hours while its row passes were running to half a second.
+        //
+        // **If that assumption is ever wrong, the log already says so in its own words** - "the
+        // active window took ... - now asking every ..." - and that line is the one to look for in
+        // the next report. It has never yet appeared after the first pass of a process.
+        *prev = us;
+        *rung = RungFor(us);
+    }
+
+    if (*rung < 0)           *rung = 0;
+    if (*rung >= kRungCount) *rung = kRungCount - 1;
+
+    int ticks = kRungTicks[*rung];
     if (full) fullIn   = ticks;
     else      activeIn = ticks;
 
