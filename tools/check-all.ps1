@@ -32,7 +32,7 @@ $ErrorActionPreference = 'Continue'
 # and is pure arithmetic, so it cannot be flaky. It is also the only suite that can see the branch
 # the dot poll's governor exists for, because this machine cannot produce a slow Document.Saved -
 # see tools\check-governor.ps1. Cheapest-first therefore puts it at the front by its own rule.
-$suites = @('governor', 'stack', 'row', 'strip', 'tabs', 'menu', 'reorder', 'startscreen', 'look', 'scroll', 'title', 'dot', 'soak-stack')
+$suites = @('governor', 'stack', 'row', 'rowsize', 'strip', 'tabs', 'menu', 'reorder', 'startscreen', 'look', 'scroll', 'title', 'dot', 'soak-stack')
 if ($Only) {
     # `pwsh -File script.ps1 -Only reorder,look` passes ONE literal string, not two: with -File every
     # argument arrives as text and PowerShell does no array parsing, so a [string[]] parameter gets a

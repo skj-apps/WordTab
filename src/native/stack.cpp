@@ -119,6 +119,7 @@ static BOOL   g_started     = FALSE;
 static BOOL   g_inSync      = FALSE;  // our own SetWindowPos calls come back through the subclass
 static BOOL   g_altTab      = TRUE;
 static BOOL   g_tearOff      = TRUE;
+static BOOL   g_rowSize      = TRUE;  // the row comes back the size it was left, not Word's
 static int    g_closeStack   = 1;     // 0 = one document, 1 = ask, 2 = the whole stack
 static BOOL   g_minimized   = FALSE;  // the whole stack is down on the taskbar
 
@@ -410,6 +411,131 @@ static Member* MoveToEnd(Member* member)
 // Returns TRUE if the member array was compacted, which the caller has to know about because it is
 // iterating over it. There is one caller - the janitor - and that is checked by the compiler rather
 // than by hoping: this is a static with a single call site.
+// ---------------------------------------------------------------------------------------------
+// The row's own size, kept across restarts.
+//
+// Without this the first window in defines the stack rect - see Join - and the first window in
+// is whatever size WORD restored it to. So the row is the size of Word's memory rather than the
+// size the user chose, and on a wide screen that is a visible complaint rather than a detail:
+// Word restores a near-full-width frame, Word's own layout puts four pages side by side inside
+// it, and every tab that joins inherits it through MatchTo. Resizing the row fixes it until the
+// next restart, when Word's rectangle comes back and takes the whole row with it.
+//
+// This does not try to work out WHY Word restores the rectangle it does - that could not be
+// reproduced here, and it does not need to be. The remembered size is applied over the top of
+// whatever Word chose, so the answer does not depend on knowing.
+//
+// Four DWORDs rather than one REG_BINARY blob because every other value under this key is a
+// readable DWORD that settings.ps1 and regedit can both show. Negative coordinates survive the
+// round trip as two's complement, which is not a corner case: a window on a monitor left of the
+// primary one has a negative left, and the rig this was reported from has exactly that.
+// ---------------------------------------------------------------------------------------------
+
+static const wchar_t* const ROW_LEFT   = L"RowLeft";
+static const wchar_t* const ROW_TOP    = L"RowTop";
+static const wchar_t* const ROW_RIGHT  = L"RowRight";
+static const wchar_t* const ROW_BOTTOM = L"RowBottom";
+static const wchar_t* const ROW_MAX    = L"RowMaximized";
+
+// Absent has to be told apart from any rectangle a user could actually have, and every DWORD
+// here is a legitimate coordinate, so the reader's default doubles as the sentinel.
+static const DWORD ROW_ABSENT = 0x7FFFFFFFu;
+
+// Small enough that it cannot be a window someone sized on purpose. A row this size would be a
+// row the user cannot use, so it is not worth storing and not worth restoring.
+#define ROW_MIN_EDGE 200
+
+static void RememberRowRect(void)
+{
+    if (!g_rowSize || !g_active || !IsWindow(g_active))
+        return;
+
+    WINDOWPLACEMENT placement;
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(g_active, &placement))
+        return;
+
+    // rcNormalPosition rather than GetWindowRect, so that maximizing the row does not overwrite
+    // the size chosen for it: the restored rectangle is kept underneath, and the maximized state
+    // is stored beside it as a state. Minimised is refused outright - Windows parks a minimised
+    // window near -32000 and that is not a size anyone asked for, the same reason MatchTo
+    // refuses to copy a minimised master's rectangle.
+    if (placement.showCmd == SW_SHOWMINIMIZED)
+        return;
+
+    const RECT r = placement.rcNormalPosition;
+    if (r.right - r.left < ROW_MIN_EDGE || r.bottom - r.top < ROW_MIN_EDGE)
+        return;
+
+    WordTabWriteNumber(ROW_LEFT,   (DWORD)r.left);
+    WordTabWriteNumber(ROW_TOP,    (DWORD)r.top);
+    WordTabWriteNumber(ROW_RIGHT,  (DWORD)r.right);
+    WordTabWriteNumber(ROW_BOTTOM, (DWORD)r.bottom);
+    WordTabWriteNumber(ROW_MAX,    placement.showCmd == SW_SHOWMAXIMIZED ? 1u : 0u);
+
+    LogWrite(L"stack  the row remembers its size: (%ld,%ld %ldx%ld)%s",
+             r.left, r.top, r.right - r.left, r.bottom - r.top,
+             placement.showCmd == SW_SHOWMAXIMIZED ? L" maximized" : L"");
+}
+
+static void ApplyRememberedRowRect(HWND frame)
+{
+    if (!g_rowSize || !IsWindow(frame))
+        return;
+
+    const DWORD stored = WordTabReadNumber(ROW_RIGHT, ROW_ABSENT);
+    if (stored == ROW_ABSENT)
+        return;                 // nothing remembered yet, so Word's rectangle stands
+
+    RECT r;
+    r.left   = (LONG)WordTabReadNumber(ROW_LEFT,   0);
+    r.top    = (LONG)WordTabReadNumber(ROW_TOP,    0);
+    r.right  = (LONG)stored;
+    r.bottom = (LONG)WordTabReadNumber(ROW_BOTTOM, 0);
+
+    if (r.right - r.left < ROW_MIN_EDGE || r.bottom - r.top < ROW_MIN_EDGE)
+        return;
+
+    // A remembered rectangle is only good while the screen it was on still exists. Monitors get
+    // unplugged and laptops get undocked, and a row restored onto a monitor that is gone is a row
+    // the user cannot reach - which is the one rule MatchTo will not break either.
+    if (!MonitorFromRect(&r, MONITOR_DEFAULTTONULL))
+    {
+        LogWrite(L"stack  hwnd=0x%p  the remembered row (%ld,%ld %ldx%ld) is on no monitor that "
+                 L"exists now - leaving it where Word put it", (void*)frame,
+                 r.left, r.top, r.right - r.left, r.bottom - r.top);
+        return;
+    }
+
+    WINDOWPLACEMENT placement;
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(frame, &placement))
+        return;
+
+    placement.rcNormalPosition = r;
+    placement.showCmd = WordTabReadNumber(ROW_MAX, 0) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+    placement.flags = 0;
+
+    // Under g_inSync for the same reason MatchTo is: this is WordTab moving the window, not the
+    // user, and the position hook must not read it back as a drag to follow.
+    g_inSync = TRUE;
+    SetWindowPlacement(frame, &placement);
+    g_inSync = FALSE;
+
+    LogWrite(L"stack  hwnd=0x%p  the row takes the size it was left at, not the one Word "
+             L"restored: (%ld,%ld %ldx%ld)%s", (void*)frame,
+             r.left, r.top, r.right - r.left, r.bottom - r.top,
+             placement.showCmd == SW_SHOWMAXIMIZED ? L" maximized" : L"");
+}
+
+void StackRememberRowSize(HWND frame)
+{
+    Member* member = Find(frame);
+    if (!member || !member->joined || frame != g_active)
+        return;
+    RememberRowRect();
+}
+
 static BOOL Join(Member* member)
 {
     if (member->joined)
@@ -458,10 +584,13 @@ static BOOL Join(Member* member)
 
     if (!master)
     {
-        // First window in: it defines where the stack is.
+        // First window in: it defines where the stack is - which is why the size it happens to
+        // have is the size of everything that joins it, and why the remembered one is applied
+        // here and nowhere else.
         g_active = member->frame;
         LogWrite(L"stack  hwnd=0x%p  joined as the first window (it defines the stack rect)",
                  (void*)member->frame);
+        ApplyRememberedRowRect(member->frame);
     }
     else
     {
@@ -575,6 +704,11 @@ void StackStart(void)
     // inside WordTab, and a machine where it misbehaves needs a way to stop offering it.
     g_tearOff  = WordTabReadFlag(L"TabTearOff", TRUE);
 
+    // Off, the row is whatever size Word restored the first window to - the behaviour before
+    // the row remembered anything. Here because overriding the host's own window placement is
+    // the kind of thing that wants an off switch on a machine where it goes wrong.
+    g_rowSize  = WordTabReadFlag(L"RowSize", TRUE);
+
     // What the title bar's x does, and the one switch here that is not a boolean:
     //
     //   1 (default)  ask - "close all N tabs", "close only this document", or cancel
@@ -589,13 +723,15 @@ void StackStart(void)
 
     TaskbarStart();
 
-    LogWrite(L"StackStart  stacking=%s  altTab suppression=%s  detach=%s  the window's x=%s",
+    LogWrite(L"StackStart  stacking=%s  altTab suppression=%s  detach=%s  the window's x=%s"
+             L"  row size=%s",
              g_enabled ? L"on" : L"off (HKCU\\Software\\WordTab\\Stack=0)",
              g_altTab ? L"on" : L"off",
              g_tearOff ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTearOff=0)",
              g_closeStack == 2 ? L"the whole stack, no question (TabCloseStack=2)"
            : g_closeStack == 1 ? L"asks: all, this one, or cancel"
-                               : L"this document only (TabCloseStack=0)");
+                               : L"this document only (TabCloseStack=0)",
+             g_rowSize ? L"remembered" : L"off (RowSize=0) - Word's rectangle stands");
 }
 
 void StackAttachFrame(HWND frame)

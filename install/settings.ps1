@@ -104,6 +104,7 @@ $Switches = @(
     @{ Name = 'TabKeys';        Does = 'Ctrl+Tab and Ctrl+Shift+Tab step along the tab row. TURN THIS OFF if you need Ctrl+Tab to type a tab inside a table.' }
     @{ Name = 'TabTip';         Does = 'Resting the pointer on a tab shows the document''s full name and the folder it is in. Off, WordTab never asks Word where your documents live.' }
     @{ Name = 'TabGhost';       Does = 'While a tab is dragged clear of the row, carry a picture of it under the pointer. Off, the row letting go and the cursor are the only feedback.' }
+    @{ Name = 'RowSize';        Does = 'The row comes back the size you last gave it, instead of whatever size Word restores its window to. Off, Word decides - which on a wide screen is what puts several pages side by side.' }
     @{ Name = 'ShowLoadBanner'; Does = 'A dialog at Word startup confirming WordTab loaded. Off by default from the installer.' }
 )
 
@@ -406,6 +407,22 @@ public static class WordTabWin {
     foreach ($s in $Switches) {
         $current = Get-Current $s.Name
         Say ("{0,-16} {1}" -f $s.Name, $(if ($null -eq $current) { 'on (default, no value set)' } elseif ($current -eq 0) { 'OFF' } else { "on ($current)" }))
+    }
+
+    # The row's remembered rectangle, decoded. It is four separate DWORDs under the key and the
+    # section below would print them raw, which is four numbers nobody can read as a window - and
+    # this is the report that comes back from a machine nobody here can reach, so the one value
+    # that says why the row is the size it is should be legible on sight.
+    $rowL = Get-Current 'RowLeft'
+    $rowT = Get-Current 'RowTop'
+    $rowR = Get-Current 'RowRight'
+    $rowB = Get-Current 'RowBottom'
+    if (($null -ne $rowL) -and ($null -ne $rowT) -and ($null -ne $rowR) -and ($null -ne $rowB)) {
+        Say ("{0,-16} ({1},{2} {3}x{4}){5}" -f 'Row remembered', $rowL, $rowT,
+                                              ($rowR - $rowL), ($rowB - $rowT),
+                                              $(if (Get-Current 'RowMaximized') { ' maximized' } else { '' }))
+    } else {
+        Say ("{0,-16} nothing yet - the row is whatever size Word restores" -f 'Row remembered')
     }
 
     # Anything under the key that is NOT one of the switches above. The list is a list of things a

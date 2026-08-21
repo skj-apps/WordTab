@@ -182,11 +182,12 @@ WHAT TO DO, IN ORDER
 
   4. Start Word and open two documents.
 
-     EXPECTED: one Word window with two tabs, each named after its document. A dialog saying
-     "WordTab is loaded inside Word" comes up first - that is the load banner, and it is on by
-     default so that the first run proves itself. Turn it off with:
+     EXPECTED: one Word window with two tabs, each named after its document.
+     EXPECTED also: no dialog. The installer's own smoke test and the log are what prove it
+     loaded. If you want Word to say so on every start, install with -Banner, or turn it on
+     later with:
 
-         powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Set ShowLoadBanner=0
+         powershell -ExecutionPolicy Bypass -File install\settings.ps1 -Set ShowLoadBanner=1
 
 WHAT YOU CAN DO WITH IT
 
@@ -197,6 +198,11 @@ WHAT YOU CAN DO WITH IT
   Ctrl+Tab / Ctrl+Shift+Tab step along the row. A document with unsaved changes shows a dot where its
   x is. Rest the pointer on a tab and it tells you the document's full name and the folder it is in -
   which is what you want when there are enough documents open that the names get cut short.
+
+  Size the window once and the row comes back that size the next time Word starts, rather than
+  whatever size Word restores its own window to - which on a wide screen is what leaves you
+  looking at several pages side by side. Turn that off with RowSize=0 if you would rather Word
+  decided.
 
 IF YOU HAVE TEN MINUTES, TRY THESE IN THIS ORDER
 

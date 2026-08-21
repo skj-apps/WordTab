@@ -26,6 +26,11 @@
 .PARAMETER NoBanner
   Install with the "WordTab is loaded" dialog switched off (it writes the log either way).
   Flips HKCU\Software\WordTab\ShowLoadBanner, so it takes effect without a rebuild.
+  This is now the default for a first install; the switch is kept so it can be said out loud.
+
+.PARAMETER Banner
+  Install with the "WordTab is loaded" dialog switched ON. Only needed to prove to yourself that
+  the add-in is loading - the installer's own smoke test and the log say the same thing.
 
 .PARAMETER SkipSmokeTest
   Skip the post-install activation check.
@@ -38,6 +43,7 @@
 param(
     [switch]$SkipBuild,
     [switch]$NoBanner,
+    [switch]$Banner,
     [switch]$SkipSmokeTest
 )
 
@@ -333,8 +339,40 @@ Write-Ok "$AddinKey  LoadBehavior=3"
 # to its default. The add-in registration above is recreated on purpose - every value in it is
 # rewritten on the next two lines - but nothing here rewrites a switch the user set.
 if (-not (Test-Path $SettingsKey)) { New-Item -Path $SettingsKey | Out-Null }
-New-ItemProperty -Path $SettingsKey -Name 'ShowLoadBanner' -Value ([int](-not $NoBanner)) -PropertyType DWord -Force | Out-Null
-Write-Ok ("Load banner: {0}" -f $(if ($NoBanner) { 'off' } else { 'on' }))
+#
+# ShowLoadBanner obeys the same rule as every other value in this key, and for four builds it did
+# not. The line here used to be an unconditional -Force write of ([int](-not $NoBanner)), so a
+# plain re-install stamped it back to 1 and a user who had turned the dialog off got it again on
+# the next build - the one value in this key the installer overwrote. It is seeded when absent and
+# left alone when present, and -NoBanner / -Banner say it explicitly.
+#
+# The seed is now OFF. The banner earned its place when nothing else proved the add-in had loaded;
+# the smoke test below and the log now both say so, and a dialog on every single Word start is a
+# cost paid forever for a fact you learn once.
+$bannerExisting = $null
+try { $bannerExisting = (Get-ItemProperty -Path $SettingsKey -Name 'ShowLoadBanner' -ErrorAction Stop).ShowLoadBanner } catch { }
+
+if ($NoBanner -and $Banner) { throw 'Pass -NoBanner or -Banner, not both.' }
+
+if ($NoBanner) {
+    New-ItemProperty -Path $SettingsKey -Name 'ShowLoadBanner' -Value 0 -PropertyType DWord -Force | Out-Null
+    $bannerOn = $false
+    Write-Ok 'Load banner: off (-NoBanner)'
+}
+elseif ($Banner) {
+    New-ItemProperty -Path $SettingsKey -Name 'ShowLoadBanner' -Value 1 -PropertyType DWord -Force | Out-Null
+    $bannerOn = $true
+    Write-Ok 'Load banner: on (-Banner)'
+}
+elseif ($null -eq $bannerExisting) {
+    New-ItemProperty -Path $SettingsKey -Name 'ShowLoadBanner' -Value 0 -PropertyType DWord -Force | Out-Null
+    $bannerOn = $false
+    Write-Ok 'Load banner: off (first install; -Banner turns the dialog on)'
+}
+else {
+    $bannerOn = ($bannerExisting -ne 0)
+    Write-Ok ("Load banner: {0} (left as you set it)" -f $(if ($bannerOn) { 'on' } else { 'off' }))
+}
 
 # ---- verify ------------------------------------------------------------------------------------
 
@@ -509,11 +547,11 @@ Write-Note 'Press Start and type WordTab to find them.'
 
 Write-Host ''
 Write-Host 'Installed.' -ForegroundColor Green
-if ($NoBanner) {
-    Write-Host '  Start Word and open two documents. Expect one window with a tab for each.' -ForegroundColor Gray
-    Write-Host '  There is no load banner (-NoBanner); the log below is the proof it loaded.' -ForegroundColor Gray
-} else {
+if ($bannerOn) {
     Write-Host "  Start Word. Expect a 'WordTab is loaded inside Word' dialog." -ForegroundColor Gray
+} else {
+    Write-Host '  Start Word and open two documents. Expect one window with a tab for each.' -ForegroundColor Gray
+    Write-Host '  There is no load banner; the smoke test above and the log are the proof it loaded.' -ForegroundColor Gray
 }
 Write-Host "  Log: $env:LOCALAPPDATA\WordTab\wordtab.log" -ForegroundColor Gray
 Write-Host '  If anything looks wrong: press Start, type WordTab, open "WordTab Report".' -ForegroundColor Gray

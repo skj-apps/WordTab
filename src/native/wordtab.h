@@ -227,6 +227,12 @@ void StackOnFrameEnable(HWND frame, BOOL enabled);
 void StackJanitor(void);
 void StackStop(void);
 
+// Called when the user finishes moving or sizing a frame. The row keeps the size it is given,
+// so the size has to be captured at the moment a person settles on one - not from every
+// intermediate rectangle a drag passes through. Ignores any frame that is not the one defining
+// the row.
+void StackRememberRowSize(HWND frame);
+
 // Is a batch close - Close Others, Close All, Close Tabs to the Right - part-way through?
 //
 // Exported so that the janitor's other work can stand off while it runs. A batch is a sequence of
@@ -354,3 +360,8 @@ BOOL WordTabReadFlag(const wchar_t* name, BOOL defaultValue);
 // every existing caller wants the boolean and a shared reader returning DWORD would put a
 // `!= 0` at seventeen call sites.
 DWORD WordTabReadNumber(const wchar_t* name, DWORD defaultValue);
+
+// The other direction, and the only thing here that writes to the registry. WordTab's switches
+// are the user's to set and this does not touch them; it exists for the handful of values
+// WordTab records for itself - where the row was left - which have to survive Word closing.
+void WordTabWriteNumber(const wchar_t* name, DWORD value);

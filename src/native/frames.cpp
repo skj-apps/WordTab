@@ -294,6 +294,18 @@ BOOL WordTabReadFlag(const wchar_t* name, BOOL defaultValue)
     return WordTabReadNumber(name, defaultValue ? 1u : 0u) != 0;
 }
 
+// The write half. Same key, same DWORD shape, so anything WordTab records for itself can be
+// read back by WordTabReadNumber and shown by settings.ps1 and regedit like every other value
+// here. RegSetKeyValue creates the key if it is missing, which is the case on a machine where
+// the installer has not run since the key was last cleaned out.
+void WordTabWriteNumber(const wchar_t* name, DWORD value)
+{
+    LSTATUS status = RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\WordTab", name,
+                                     REG_DWORD, &value, sizeof(value));
+    if (status != ERROR_SUCCESS)
+        LogWrite(L"settings: could not write %s (error %ld)", name, (long)status);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The subclass procedure. Everything Word's frame receives passes through here first.
 // ---------------------------------------------------------------------------------------------
@@ -331,6 +343,10 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
     case WM_EXITSIZEMOVE:
         TraceFlush();
         LogWrite(L"WM_EXITSIZEMOVE   hwnd=0x%p", (void*)hwnd);
+
+        // The user has settled on a size. If this is the window the row is measured from,
+        // that is the size the row should come back as next time Word starts.
+        StackRememberRowSize(hwnd);
         break;
 
     case WM_WINDOWPOSCHANGING:
