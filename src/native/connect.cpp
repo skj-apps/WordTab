@@ -282,6 +282,165 @@ static BOOL CallMethodNoArgs(IDispatch* disp, const wchar_t* name)
     return TRUE;
 }
 
+// Write a numeric property. The first write into Word's object model from this add-in, so the shape
+// is worth stating: a property PUT carries its value as an argument NAMED DISPID_PROPERTYPUT, which
+// is not something DISPPARAMS makes obvious - cNamedArgs is 1 and rgdispidNamedArgs points at that
+// one id. Getting it wrong does not fail loudly; Word returns DISP_E_PARAMNOTOPTIONAL, or quietly
+// does nothing at all.
+static BOOL SetLongProperty(IDispatch* disp, const wchar_t* name, LONG value)
+{
+    if (!disp)
+        return FALSE;
+
+    DISPID dispid = 0;
+    LPOLESTR nameCopy = (LPOLESTR)name;
+    if (FAILED(disp->GetIDsOfNames(IID_NULL, &nameCopy, 1, LOCALE_USER_DEFAULT, &dispid)))
+        return FALSE;
+
+    VARIANT arg;
+    VariantInit(&arg);
+    arg.vt   = VT_I4;
+    arg.lVal = value;
+
+    DISPID    putId = DISPID_PROPERTYPUT;
+    DISPPARAMS args = { &arg, &putId, 1, 1 };
+    EXCEPINFO error;
+    memset(&error, 0, sizeof(error));
+
+    HRESULT hr = disp->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT,
+                              DISPATCH_PROPERTYPUT, &args, NULL, &error, NULL);
+    ClearExceptionInfo(&error);
+    VariantClear(&arg);
+
+    return SUCCEEDED(hr) ? TRUE : FALSE;
+}
+
+// The Word window that owns a frame, found by handle. Caller Releases.
+//
+// Not Application.ActiveWindow: this is asked as a window JOINS the row, which is not always the one
+// Word considers active, and there is no reason to activate anything merely to look at its view. A
+// frame that no window claims is the Protected View case - such a document lives in
+// ProtectedViewWindows and in no collection reachable from here - and NULL is the honest answer.
+static IDispatch* WindowForFrame(HWND frame)
+{
+    if (!g_application || !frame)
+        return NULL;
+
+    IDispatch* windows = GetObjectProperty(g_application, L"Windows");
+    if (!windows)
+        return NULL;
+
+    LONG total = 0;
+    if (!GetLongProperty(windows, L"Count", &total))
+    {
+        windows->Release();
+        return NULL;
+    }
+
+    IDispatch* found = NULL;
+    for (LONG index = 1; index <= total && !found; index++)
+    {
+        IDispatch* window = GetItemAt(windows, index);
+        if (!window)
+            continue;
+
+        // The same (LONG)(LONG_PTR) narrowing as everywhere else here: window handles are 32-bit
+        // values sign-extended into a pointer, and Word reports Hwnd as a long.
+        LONG reported = 0;
+        if (GetLongProperty(window, L"Hwnd", &reported) && reported == (LONG)(LONG_PTR)frame)
+            found = window;                  // the reference is the caller's now
+        else
+            window->Release();
+    }
+
+    windows->Release();
+    return found;
+}
+
+// Below this, a zoom is not a choice: it is what fitting several pages across left behind.
+#define ONEPAGE_MIN_ZOOM 50
+
+// One page across, which is what the user does by hand on every single Word start.
+//
+// Their words, and it took three of my answers before I heard them: "i have to chage view to single
+// page on word open", "every time i mean". Everything built for "it opens 3 pages wide" was about
+// the WIDTH of the window, and this is not that. Measured on 16.0.20228:
+//
+//   - A healthy Word reports Zoom.PageColumns = 99, its "as many as fit", and pages side by side are
+//     then purely a function of how wide the window is. That case the row's own width answers.
+//   - Once anything sets a COLUMN COUNT, Word keeps it as a default and crushes the zoom to fit that
+//     many pages: PageColumns=2 in a 1305px window took the zoom to 10%. It survives closing the
+//     document, closing Word, and opening a document Word has never seen - including a brand new
+//     blank one from the template. It lives in HKCU\...\Word\Data, which is an opaque blob.
+//   - The ribbon's One Page and 100% buttons fix the window in front of you and do NOT change that
+//     default. That is the whole of "every time": the button being pressed could never have stuck.
+//
+// So the add-in does what they do, at the moment a document arrives in the row. PageColumns first
+// and the zoom second, because setting the columns alone leaves the crushed zoom exactly where it
+// was - measured: three columns at 10% became one column at 10%, which is one page and still
+// unreadable.
+//
+// It acts ONLY when the view is showing more than one page across. A window already on one page is
+// left alone entirely, zoom included, because a zoom somebody chose for a document is theirs.
+BOOL WordTabOnePageView(HWND frame, LONG* wasColumns, LONG* wasZoom)
+{
+    if (wasColumns) *wasColumns = 0;
+    if (wasZoom)    *wasZoom    = 0;
+
+    IDispatch* window = WindowForFrame(frame);
+    if (!window)
+        return FALSE;
+
+    IDispatch* view = GetObjectProperty(window, L"View");
+    window->Release();
+    if (!view)
+        return FALSE;
+
+    IDispatch* zoom = GetObjectProperty(view, L"Zoom");
+    view->Release();
+    if (!zoom)
+        return FALSE;
+
+    LONG columns = 0;
+    LONG percent = 0;
+    BOOL read = GetLongProperty(zoom, L"PageColumns", &columns);
+    GetLongProperty(zoom, L"Percentage", &percent);
+
+    if (wasColumns) *wasColumns = columns;
+    if (wasZoom)    *wasZoom    = percent;
+
+    // 99 is Word's "as many as fit", not a request for ninety-nine pages, and it is the healthy
+    // state. Left alone: what it draws is decided by the window's width, which is the row's business
+    // and is answered elsewhere.
+    BOOL manyPages = (read && columns > 1 && columns < 99) ? TRUE : FALSE;
+
+    // The other half of the same illness, and the suite for this found it by printing a number an
+    // assertion was not looking at: correcting the columns leaves Word's remembered ZOOM crushed.
+    // The second document opened afterwards came up "1 page across at 10%" - one page, and
+    // unreadable, which is not what anybody meant by fixing it. Word recomputed the zoom when it was
+    // asked for three columns and does not recompute it when it is asked for one.
+    //
+    // A zoom under half size is not a reading choice, it is the leftover of a fit-many-pages
+    // calculation - Word's own floor is 10%, which is what a three-column fit produced here. Above
+    // that, whatever zoom a document opens at is somebody's business and is left alone.
+    BOOL tooSmall = (!manyPages && percent > 0 && percent < ONEPAGE_MIN_ZOOM) ? TRUE : FALSE;
+
+    if (!manyPages && !tooSmall)
+    {
+        zoom->Release();
+        return FALSE;
+    }
+
+    BOOL ok = TRUE;
+    if (manyPages)
+        ok = SetLongProperty(zoom, L"PageColumns", 1);
+    if (ok)
+        ok = SetLongProperty(zoom, L"Percentage", 100);
+
+    zoom->Release();
+    return ok;
+}
+
 // Save the document behind a tab.
 //
 // Word's own Document.Save, so everything about saving is Word's: an unchanged document is not

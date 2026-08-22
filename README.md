@@ -158,6 +158,26 @@ powershell -Command "Set-ItemProperty 'HKCU:\Software\WordTab' RowSize 0 -Type D
 
 `settings.ps1` prints the remembered rectangle, or says nothing is remembered yet.
 
+### Pages side by side, and the zoom that comes with them
+
+Word keeps *how many pages to show side by side* as a setting of its own, and it is stickier than it
+looks: once something sets a column count, Word shrinks the zoom to fit that many pages and then
+opens **every** document that way afterwards - including documents it has never seen and brand new
+blank ones. The One Page and 100% buttons on the View ribbon fix the window in front of you and do
+not clear it, which is why it comes straight back on the next document.
+
+So WordTab puts it right as each document arrives: a document that opens **more than one page
+across**, or at a zoom **under 50%** - which is not a zoom anyone picks, it is what fitting several
+pages across leaves behind - is set to one page at 100%. A document that opens on one page at a
+readable size is not touched at all, whatever zoom it is at.
+
+```
+powershell -Command "Set-ItemProperty 'HKCU:\Software\WordTab' OnePage 0 -Type DWord"   # leave the view alone
+```
+
+This is separate from how wide the window opens, above. The width decides how many pages *fit*; this
+decides how many Word *tries* to show.
+
 ### What the window's × does
 
 Closing the *window* is not the same as closing a tab, so it asks: **close all N tabs**, **close only

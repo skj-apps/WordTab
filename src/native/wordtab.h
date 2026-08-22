@@ -140,6 +140,14 @@ BOOL WordTabReadDocumentPath(HWND frame, wchar_t* out, int chars);
 // `frame` must already be the window Word considers active. This does not activate it: it *checks*
 // that Word agrees, and saves nothing if it does not. Saving the wrong document is the one failure
 // in this add-in that reaches the user's data, so it is made impossible rather than unlikely.
+// Put a document back to one page across, if it opened showing several side by side.
+//
+// Word keeps a column count as a DEFAULT and crushes the zoom to fit it, and the ribbon buttons
+// that appear to fix it only fix the window in front of you - which is why the person this was
+// built for was setting the view by hand on every Word start. Reports what it found, so the log
+// can say what was wrong rather than only that something was.
+BOOL WordTabOnePageView(HWND frame, LONG* wasColumns, LONG* wasZoom);
+
 BOOL WordTabSaveDocument(HWND frame);
 
 // ---------------------------------------------------------------------------------------------

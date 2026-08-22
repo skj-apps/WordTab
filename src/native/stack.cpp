@@ -114,6 +114,7 @@ static void CloseBatchEnd(const wchar_t* why);
 static Member g_members[MAX_MEMBERS];
 static int    g_memberCount = 0;      // frames we know about, joined or not
 static HWND   g_active      = NULL;
+static BOOL   g_onePage     = TRUE;    // HKCU\Software\WordTab\OnePage
 static BOOL   g_enabled     = TRUE;
 static BOOL   g_started     = FALSE;
 static BOOL   g_inSync      = FALSE;  // our own SetWindowPos calls come back through the subclass
@@ -728,6 +729,33 @@ static BOOL Join(Member* member)
                  (void*)member->frame, (void*)master, JoinedCount());
     }
 
+    // The view, once, now that this window is a tab.
+    //
+    // Here rather than on a timer, and this is the distinction that matters: a document arriving
+    // in the row is an EVENT, and asking Word one question per event is not the same animal as the
+    // dot poll, which asks per window twice a second and had to be governed for it. Reading and
+    // writing the two zoom properties measured 3ms here. If it is slower on a SharePoint machine it
+    // is slower once, as the document opens, which is already the slowest moment there is.
+    if (g_onePage)
+    {
+        LONG columns = 0;
+        LONG percent = 0;
+        if (WordTabOnePageView(member->frame, &columns, &percent))
+        {
+            // Two illnesses, one cure, and the log says which one it found. They were one line for
+            // an hour and that line would have reported "1 pages across", which is not a thing that
+            // happens and would have sent the next person looking in the wrong place.
+            if (columns > 1)
+                LogWrite(L"view  hwnd=0x%p  this document opened %ld pages across at %ld%% - put "
+                         L"back to one page at 100%% (OnePage=0 leaves it alone)",
+                         (void*)member->frame, columns, percent);
+            else
+                LogWrite(L"view  hwnd=0x%p  this document opened at %ld%%, which is what fitting "
+                         L"several pages across leaves behind - put back to 100%% (OnePage=0 leaves "
+                         L"it alone)", (void*)member->frame, percent);
+        }
+    }
+
     Present();
     StripRefreshTabs();
     return compacted;
@@ -838,6 +866,12 @@ void StackStart(void)
     // the kind of thing that wants an off switch on a machine where it goes wrong.
     g_rowSize  = WordTabReadFlag(L"RowSize", TRUE);
 
+    // Off, a document that opens showing several pages side by side is left showing them. On is
+    // the default because it is the only setting the person this was built for was correcting by
+    // hand on every single Word start - see WordTabOnePageView for what Word is doing and why the
+    // ribbon buttons never made it stop.
+    g_onePage  = WordTabReadFlag(L"OnePage", TRUE);
+
     // What the title bar's x does, and the one switch here that is not a boolean:
     //
     //   1 (default)  ask - "close all N tabs", "close only this document", or cancel
@@ -853,14 +887,15 @@ void StackStart(void)
     TaskbarStart();
 
     LogWrite(L"StackStart  stacking=%s  altTab suppression=%s  detach=%s  the window's x=%s"
-             L"  row size=%s",
+             L"  row size=%s  one page=%s",
              g_enabled ? L"on" : L"off (HKCU\\Software\\WordTab\\Stack=0)",
              g_altTab ? L"on" : L"off",
              g_tearOff ? L"on" : L"off (HKCU\\Software\\WordTab\\TabTearOff=0)",
              g_closeStack == 2 ? L"the whole stack, no question (TabCloseStack=2)"
            : g_closeStack == 1 ? L"asks: all, this one, or cancel"
                                : L"this document only (TabCloseStack=0)",
-             g_rowSize ? L"remembered" : L"off (RowSize=0) - Word's rectangle stands");
+             g_rowSize ? L"remembered" : L"off (RowSize=0) - Word's rectangle stands",
+             g_onePage ? L"on" : L"off (OnePage=0) - Word's remembered column count stands");
 }
 
 void StackAttachFrame(HWND frame)

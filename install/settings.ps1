@@ -105,6 +105,7 @@ $Switches = @(
     @{ Name = 'TabTip';         Does = 'Resting the pointer on a tab shows the document''s full name and the folder it is in. Off, WordTab never asks Word where your documents live.' }
     @{ Name = 'TabGhost';       Does = 'While a tab is dragged clear of the row, carry a picture of it under the pointer. Off, the row letting go and the cursor are the only feedback.' }
     @{ Name = 'RowSize';        Does = 'The row comes back the size you last gave it, instead of whatever size Word restores its window to. Until you have given it one, a window Word opens three or more pages wide is narrowed to about one page. Off, Word decides - which on a wide screen is what puts several pages side by side.' }
+    @{ Name = 'OnePage';        Does = 'A document that opens showing several pages side by side, or at a zoom too small to read, is put back to one page at 100%. Off, Word''s remembered column count and zoom stand.' }
     @{ Name = 'ShowLoadBanner'; Does = 'A dialog at Word startup confirming WordTab loaded. Off by default from the installer.' }
 )
 
