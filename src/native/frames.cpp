@@ -440,6 +440,35 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                                 : command == SC_MOVE     ? L"SC_MOVE"
                                                          : L"SC_SIZE";
             LogWrite(L"WM_SYSCOMMAND  hwnd=0x%p  %s", (void*)hwnd, name);
+
+            // A size the user settled on WITHOUT dragging, which is the other half of what
+            // WM_EXITSIZEMOVE catches. That message ends the modal move/size loop, so it covers a
+            // drag and nothing else: double-clicking the title bar, pressing the maximize button
+            // and Win+Up never enter that loop. Until this was here, a row maximized any of those
+            // ways was never recorded, so the next Word start came back at Word's own rectangle and
+            // the size they chose was lost - and with a default width now applied when nothing is
+            // remembered, that turns into a window they maximize and WordTab narrows again on every
+            // single start. The default needs this to be here to be safe.
+            //
+            // **WM_SYSCOMMAND and not WM_SIZE**, and the difference is the same one SC_CLOSE turns
+            // on above: this message is a person operating the window. WM_SIZE is every resize
+            // there is - Word's own, another program's, a check suite's - and keying on it was
+            // measured to record sizes nobody chose: two suites in one battery ran against windows
+            // dragged to a rectangle an earlier suite had "settled on". On a wide screen it is
+            // worse than untidy, because it would let Word's own startup rectangle install itself
+            // as the user's choice, which is the exact thing the remembered size exists to overrule.
+            //
+            // Chained first and read after, like WM_SHOWWINDOW below: the window has not maximized
+            // yet when this arrives, so reading it here would record the rectangle it is leaving.
+            //
+            // Still not covered: Win+Left and Win+Right. They snap without the modal loop and
+            // without a system command, and there is no message that says a person did it.
+            if (command == SC_MAXIMIZE || command == SC_RESTORE)
+            {
+                LRESULT chained = DefSubclassProc(hwnd, msg, wParam, lParam);
+                StackRememberRowSize(hwnd);
+                return chained;
+            }
         }
         break;
     }

@@ -562,6 +562,15 @@ static int Scaled(int logical, int dpi)
     return MulDiv(logical, dpi, 96);
 }
 
+// The stack asks this file what the DPI is rather than asking Windows itself. Two reasons, and the
+// second is the one that matters: the two files cannot then disagree, and TabDpi - which is the only
+// way to reach a second DPI on a one-monitor rig - moves both of them at once, so the page-width
+// arithmetic in stack.cpp can be driven from a check suite on a machine that has one screen.
+int StripDpiOf(HWND frame)
+{
+    return DpiOf(frame);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Theme.
 //
@@ -5197,6 +5206,20 @@ static void ApplyInitial(StripState* state)
 // These exist because of the layout-oracle rule: Word lays out only the focused window, so the
 // stack has to take that window's interior and hand it to the others itself. See stack.cpp.
 // ---------------------------------------------------------------------------------------------
+
+// TRUE while a press is being held on a tab: a gesture that has begun and has not been agreed to.
+//
+// Asked by the stack, which decides which tab is selected from which window is in front. That is
+// the right question while the windows are sitting still and the wrong one while a tab is being
+// carried: the card under the pointer is a top-level window of its own, and showing it was
+// measured raising the window whose strip the press landed on - back over the tab that same press
+// had just activated. The row followed it and undid the switch the user had just made, 92ms after
+// the "tab clicked ->" line, in the reorder suite log. Nothing is concluded from where the windows
+// have ended up until the gesture is over.
+BOOL StripTabPressHeld(void)
+{
+    return g_dragStrip != NULL;
+}
 
 // Is there a document open in this window?
 //

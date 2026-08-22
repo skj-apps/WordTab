@@ -182,6 +182,10 @@ void StripStop(void);
 // What the stack needs from the strip. All of these exist because Word lays out only the focused
 // window: the stack has to take that window's document-frame rect and hand it to the others.
 
+// Is a press being held on a tab? A gesture in progress, so nothing may be concluded from where
+// the windows have ended up - the carried card raises the window it was picked up from.
+BOOL StripTabPressHeld(void);
+
 // Is there a document open in this window? This is the membership test - a window with no document
 // is not a tab - and it is deliberately *not* the same question as "does it have a `_WwF`". Word
 // keeps the document frame for the life of the window and empties it when the last document closes.
@@ -196,6 +200,10 @@ BOOL StripHasDocument(HWND frame);
 // it. A window with two document frames and a window with one empty one are the same line otherwise,
 // and they are different bugs.
 void StripDescribeDocumentFrames(HWND frame, wchar_t* out, int chars);
+
+// The DPI this window is being drawn at, as the strip computes it - honouring TabDpi. The stack
+// uses it to work out how wide a printed page is on this screen; see ApplyDefaultRowRect.
+int StripDpiOf(HWND frame);
 
 BOOL StripGetNatural(HWND frame, RECT* natural);
 // `why` names the path that asked, because this is the one writer of a window's natural rect that

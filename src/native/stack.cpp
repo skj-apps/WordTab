@@ -478,6 +478,129 @@ static void RememberRowRect(void)
              placement.showCmd == SW_SHOWMAXIMIZED ? L" maximized" : L"");
 }
 
+// ---------------------------------------------------------------------------------------------
+// The row's width when nothing has been remembered yet.
+//
+// The field report this exists for, three times over: "opening up 4 pages wide", then "still opened
+// 3 pages wide". Neither number is anything WordTab draws. Word draws a page at its true size at
+// 100% zoom, so a document frame N page-widths across shows N pages side by side - and on that rig
+// Word restores its own frame 3840px wide on a 5120x2160 screen at 150%. A page there is
+// 8.5in x 144dpi = 1224px, so 3840px is three pages across and the maximized 5120px is four. The
+// two reports are one complaint seen at two window sizes, and the arithmetic says so.
+//
+// Remembering the size the user settles on - which is what shipped first - does not answer it. Until
+// they settle on one there is nothing to remember, and Word's rectangle stands: the fix was made to
+// depend on the user doing something, and the report that came back says they did not do it. A
+// default that needs no manual step is the fix. The remembered size still wins the moment there is
+// one, which is the point - this is what happens in its absence, not instead of it.
+//
+// Deliberately NOT written to the registry. "Remembered" means a width the user chose, and a default
+// that wrote itself into that slot would be indistinguishable from one - it would then be applied
+// forever on a machine where it was wrong, and the user would have no way to tell which of the two
+// they were looking at.
+// ---------------------------------------------------------------------------------------------
+
+// A page in tenths of an inch. Letter (8.5in) rather than A4 (8.27in) on purpose: A4 is NARROWER,
+// so a threshold computed from Letter is reached later and a width computed from Letter is wider.
+// Both errors fall the same way - towards leaving the window alone.
+#define ROW_PAGE_TENTHS 85
+
+// Three pages across before this touches anything, and one-and-a-bit after it does.
+//
+// Three rather than two is the whole blast radius of this change, so it is the number to argue with
+// first. A maximized Word on an ordinary 1920x1080 screen at 100% is about 2.3 pages across, and two
+// pages side by side is what Word has always done there and what nobody has ever complained about.
+// Starting at three leaves every ordinary screen untouched and catches the wide ones - which is
+// where every one of these reports has come from.
+#define ROW_CAP_TRIGGER_TENTHS 30
+#define ROW_CAP_TARGET_TENTHS  14
+
+// How wide one page is on this window's screen, in the same physical pixels GetWindowRect speaks.
+static LONG PageWidthPx(HWND frame)
+{
+    int dpi = StripDpiOf(frame);
+    if (dpi < 72 || dpi > 480)
+        dpi = 96;
+    return ((LONG)ROW_PAGE_TENTHS * (LONG)dpi) / 10;
+}
+
+static void ApplyDefaultRowRect(HWND frame)
+{
+    const LONG page = PageWidthPx(frame);
+    if (page <= 0)
+        return;
+
+    // Measured as the window is SHOWN, not as it is stored. A maximized window covers the screen
+    // whatever its rcNormalPosition says, and it is what is on the screen that decides how many
+    // pages Word lays out - the "4 pages wide" report is the maximized case of the "3 pages" one.
+    RECT shown;
+    if (!GetWindowRect(frame, &shown))
+        return;
+
+    const LONG width = shown.right - shown.left;
+    if (width < (page * ROW_CAP_TRIGGER_TENTHS) / 10)
+        return;                 // under three pages across: Word's rectangle is not the complaint
+
+    WINDOWPLACEMENT placement;
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(frame, &placement))
+        return;
+    if (placement.showCmd == SW_SHOWMINIMIZED)
+        return;                 // no rectangle worth correcting, same rule as MatchTo and Remember
+
+    MONITORINFO info;
+    info.cbSize = sizeof(info);
+    HMONITOR monitor = MonitorFromWindow(frame, MONITOR_DEFAULTTONEAREST);
+    if (!monitor || !GetMonitorInfoW(monitor, &info))
+        return;
+
+    // Where it goes when it stops being maximized is the user's own restored rectangle if they have
+    // one and the work area if they do not - and either way only its WIDTH is overruled. Height,
+    // and the corner it sits in, are left as they were found.
+    RECT r = placement.rcNormalPosition;
+    if (r.right - r.left < ROW_MIN_EDGE || r.bottom - r.top < ROW_MIN_EDGE)
+        r = info.rcWork;
+
+    const LONG target = (page * ROW_CAP_TARGET_TENTHS) / 10;
+    if (target < ROW_MIN_EDGE)
+        return;
+    r.right = r.left + target;
+
+    // Back onto the monitor it was already on. rcNormalPosition is in workspace coordinates and
+    // rcWork is in screen coordinates; the two differ by the taskbar's edge, which is close enough
+    // for a clamp whose whole job is to keep the window reachable.
+    if (r.right > info.rcWork.right)
+    {
+        const LONG shift = r.right - info.rcWork.right;
+        r.left  -= shift;
+        r.right -= shift;
+    }
+    if (r.left < info.rcWork.left)
+    {
+        const LONG shift = info.rcWork.left - r.left;
+        r.left  += shift;
+        r.right += shift;
+    }
+
+    placement.rcNormalPosition = r;
+    placement.showCmd = SW_SHOWNORMAL;
+    placement.flags = 0;
+
+    // Under g_inSync for the same reason every other move here is: this is WordTab moving the
+    // window, so neither the position hook nor the WM_SIZE that records the row's size may read it
+    // back as the user having chosen this width.
+    g_inSync = TRUE;
+    SetWindowPlacement(frame, &placement);
+    g_inSync = FALSE;
+
+    LogWrite(L"stack  hwnd=0x%p  no row size remembered and Word opened this window %ldpx wide, "
+             L"which is %ld.%ld pages across at %ldpx to a page - narrowed to (%ld,%ld %ldx%ld). "
+             L"Size the window yourself and that is what comes back instead (RowSize=0 turns this "
+             L"off entirely).",
+             (void*)frame, width, width / page, ((width * 10) / page) % 10, page,
+             r.left, r.top, r.right - r.left, r.bottom - r.top);
+}
+
 static void ApplyRememberedRowRect(HWND frame)
 {
     if (!g_rowSize || !IsWindow(frame))
@@ -485,7 +608,13 @@ static void ApplyRememberedRowRect(HWND frame)
 
     const DWORD stored = WordTabReadNumber(ROW_RIGHT, ROW_ABSENT);
     if (stored == ROW_ABSENT)
-        return;                 // nothing remembered yet, so Word's rectangle stands
+    {
+        // Nothing remembered. Word's rectangle used to stand here unconditionally - and on a wide
+        // screen Word's rectangle is the "3 pages wide" report. It stands only while it is a size
+        // somebody would recognise as a Word window.
+        ApplyDefaultRowRect(frame);
+        return;
+    }
 
     RECT r;
     r.left   = (LONG)WordTabReadNumber(ROW_LEFT,   0);
@@ -1015,6 +1144,51 @@ void StackOnFrameSize(HWND frame, WPARAM sizeType)
 // Membership, re-decided from what is true right now rather than from what happened. Cheap enough
 // to run on the strip's half-second janitor, and that cadence is what makes it robust against
 // Word hiding and showing frames without telling anyone.
+// Which of the row's windows the user is actually looking at.
+//
+// The stack holds every window at one rectangle, so the document on screen is the front-most of
+// them and nothing else. That is the whole definition, and it is worth writing down because the
+// row spent a long time reading a different answer: the KEYBOARD. GetForegroundWindow and
+// WM_ACTIVATE are both about focus, and focus is only a proxy for what is in front.
+//
+// The proxy failed in the field. From the work rig, their words: "when opening a second doc it
+// switch to that but initial tab still highlighted" - and their log has it three times in one day,
+// `joined, snapped to 0x...` with no `active ->` after it. Word had put the new document's window
+// in front without handing it the keyboard, so every question the row knew how to ask returned the
+// window the user could no longer see, and the highlight stayed there until they clicked something.
+// It does not reproduce on the dev rig, where Word raises and focuses in the same breath - which is
+// exactly why the check for it drives the mechanism (SWP_NOACTIVATE) rather than the trigger.
+//
+// GetTopWindow walks the desktop from the front, so the first joined member met is the one on top.
+// The walk stops there, and nothing is walked at all while the row holds a single tab - with nothing
+// to switch between there is nothing to decide, and that is the idle case this runs in most of the
+// time. What is left is one GetWindow per window in front of ours, twice a second: a local call with
+// no cross-process work in it, which is what makes this safe to put on a timer at all. The dot poll
+// is the standing warning about the other kind - see RESULT-dot.md, where one object-model call
+// measured 430us here and half a second on the work rig.
+static HWND FrontMostJoined(void)
+{
+    if (JoinedCount() < 2)
+        return NULL;
+
+    // Not while a tab is being carried. The gesture moves windows for its own reasons - showing
+    // the card under the pointer was measured raising the window the tab was picked up from, over
+    // the one the same press had just activated - so z-order during a drag is not a statement
+    // about which document the user has chosen. Seen once in the reorder suite, 92ms after a
+    // "tab clicked ->" line, undoing the switch. Answering NULL here leaves the older focus rule
+    // to reply, which is exactly what it replied before any of this existed.
+    if (StripTabPressHeld())
+        return NULL;
+
+    for (HWND h = GetTopWindow(NULL); h; h = GetWindow(h, GW_HWNDNEXT))
+    {
+        Member* member = Find(h);
+        if (member && member->joined && IsWindowVisible(h) && !IsIconic(h))
+            return h;
+    }
+    return NULL;
+}
+
 static void JanitorPass(void)
 {
 
@@ -1137,15 +1311,25 @@ static void JanitorPass(void)
         }
     }
 
-    // Word activates windows without always telling our frame procedure, so trust the system over
-    // our own bookkeeping.
-    HWND foreground = GetForegroundWindow();
-    if (foreground && foreground != g_active)
+    // Which tab is drawn selected, read back from the system rather than tracked through events
+    // Word does not always send. The window in front is the one the user is looking at, so it is
+    // the one the row is on - see FrontMostJoined for why that is the question and focus was not.
+    HWND showing = FrontMostJoined();
+
+    // When z-order declines to answer - one tab or none, or a gesture still in progress - the
+    // older rule stands: Word activates windows without always telling our frame procedure, so
+    // trust the system over our own bookkeeping. Both rules are the same sentence - believe what
+    // is there over what we last wrote down - asked of the two things that can answer it.
+    if (!showing)
     {
-        Member* member = Find(foreground);
+        HWND foreground = GetForegroundWindow();
+        Member* member  = foreground ? Find(foreground) : NULL;
         if (member && member->joined)
-            StackOnFrameActivate(foreground);
+            showing = foreground;
     }
+
+    if (showing && showing != g_active)
+        StackOnFrameActivate(showing);
 
     // After the membership pass above, deliberately: whether the tab we asked Word to close has
     // actually gone is a membership question, and this reads the answer that loop just wrote.

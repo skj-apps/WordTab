@@ -201,8 +201,10 @@ WHAT YOU CAN DO WITH IT
 
   Size the window once and the row comes back that size the next time Word starts, rather than
   whatever size Word restores its own window to - which on a wide screen is what leaves you
-  looking at several pages side by side. Turn that off with RowSize=0 if you would rather Word
-  decided.
+  looking at several pages side by side. Before you have sized it even once, a window Word opens
+  three or more pages wide is narrowed to about one page, so the first start is not wide either.
+  Whatever size you give it afterwards wins from then on. Turn the whole thing off with RowSize=0
+  if you would rather Word decided.
 
 IF YOU HAVE TEN MINUTES, TRY THESE IN THIS ORDER
 

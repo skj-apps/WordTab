@@ -93,6 +93,11 @@ public static class RowProbe
     // WM_EXITSIZEMOVE. The message the add-in keys on, sent rather than posted so that it has been
     // handled by the time this returns and the registry can be read straight after.
     public static void SettleSize(IntPtr hwnd) { SendMessage(hwnd, 0x0232, IntPtr.Zero, IntPtr.Zero); }
+
+    // WM_SYSCOMMAND / SC_MAXIMIZE - what the title bar's maximize button, a double-click on the
+    // title bar and Win+Up all send. ShowWindow(SW_MAXIMIZE) maximizes the same window without it,
+    // and that case must NOT be recorded, which is what step 8 checks either side of this.
+    public static void UserMaximize(IntPtr hwnd) { SendMessage(hwnd, 0x0112, (IntPtr)0xF030, IntPtr.Zero); }
 }
 '@ -Language CSharp -ReferencedAssemblies @('System.Runtime', 'netstandard')
 
@@ -171,9 +176,59 @@ function Format-Rc($rc) { return "($($rc.Left),$($rc.Top) $($rc.Right - $rc.Left
 # both sides are compared as 32-bit unsigned rather than one side being widened to a signed long.
 function As-Dword([int]$v) { return [uint32]([uint32]::MaxValue -band $v) }
 
+# The complaint this suite exists for is not something the add-in does - it is something WORD does,
+# which the add-in then spreads across the row. Word remembers its own window size between runs, so
+# whatever the last Word window was sized to is what the next one opens at. That is the whole
+# mechanism, and priming it here is how a machine with one ordinary screen can be made to reproduce
+# "Word opened it far too wide" on demand rather than waiting for a rig that has a 5120px monitor.
+#
+# RowSize is off while this runs, so the add-in leaves the priming window alone and does not record
+# it either - what is being set up is Word's memory, not WordTab's.
+function Prime-WordWidth($width, $height) {
+    Close-AllWordAndWait
+    Set-ItemProperty -Path $SettingsKey -Name RowSize -Value 0 -Type DWord
+    Open-Document 9 | Out-Null
+    Wait-WordReady 1 45 | Out-Null
+    $f = Get-FirstFrame
+    if ($f -eq [IntPtr]::Zero) { Write-Note 'no frame to prime Word width with'; return 0 }
+    $work = [WordLayout]::WorkArea($f)
+    [WordLayout]::Show($f, 9)                       # SW_RESTORE, in case Word came back maximized
+    $w = [Math]::Min($width,  ($work.Right - $work.Left) - 80)
+    $h = [Math]::Min($height, ($work.Bottom - $work.Top) - 80)
+    [WordLayout]::MoveTo($f, $work.Left + 40, $work.Top + 40)
+    [WordLayout]::Resize($f, $w, $h)
+    Start-Sleep -Milliseconds 600
+    Close-AllWordAndWait
+    Remove-ItemProperty -Path $SettingsKey -Name RowSize -ErrorAction SilentlyContinue
+    return $w
+}
+
+# TabDpi is what makes the page-width arithmetic reachable here. A page is 8.5in wide, so at the
+# dev rig's real 192dpi three pages is 4896px - wider than any monitor here - and the default width
+# could never be made to fire. Forcing the add-in's DPI shrinks a page to something this screen can
+# hold three of, which is the only way this step can be driven at all.
+#
+# 72 is not a free choice and must not be lowered to suit a small screen: PageWidthPx refuses a
+# forced dpi outside 72..480 and falls back to 96, so 72 is the smallest page that can be asked
+# for. 612px, and three of them 1836px.
+$ForcedDpi     = 72
+$ForcedPage    = [int]((85 * $ForcedDpi) / 10)      # 612
+$ForcedTrigger = [int](($ForcedPage * 30) / 10)     # 1836
+$ForcedTarget  = [int](($ForcedPage * 14) / 10)     # 856
+
+# And a screen has to be able to hold a Word window that wide, which is not a given: this rig
+# measured 2856px across one morning and 1740px the same evening, and three checks went red on
+# that alone - "Word was primed 1660px wide, which is over the 1836px that is three pages here"
+# is a precondition failing, not the product. A check that cannot be run is a check that cannot
+# fail, so it is skipped by name instead, with the reason. Prime-WordWidth can reach the work area
+# less the 80px margin it keeps.
+$WorkWide      = ([WordLayout]::WorkArea([IntPtr]::Zero)).Right - ([WordLayout]::WorkArea([IntPtr]::Zero)).Left
+$CanForceWidth = (($WorkWide - 80) -gt $ForcedTrigger)
+
 # ---- what was there before, so the machine is left as it was found -----------------------------
 
 $origRowSize = try { (Get-ItemProperty -Path $SettingsKey -Name RowSize -ErrorAction Stop).RowSize } catch { $null }
+$origTabDpi  = try { (Get-ItemProperty -Path $SettingsKey -Name TabDpi  -ErrorAction Stop).TabDpi  } catch { $null }
 $origRow     = Get-StoredRow
 
 try {
@@ -181,6 +236,11 @@ try {
 # ---- 1. nothing remembered: Word's rectangle stands --------------------------------------------
 
 Write-Step 'Nothing remembered yet'
+# Primed narrow on purpose. "Word's rectangle stands" is only the right answer while Word's
+# rectangle is one a person would recognise as a Word window, and step 6 is the other half of this:
+# left alone means left alone because there was nothing wrong with it, not because nothing looked.
+Remove-ItemProperty -Path $SettingsKey -Name TabDpi -ErrorAction SilentlyContinue
+Prime-WordWidth 1200 900 | Out-Null
 Close-AllWordAndWait
 Clear-Row
 Remove-ItemProperty -Path $SettingsKey -Name RowSize -ErrorAction SilentlyContinue
@@ -195,6 +255,8 @@ Assert ((Get-LogCount 'row size=remembered') -ge 1) 'the row-size switch is on b
 Assert ((Get-LogCount 'the row takes the size it was left at') -eq 0) `
        'nothing was remembered, so the add-in did not move the window'
 Assert ($null -eq (Get-StoredRow)) 'and it invented no row rectangle of its own'
+Assert ((Get-LogCount 'no row size remembered and Word opened') -eq 0) `
+       'and it did not narrow a window that was not too wide'
 
 # ---- 2. a size the user settles on is remembered ------------------------------------------------
 
@@ -281,13 +343,122 @@ Assert ((Get-LogCount 'row size=off') -ge 1) 'the add-in said the switch is off'
 Assert ((Get-LogCount 'the row takes the size it was left at') -eq 0) 'and left the window to Word'
 Assert ((Get-LogCount 'the row remembers its size') -eq 0) 'and recorded nothing either'
 
+# ---- 6. nothing remembered, and Word opens it three pages wide ------------------------------------
+#
+# The complaint itself, reproduced by arithmetic rather than by hardware. Their rig is a 5120x2160
+# screen at 150% where Word restores a 3840px frame; a page there is 8.5in x 144dpi = 1224px, so
+# 3840px is three pages across. Here TabDpi forces 72dpi, which makes a page 612px and three pages
+# 1836px - the same sum with numbers a screen this size can hold, when it can.
+
+if (-not $CanForceWidth) {
+    Write-Note "the work area is ${WorkWide}px across and this needs more than $($ForcedTrigger + 80)px to prime Word three pages wide - steps 6 and 7 skipped"
+} else {
+    Write-Step 'Nothing remembered, and Word opens it three pages wide'
+    Close-AllWordAndWait
+    Set-ItemProperty -Path $SettingsKey -Name TabDpi -Value $ForcedDpi -Type DWord
+    $primed = Prime-WordWidth 2600 1200
+    Clear-Row
+    Remove-ItemProperty -Path $SettingsKey -Name RowSize -ErrorAction SilentlyContinue
+    Set-LogMark
+    Open-Document 5 | Out-Null
+    if (-not (Wait-WordReady 1 45)) { Write-Note 'document 5 did not arrive with a strip within 45s' }
+    Wait-Joined
+
+    $narrowed = Get-LogLast 'no row size remembered and Word opened'
+    Assert ($primed -ge $ForcedTrigger) `
+           "Word was primed $($primed)px wide, which is over the ${ForcedTrigger}px that is three pages here"
+    Assert ($null -ne $narrowed) 'the add-in said it was too wide and narrowed it'
+    if ($null -ne $narrowed) { Write-Note $narrowed }
+
+    $capped = [WordLayout]::RectOf((Get-FirstFrame))
+    $cappedW = $capped.Right - $capped.Left
+    Assert ([Math]::Abs($cappedW - $ForcedTarget) -le 4) `
+           "the window came up ${cappedW}px wide, about one page ($ForcedTarget)"
+    Assert (-not [WordLayout]::Maximized((Get-FirstFrame))) 'and not maximized'
+
+    # The one that keeps the two apart. A default that wrote itself into the remembered slot would be
+    # indistinguishable from a size the user chose, and would then be applied on every machine forever.
+    Assert ($null -eq (Get-StoredRow)) 'and it recorded nothing - a default is not a size you chose'
+
+    # ---- 7. a remembered size still beats the default --------------------------------------------------
+
+    Write-Step 'A remembered size beats the default'
+    Close-AllWordAndWait
+    $wantW = $ForcedTarget * 2      # wider than the default, and still over the three-page threshold
+    Set-StoredRow ($capped.Left) ($capped.Top) ($capped.Left + $wantW) ($capped.Top + 900) 0
+    Set-LogMark
+    Open-Document 6 | Out-Null
+    if (-not (Wait-WordReady 1 45)) { Write-Note 'document 6 did not arrive with a strip within 45s' }
+    Wait-Joined
+
+    Assert ((Get-LogCount 'the row takes the size it was left at') -ge 1) 'the remembered rectangle was applied'
+    Assert ((Get-LogCount 'no row size remembered and Word opened') -eq 0) 'and the default never ran'
+    $kept = [RowProbe]::Placement((Get-FirstFrame)).rcNormalPosition
+    Assert (($kept.Right - $kept.Left) -eq $wantW) `
+           "the row is the ${wantW}px it was told to be, not the default $(Format-Rc $kept)"
+}
+
+# ---- 8. a size settled on WITHOUT a drag is remembered too ------------------------------------------
+#
+# WM_EXITSIZEMOVE ends the modal move/size loop, so it catches a drag and nothing else. Double-
+# clicking the title bar and Win+Up never enter that loop, and until this was fixed a row maximized
+# either way was never recorded - which is one of the ways a user can do everything they were asked
+# to do and still get Word's own rectangle back on the next start.
+
+Write-Step 'A size settled on without dragging'
+Close-AllWordAndWait
+Remove-ItemProperty -Path $SettingsKey -Name TabDpi -ErrorAction SilentlyContinue
+Clear-Row
+Remove-ItemProperty -Path $SettingsKey -Name RowSize -ErrorAction SilentlyContinue
+# Marked BEFORE the document is opened, or Wait-Joined is satisfied by the PREVIOUS step's join
+# line and returns at once - which is how this step first maximized a window half a second before
+# it was a member of anything, and then reported that maximizing is not recorded. The suite has
+# made this mistake before; see the note on Wait-Joined.
+Set-LogMark
+Open-Document 7 | Out-Null
+if (-not (Wait-WordReady 1 45)) { Write-Note 'document 7 did not arrive with a strip within 45s' }
+Wait-Joined
+Assert ((Get-LogCount 'joined as the first window') -ge 1) 'the window joined the row first'
+
+$frame8 = Get-FirstFrame
+Assert ($frame8 -ne [IntPtr]::Zero) 'the frame is reachable from outside'
+
+# First half, and it is the half that matters more. A resize NOBODY ASKED FOR must not be recorded.
+# Keying this on WM_SIZE instead of the system command was measured to take two suites down in one
+# battery - they ran against windows snapped to a rectangle an earlier suite had resized to - and on
+# a wide screen it would let WORD's own startup rectangle install itself as the size the user chose,
+# which is the one thing the remembered size exists to overrule.
+Set-LogMark
+[WordLayout]::Show($frame8, 9)          # SW_RESTORE, programmatic
+[WordLayout]::Resize($frame8, 940, 820) # and a plain SetWindowPos - a resize, but not a person
+Start-Sleep -Milliseconds 600
+Assert ((Get-LogCount 'the row remembers its size') -eq 0) `
+       'a resize the user did not ask for is not recorded'
+Assert ($null -eq (Get-StoredRow)) 'and nothing was written'
+
+# Second half: the same window, maximized the way a person maximizes it.
+Set-LogMark
+[RowProbe]::UserMaximize($frame8)       # WM_SYSCOMMAND / SC_MAXIMIZE - no modal loop, no drag
+Start-Sleep -Milliseconds 600
+
+$maxed = Get-StoredRow
+Assert ((Get-LogCount 'the row remembers its size') -ge 1) `
+       'maximizing without a drag IS recorded'
+Assert ($null -ne $maxed) 'all five row values are present'
+if ($null -ne $maxed) {
+    Assert ($maxed['RowMaximized'] -eq 1) 'and it was recorded as maximized'
+}
+Assert ([WordLayout]::Maximized($frame8)) 'and the window really is maximized'
+
 }
 finally {
     # Put the machine back: these values are the user's, and a suite that leaves a row behind changes
     # what the next Word start does.
     Clear-Row
     Remove-ItemProperty -Path $SettingsKey -Name RowSize -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $SettingsKey -Name TabDpi  -ErrorAction SilentlyContinue
     if ($null -ne $origRowSize) { Set-ItemProperty -Path $SettingsKey -Name RowSize -Value $origRowSize -Type DWord }
+    if ($null -ne $origTabDpi)  { Set-ItemProperty -Path $SettingsKey -Name TabDpi  -Value $origTabDpi  -Type DWord }
     if ($null -ne $origRow) {
         Set-StoredRow $origRow['RowLeft'] $origRow['RowTop'] $origRow['RowRight'] $origRow['RowBottom'] $origRow['RowMaximized']
     }

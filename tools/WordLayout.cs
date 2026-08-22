@@ -240,6 +240,18 @@ public static class WordLayout
 
     public static IntPtr GetForeground() { return GetForegroundWindow(); }
 
+    // Put a window in front of the others WITHOUT giving it the keyboard: HWND_TOP, SWP_NOACTIVATE.
+    //
+    // This is not a synthetic gesture. It is what Word does to a document it has just opened on the
+    // work rig - the window arrives on top, the focus does not follow it, and the row went on
+    // highlighting the tab of the document that was no longer on screen. Focus and z-order are two
+    // different answers to "which window is the user looking at", and this is how a suite on a rig
+    // where they always agree can ask the question anyway.
+    public static void RaiseWithoutFocus(IntPtr hwnd)
+    {
+        SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+    }
+
     // The tooltip's appearance delay IS this number, and its auto-hide is ten times it: the add-in
     // asks Windows rather than carrying a constant of its own, so that WordTab's tooltip arrives when
     // the user's other tooltips arrive. A suite that waited a hardcoded 500ms would be asserting

@@ -484,6 +484,65 @@ if ($Screenshot) {
     Write-Note (Join-Path $ShotDir 'wordtab-taskbar.png')
 }
 
+# ---- the tab that is highlighted is the document on screen ---------------------------------------
+#
+# The report this exists for, their words: "when opening a second doc it switch to that but initial
+# tab still highlighted". Their log has it three times in one day - `joined, snapped to 0x...` with
+# no `active ->` after it - and it stays wrong until the user clicks something.
+#
+# The cause is not the opening. It is that the row read "which window is the user looking at" off
+# the KEYBOARD: GetForegroundWindow, plus WM_ACTIVATE. Word puts a newly opened document's window in
+# front without always giving it focus, and then those two answers differ. The stack holds every
+# window at one rectangle, so the document on screen is the front-most one and nothing else - focus
+# was only ever a proxy for that, and this is the case where the proxy is wrong.
+#
+# It cannot be provoked by opening a document HERE: on this rig Word raises the new window and hands
+# it the keyboard in the same breath, so both answers agree and the check could never fail. What is
+# reproduced instead is the mechanism - a window put in front with SWP_NOACTIVATE, which is exactly
+# the state their Word leaves behind - and it is asserted from outside the add-in, through the one
+# window it presents to Alt+Tab. That is g_active read back through the product rather than through
+# its log.
+if ((Get-FrameCount) -ge 2) {
+    Write-Step 'A window raised without focus becomes the selected tab'
+
+    $before   = @(Get-Frames)
+    $showing  = @($before | Where-Object { -not [WordLayout]::IsToolWindow($_) })
+    $hidden   = @($before | Where-Object { [WordLayout]::IsToolWindow($_) })
+
+    if ($showing.Count -ne 1 -or $hidden.Count -lt 1) {
+        Assert $false "the row presents exactly one window before the raise (presented $($showing.Count) of $($before.Count))"
+    } else {
+        $wasActive = $showing[0]
+        $raised    = $hidden[0]
+        $focusWas  = [WordLayout]::GetForeground()
+
+        Set-LogMark
+        [WordLayout]::RaiseWithoutFocus($raised)
+
+        # Long enough for two janitor ticks, and a fixed wait rather than a poll: how long the row
+        # takes to notice is part of the claim, and waiting for the answer would make this unable
+        # to fail.
+        Start-Sleep -Milliseconds 1500
+
+        $focusNow = [WordLayout]::GetForeground()
+        Write-Note ("raised 0x{0:X} in front of 0x{1:X}; foreground 0x{2:X} -> 0x{3:X}" -f `
+                    [int64]$raised, [int64]$wasActive, [int64]$focusWas, [int64]$focusNow)
+        foreach ($line in @(Get-LogSince 'active ->')) { Write-Note "  log: $($line.Trim())" }
+
+        # The precondition that makes the rest mean anything: the keyboard did NOT move. Without
+        # this, a pass could be the old focus rule answering a question it was never asked.
+        Assert ($focusNow -eq $focusWas) 'the raise left the keyboard where it was'
+        Assert (-not [WordLayout]::IsToolWindow($raised)) 'the window in front is the one presented to Alt+Tab'
+        Assert ([WordLayout]::IsToolWindow($wasActive)) 'the window behind it gave the presentation up'
+        Assert (@(Get-LogSince 'active ->').Count -ge 1) 'the row said the active tab changed'
+
+        # Put the row back the way the suite found it, through the product's own path rather than by
+        # raising the old window the same way: what follows asserts on the active window, and leaving
+        # it decided by a z-order the user never touched would be this check bleeding into the next.
+        [WordLayout]::Focus($wasActive) | Out-Null
+        Start-Sleep -Milliseconds 900
+    }
+}
 # ---- minimising ----------------------------------------------------------------------------------
 #
 # The stack is one window to the user, so it goes down and comes back as one. Only the active window

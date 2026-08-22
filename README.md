@@ -137,6 +137,27 @@ powershell -Command "Remove-ItemProperty 'HKCU:\Software\WordTab' TabFontSize"  
 Anything outside 8..16 is treated as a typo: the strip clamps to that range and says so in the log.
 Close Word completely for a change to take effect.
 
+### How wide the window opens
+
+Word draws a page at its true size at 100% zoom, so a Word window several page-widths across shows
+several pages side by side. On a wide screen that is what Word restores its own window to, and it is
+where "it opens 3 pages wide" comes from - it is Word's layout, not the tab row.
+
+WordTab does two things about it, and the second beats the first:
+
+- **Before you have sized the window even once**, a window Word opens **three or more pages wide** is
+  narrowed to about one page, keeping its height and its corner. Two pages side by side is left
+  alone - that is ordinary on an ordinary screen.
+- **Once you size the window yourself**, that is what comes back on every Word start afterwards -
+  including maximized, if that is what you want. Dragging the edges, the maximize button,
+  double-clicking the title bar and Win+Up all count.
+
+```
+powershell -Command "Set-ItemProperty 'HKCU:\Software\WordTab' RowSize 0 -Type DWord"   # neither; Word decides
+```
+
+`settings.ps1` prints the remembered rectangle, or says nothing is remembered yet.
+
 ### What the window's × does
 
 Closing the *window* is not the same as closing a tab, so it asks: **close all N tabs**, **close only
@@ -212,12 +233,15 @@ that was built, measured and deliberately scrapped.
   the target has to be a window already in one.
 - A Word that has only ever held Protected View documents keeps the fallback palette until an
   ordinary document is in front, because a Protected View window has no ribbon body to sample.
-- Multi-monitor behaviour is unproven. Per-window DPI changes are handled, but this has only ever run
-  on a single-monitor machine.
-- WordTab has never run beside a working copy of Office Tab, and one report of the document area
-  laying out wrong comes from a machine where Office Tab's helper is loading. Both carve up the same
-  document frame. The add-in now says so in its log if it finds that its document frame has been
-  taken in under somebody else's container, which is the shape that would explain it.
+- Moving the row between screens of different scaling is unproven. Per-window DPI changes are
+  handled, and the machine WordTab runs on daily has two screens at 125% and 150% - but every
+  report from it so far has Word on the 150% one for the whole session, so a row that crosses
+  between them has never been observed. The development machine has one screen.
+- WordTab has never run beside a working copy of Office Tab. Both carve up the same document frame,
+  and the add-in says so in its log if it finds its document frame taken in under somebody else's
+  container. The machine that reported the document area laying out wrong no longer has Office Tab
+  on it at all - so that doubt is closed for anything reported from there now, and open for nothing
+  else, because there is no machine left that runs both.
 - **A View change has been reported to drop a window out of the row on one machine** — the document
   is never at risk, but the tab and the strip go. It has not been reproduced here
   (`tools\probe-view.ps1` drives every View command Word's object model offers and the row never

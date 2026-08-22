@@ -352,6 +352,19 @@ if (-not (Test-Path $SettingsKey)) { New-Item -Path $SettingsKey | Out-Null }
 $bannerExisting = $null
 try { $bannerExisting = (Get-ItemProperty -Path $SettingsKey -Name 'ShowLoadBanner' -ErrorAction Stop).ShowLoadBanner } catch { }
 
+# ...with one exception, once, and it is here because the rule above cannot tell a switch the user
+# set from one the installer stamped. The old unconditional write put ShowLoadBanner=1 on every
+# machine it touched. Stopping it was the fix, and on the work rig the fix did nothing: their report
+# came back with "ShowLoadBanner  on (1)" - the only value set in the whole key - on a build that no
+# longer writes it, and their log has the dialog opening at 07:51, 08:58 and 13:11, each one clicked
+# away by hand. Their words for it were "very annoying".
+#
+# A fix that only stops making the problem worse is not a fix for anyone who already has it. The
+# stamp is cleared once, marked so it cannot happen twice, and -Banner puts the dialog back for
+# anyone who actually wanted it - after which nothing here touches it again.
+$bannerSeedFixed = $null
+try { $bannerSeedFixed = (Get-ItemProperty -Path $SettingsKey -Name 'BannerSeedFixed' -ErrorAction Stop).BannerSeedFixed } catch { }
+
 if ($NoBanner -and $Banner) { throw 'Pass -NoBanner or -Banner, not both.' }
 
 if ($NoBanner) {
@@ -369,10 +382,19 @@ elseif ($null -eq $bannerExisting) {
     $bannerOn = $false
     Write-Ok 'Load banner: off (first install; -Banner turns the dialog on)'
 }
+elseif (($bannerExisting -ne 0) -and ($null -eq $bannerSeedFixed)) {
+    New-ItemProperty -Path $SettingsKey -Name 'ShowLoadBanner' -Value 0 -PropertyType DWord -Force | Out-Null
+    $bannerOn = $false
+    Write-Ok 'Load banner: off (an older installer turned this on by itself - cleared, once. -Banner puts it back)'
+}
 else {
     $bannerOn = ($bannerExisting -ne 0)
     Write-Ok ("Load banner: {0} (left as you set it)" -f $(if ($bannerOn) { 'on' } else { 'off' }))
 }
+
+# Written whichever way the above went, so the clearing happens on one install and never again -
+# including for somebody who turns the dialog back on straight afterwards.
+New-ItemProperty -Path $SettingsKey -Name 'BannerSeedFixed' -Value 1 -PropertyType DWord -Force | Out-Null
 
 # ---- verify ------------------------------------------------------------------------------------
 
