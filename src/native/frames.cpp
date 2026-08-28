@@ -399,8 +399,29 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         // propagate - it copied rectangles, so a stacked window looked maximized without being it.
         if (!g_inModalLoop)
         {
-            LogWrite(L"WM_SIZE  hwnd=0x%p  %s  %dx%d", (void*)hwnd,
-                     SizeTypeName(wParam), (int)LOWORD(lParam), (int)HIWORD(lParam));
+            // The outer rectangle and who asked for it, beside the client size.
+            //
+            // Both are here because of one thing in the field log that cannot be explained without
+            // them. A pure move - 203 position updates, none of them a resize - ended, and 16ms
+            // later every window in the row was resized 24x63px smaller, and the next gesture the
+            // user made banked that smaller rectangle as the size they had chosen. The log has five
+            // WM_SIZE lines for it and no way to tell which of the three things that resize windows
+            // did it: WordTab's own MatchTo, Word, or Windows.
+            //
+            // g_inSync answers exactly that, and it is free - it is already true or false at this
+            // instant for its own reasons. The drag case needs no words: this line is not written
+            // at all inside a modal move/size loop, so anything that reaches here is either ours or
+            // nobody's. The outer rect is what the row's remembered size is measured in, so it is
+            // the number to compare against the "remembers its size" line rather than a client size
+            // that has to be converted first.
+            RECT outer;
+            if (!GetWindowRect(hwnd, &outer))
+                outer.left = outer.top = outer.right = outer.bottom = 0;
+
+            LogWrite(L"WM_SIZE  hwnd=0x%p  %s  %dx%d  outer (%ld,%ld %ldx%ld)  %s", (void*)hwnd,
+                     SizeTypeName(wParam), (int)LOWORD(lParam), (int)HIWORD(lParam),
+                     outer.left, outer.top, outer.right - outer.left, outer.bottom - outer.top,
+                     StackIsSyncing() ? L"WordTab moved it" : L"nobody here asked for it");
         }
         // The stack is one window to the user, so it goes down to the taskbar and comes back as
         // one. This is where that is noticed.

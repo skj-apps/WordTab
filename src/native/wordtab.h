@@ -223,6 +223,17 @@ void StripRefreshTabs(void);
 // The name to put on a tab: the frame's title with Word's " - Word" suffix removed.
 void WordTabFrameTitle(HWND frame, wchar_t* out, int chars);
 
+// What the tab is CALLED - the name the row is drawing for this frame right now.
+//
+// The same as the above except in one case: a frame whose document has gone, whose title Word has
+// already reverted to a bare "Word", and about which the stack has not yet decided whether the tab
+// goes too. A tab that took that name there would be announcing a decision nobody has made. Live in
+// every other case, deliberately - see the definition for the regression that rule was written from.
+//
+// Everything that shows a tab's name to anybody - the two painters, the tooltip, the close dialog,
+// the row's own log line - asks this, so they cannot disagree.
+void StripTabName(HWND frame, wchar_t* out, int chars);
+
 // ---------------------------------------------------------------------------------------------
 // The stack - several Word windows held at one rectangle so they read as one window with tabs.
 // See stack.cpp. Membership is decided by what is true now (visible, has a document open in it),
@@ -248,6 +259,12 @@ void StackStop(void);
 // intermediate rectangle a drag passes through. Ignores any frame that is not the one defining
 // the row.
 void StackRememberRowSize(HWND frame);
+
+// Is the stack waiting to see whether this frame's missing document is a moment or a fact?
+//
+// TRUE only inside that grace window. FALSE for a frame that is not in the row, for one that is
+// there and holding a document, and for one whose loss has already been settled either way.
+BOOL StackIsWaitingFor(HWND frame);
 
 // Is a batch close - Close Others, Close All, Close Tabs to the Right - part-way through?
 //

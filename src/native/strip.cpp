@@ -271,6 +271,10 @@ struct StripState
 
     wchar_t title[256];
 
+    // Has this frame's title been seen collapsed to Word's placeholder without a decision about it
+    // yet? Cleared the moment a real title is taken. See ReadTitle for what the two states are for.
+    BOOL namelessSeen;
+
     // Does this window's document have unsaved changes? Read from Word's object model by the
     // janitor, cached here and compared against last tick exactly as the title is.
     //
@@ -1002,6 +1006,100 @@ static BOOL ApplyPalette(COLORREF chrome, const wchar_t* why)
 static void ApplyFallbackPalette(const wchar_t* why)
 {
     ApplyPalette(DarkThemeInUse() ? RGB(41, 41, 41) : RGB(255, 255, 255), why);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Which sampled colours are believed.
+//
+// `ApplyPalette` above compares for equality and rebuilds on any difference, which is right for the
+// callers that hand it a colour they already know - the theme registry, and a caller that has
+// decided. It is wrong for the sampler, and the work rig's log says so twice over in one day. What
+// arrives from the sampler is a *measurement*, and this is where a measurement becomes a decision.
+// ---------------------------------------------------------------------------------------------
+
+// How far a sampled colour has to move before it is a different colour.
+//
+// Measured, and it is the whole reason the first half of this gate exists: Word's ribbon reads
+// RGB(9,9,9) while its window is active and RGB(10,10,10) while it is not. Every switch between two
+// documents therefore moved the palette by one unit in each channel, and equality called that a new
+// theme - so one working day's log holds over a hundred palette rebuilds, each destroying and
+// remaking two brushes and invalidating every strip in the row, for a difference no display can
+// show.
+//
+// Four, because the Office themes this has to tell apart are nowhere near that close. Black samples
+// at 9, dark grey at 41, and the two light ones in the 240s and at 255: the smallest real gap is an
+// order of magnitude above this number and the observed jitter an order of magnitude below it.
+// There is no value in between that would be a hard call.
+#define CHROME_SAME_WITHIN 4
+
+static BOOL ChromeNear(COLORREF a, COLORREF b)
+{
+    int dr = (int)GetRValue(a) - (int)GetRValue(b);
+    int dg = (int)GetGValue(a) - (int)GetGValue(b);
+    int db = (int)GetBValue(a) - (int)GetBValue(b);
+    if (dr < 0) dr = -dr;
+    if (dg < 0) dg = -dg;
+    if (db < 0) db = -db;
+    return (dr <= CHROME_SAME_WITHIN && dg <= CHROME_SAME_WITHIN && db <= CHROME_SAME_WITHIN)
+           ? TRUE : FALSE;
+}
+
+// A new colour is adopted on the second reading, never the first.
+//
+// The dead band handles a palette jittering between two neighbouring values. This handles the other
+// thing the log shows: a single sample that is not the ribbon at all. Twice in one day the sampler
+// returned RGB(0,0,0) with every reading either side of it RGB(10,10,10), and because ApplyPalette
+// believes whatever it is handed, the whole row went a different colour for the two seconds until
+// the next sample put it back.
+//
+// Nothing about that sample is detectable from inside itself. It is flat, it is owned by the ribbon,
+// it passes every test SampleChrome makes - the one thing separating it from a real theme change is
+// that a real theme change is still true two seconds later. So that is the test, because it is the
+// only one there is.
+//
+// What it costs is that a genuine theme change reaches the strip one sample - two seconds - later
+// than it used to. A theme change is a person in File > Account, so that is not a delay anybody is
+// waiting on. The FIRST sample of a process is exempt: until then the palette is the registry's
+// guess rather than a measurement, and making the first measurement wait would leave a colour that
+// may be wrong up for twice as long as it is now, which is the opposite of the point.
+static BOOL AdoptSampledChrome(COLORREF chrome, HWND from)
+{
+    static BOOL     everSampled = FALSE;
+    static BOOL     pendingSet  = FALSE;
+    static COLORREF pending     = 0;
+
+    // Already showing this colour, near enough. The common case by a very long way, and the one the
+    // dead band exists for: it has to cost nothing and say nothing.
+    if (g_paletteReady && everSampled && ChromeNear(g_palette.chrome, chrome))
+    {
+        pendingSet = FALSE;
+        return FALSE;
+    }
+
+    if (everSampled && (!pendingSet || !ChromeNear(pending, chrome)))
+    {
+        // Once per candidate rather than once per sample, which matters: a colour that keeps
+        // arriving and keeps failing to be confirmed would otherwise write a line every two seconds
+        // for as long as Word is open. A second reading either adopts it - and ApplyPalette says so
+        // in the line this project already greps for - or is replaced by a different candidate,
+        // which writes its own line naming that one.
+        LogWrite(L"strip  chrome read as RGB(%d,%d,%d) in 0x%p against a palette of RGB(%d,%d,%d) - "
+                 L"waiting for a second reading before believing it",
+                 GetRValue(chrome), GetGValue(chrome), GetBValue(chrome), (void*)from,
+                 GetRValue(g_palette.chrome), GetGValue(g_palette.chrome),
+                 GetBValue(g_palette.chrome));
+        pending    = chrome;
+        pendingSet = TRUE;
+        return FALSE;
+    }
+
+    everSampled = TRUE;
+    pendingSet  = FALSE;
+
+    wchar_t why[96];
+    _snwprintf(why, 96, L"sampled from Word's ribbon in 0x%p", (void*)from);
+    why[95] = 0;
+    return ApplyPalette(chrome, why);
 }
 
 static void MakeFont(StripState* state)
@@ -2231,7 +2329,7 @@ static void DrawOneTab(StripState* state, Surface* s, HWND frame, int index,
     BOOL hasClose = !IsRectEmpty(&close) && close.right <= tab.right;
 
     wchar_t title[256];
-    WordTabFrameTitle(frame, title, 256);
+    StripTabName(frame, title, 256);
 
     RECT text = tab;
     text.left += Scaled(12, dpi);
@@ -2565,7 +2663,7 @@ static void DrawStripFlat(StripState* state, HDC dc, const RECT* client)
         }
 
         wchar_t title[256];
-        WordTabFrameTitle(frames[i], title, 256);
+        StripTabName(frames[i], title, 256);
 
         BOOL hasClose = !IsRectEmpty(&layout.close[i]);
         RECT text = tab;
@@ -4229,6 +4327,23 @@ static void TipShow(StripState* state, HWND hwnd)
 {
     KillTimer(hwnd, ID_TIP_SHOW);
 
+    // Nothing is armed, so there is nothing to show.
+    //
+    // Not defensive tidiness - this fired twice in one day on the work rig, both times as a frame
+    // was being destroyed under the pointer, and it produced a line naming the null window:
+    //
+    //     tip: hwnd=0x0000000000000000  ||  nothing to add (name fits; Word would not say where it is)
+    //
+    // The test below is `hit.frame != g_tipFrame`, and when the tab has gone both sides are NULL.
+    // Two nothings comparing equal read as "the pointer is still on the tab we armed", so the whole
+    // body ran on a window that does not exist - including a call into Word's object model asking
+    // for the document path of NULL, which is the part that is worth not doing.
+    if (!g_tipFrame)
+    {
+        LogWrite(L"tip: the wait ended with no tab armed - nothing to show");
+        return;
+    }
+
     // Where the pointer is *now*, not where it was when the timer was armed. Half a second is long
     // enough for the row to have scrolled under a still hand, for that document to have been closed,
     // or for the pointer to have been moved by something that sends no mouse message at all.
@@ -4284,7 +4399,7 @@ static void TipShow(StripState* state, HWND hwnd)
     }
 
     wchar_t name[256];
-    WordTabFrameTitle(hit.frame, name, 256);
+    StripTabName(hit.frame, name, 256);
 
     wchar_t folder[MAX_PATH];
     BOOL answered = WordTabReadDocumentPath(hit.frame, folder, MAX_PATH);
@@ -5128,29 +5243,121 @@ void WordTabFrameTitle(HWND frame, wchar_t* out, int chars)
         wcscpy(out, L"Word");
 }
 
+// What the tab is CALLED, which is not always what the window is called this instant.
+//
+// WordTabFrameTitle above is a pure function of the window title, and that is the right thing for it
+// to be. This is the other question, and it needed asking separately: a frame whose document has
+// just gone still has a tab in the row for as long as the stack is deciding whether to keep it, and
+// during that half second its window title has already reverted to a bare "Word".
+//
+// Every reader goes through here - both painters, the tooltip, the row's log line, the close
+// dialog's heading - and that is the point rather than tidiness. The report that queued this shows
+// the row line printing |Word| for a tab that was about to disappear, and a log that disagrees
+// with the screen about what a tab is called has cost this project two diagnoses.
+//
+// **Live except in the one case the last decided name exists for.** The first version of this
+// returned `state->title` whenever there was one, which reads like the tidier rule and was wrong in
+// a way the battery caught within the hour: a strip binds to a frame BEFORE Word has put a title on
+// it, so the name it records at bind time is the placeholder, and serving that for the half second
+// until the janitor's next tick made a document opening flash a tab called "Word" - a fresh instance
+// of the defect this whole change is here to remove. check-onepage's log went from no row line
+// carrying a |Word| to four of them.
+//
+// So the question is asked of the window first, and `state->title` is consulted only when the window
+// has stopped offering a name at all. That also decides the case correctly at every stage without a
+// flag to keep in step: before ReadTitle has ruled, the last real name is still in `state->title` and
+// is what is drawn; once ReadTitle rules that the frame genuinely has no document, `state->title`
+// becomes the placeholder itself and this falls through to the live answer, which is the same thing.
+void StripTabName(HWND frame, wchar_t* out, int chars)
+{
+    if (!out || chars <= 0)
+        return;
+
+    wchar_t raw[256];
+    raw[0] = L'\0';
+    if (frame && IsWindow(frame))
+    {
+        GetWindowTextW(frame, raw, 256);
+        raw[255] = L'\0';
+    }
+
+    // The same test ReadTitle makes, and on the same thing - the RAW title, so that a document
+    // actually called Word ("Word - Word") is not mistaken for a window that has lost one.
+    if (raw[0] == L'\0' || wcscmp(raw, L"Word") == 0)
+    {
+        StripState* state = FindByFrame(frame);
+        if (state && state->title[0] != L'\0' && wcscmp(state->title, L"Word") != 0)
+        {
+            wcsncpy(out, state->title, (size_t)chars - 1);
+            out[chars - 1] = L'\0';
+            return;
+        }
+    }
+
+    WordTabFrameTitle(frame, out, chars);
+}
+
 static void ReadTitle(StripState* state)
 {
     wchar_t title[256];
     WordTabFrameTitle(state->frame, title, 256);
 
-    if (wcscmp(title, state->title) != 0)
+    if (wcscmp(title, state->title) == 0)
+        return;
+
+    wchar_t raw[256];
+    GetWindowTextW(state->frame, raw, 256);
+    raw[255] = L'\0';
+
+    // A frame whose document has gone reverts to a bare "Word", or to no title at all, and Word
+    // reuses that frame for the next document rather than destroying it. So this is not a rename -
+    // it is a window on its way out of the row, or on its way to holding something else.
+    //
+    // Tested on the RAW title rather than the cleaned name, and that is the difference between a
+    // rule and a guess: a document actually called Word gives "Word - Word" here and is not this.
+    BOOL nameless = (raw[0] == L'\0' || wcscmp(raw, L"Word") == 0) ? TRUE : FALSE;
+
+    if (nameless && state->title[0] != L'\0' && wcscmp(state->title, L"Word") != 0)
     {
-        wcsncpy(state->title, title, 255);
-        state->title[255] = L'\0';
-
-        // A tab name is drawn and never stored in a control, so there is no way to read one from
-        // outside the process. This line is that way. check-title.ps1 asserts the exact string
-        // against it and then photographs the painted text as well, because a log line about what
-        // was computed is not on its own evidence of what was drawn.
-        wchar_t raw[256];
-        GetWindowTextW(state->frame, raw, 256);
-        raw[255] = L'\0';
-        LogWrite(L"strip  hwnd=0x%p  tab name |%s|  from window title |%s|",
-                 (void*)state->frame, state->title, raw);
-
-        // Every strip shows every tab, so one window's title changing has to repaint all of them.
-        StripRefreshTabs();
+        // Never believed on first sight, and after that only while the stack is not waiting.
+        //
+        // Two facts about the order of this file's janitor make this the shape it is. ReadTitle runs
+        // in the per-strip loop ABOVE StackJanitor, so on the tick a document goes away the title
+        // has already been read and drawn by the time the stack notices - measured at 11ms in the
+        // report that queued this. And once the stack does have an answer, it is exactly the right
+        // question to ask: while it is waiting to see whether the loss is a moment or a fact, a tab
+        // that renames itself has decided it is a fact.
+        //
+        // So the first sight is deferred one tick, which puts the second sight after a StackJanitor
+        // that has seen the same thing. Nothing is lost by waiting: a frame handed a new document
+        // arrives with a real title and takes it here, and a frame that has genuinely gone leaves
+        // the row rather than being renamed in it.
+        //
+        // A frame really sitting in the row with no document - which happens, and once had this row
+        // showing a tab called "Word" for four slices - still gets its "Word". Half a second later
+        // than before, and only once the stack has agreed it belongs there.
+        if (!state->namelessSeen)
+        {
+            state->namelessSeen = TRUE;
+            return;
+        }
+        if (StackIsWaitingFor(state->frame))
+            return;
     }
+
+    state->namelessSeen = FALSE;
+    wcsncpy(state->title, title, 255);
+    state->title[255] = L'\0';
+
+    // A tab name is drawn and never stored in a control, so there is no way to read one from
+    // outside the process. This line is that way. check-title.ps1 asserts the exact string
+    // against it and then photographs the painted text as well, because a log line about what
+    // was computed is not on its own evidence of what was drawn.
+    LogWrite(L"strip  hwnd=0x%p  tab name |%s|  from window title |%s|",
+             (void*)state->frame, state->title, raw);
+
+    // Every strip shows every tab, so one window's title changing has to repaint all of them.
+    StripRefreshTabs();
 }
 
 // Apply the shift for the first time. Everything after this is driven by WM_WINDOWPOSCHANGING;
@@ -5925,11 +6132,26 @@ static void PollModified(void)
     // a steady state of about 200, so the record line described a cold start and then fell silent
     // forever. A worst case with no typical case beside it is not a measurement of what something
     // costs.
-    static LONGLONG worstEver = -1;
-    if (us > worstEver)
+    //
+    // Kept apart for the two kinds of pass, like the rungs above and for the same reason: they
+    // measure different things. Pooling them was a real fault in the instrument rather than an
+    // untidiness. The field log has
+    //
+    //     dot poll: 1 window(s), 480 passes, mean 232103 us, worst 516165 us
+    //
+    // which reads as the ACTIVE window costing a quarter of a second a pass - and the comment fifty
+    // lines above tells the next reader that a line saying so is the one to look for, because it
+    // would mean the whole design's assumption had failed. It had not. "1 window(s)" is only
+    // whichever kind of pass happened to run last before the counter came due, and the mean is over
+    // both. The number that matters most in the report this instrument exists to produce could not
+    // be read at all.
+    static LONGLONG worstEver[2] = { -1, -1 };
+    LONGLONG* record = &worstEver[full ? 1 : 0];
+    if (us > *record)
     {
-        worstEver = us;
-        LogWrite(L"strip  dot poll: %d window(s) in %lld us (the most it has ever taken)", asked, us);
+        *record = us;
+        LogWrite(L"strip  dot poll: %s in %lld us (the most it has ever taken)",
+                 full ? L"the whole row" : L"the active window", us);
     }
 
     // ...and a summary: once ten seconds in, and every four minutes after that.
@@ -5940,24 +6162,29 @@ static void PollModified(void)
     // first call is Word building its automation machinery. A cold outlier with nothing beside it
     // says almost nothing about what this costs. The four-minute cadence afterwards is rare enough
     // not to crowd a log that rolls at half a megabyte.
-    static int      passes    = 0;
-    static int      reportAt  = 20;
-    static LONGLONG total     = 0;
-    static LONGLONG worst     = 0;
+    static int      passes[2]   = { 0, 0 };
+    static int      reportAt[2] = { 20, 20 };
+    static LONGLONG total[2]    = { 0, 0 };
+    static LONGLONG worst[2]    = { 0, 0 };
 
-    passes++;
-    total += us;
-    if (us > worst)
-        worst = us;
+    const int kind = full ? 1 : 0;
 
-    if (passes >= reportAt)
+    passes[kind]++;
+    total[kind] += us;
+    if (us > worst[kind])
+        worst[kind] = us;
+
+    if (passes[kind] >= reportAt[kind])
     {
-        LogWrite(L"strip  dot poll: %d window(s), %d passes, mean %lld us, worst %lld us",
-                 asked, passes, total / passes, worst);
-        passes   = 0;
-        total    = 0;
-        worst    = 0;
-        reportAt = 480;
+        // The window count stays on the line - it is what a row pass actually asked, and it moves -
+        // but it is no longer the only thing saying which kind of pass this was.
+        LogWrite(L"strip  dot poll: %s, %d window(s), %d passes, mean %lld us, worst %lld us",
+                 full ? L"the whole row" : L"the active window",
+                 asked, passes[kind], total[kind] / passes[kind], worst[kind]);
+        passes[kind]   = 0;
+        total[kind]    = 0;
+        worst[kind]    = 0;
+        reportAt[kind] = 480;
     }
 }
 
@@ -6123,14 +6350,18 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
                     const wchar_t* mine = L"ok";
                     if (SampleChrome(state, &chrome, &mine))
                     {
-                        // Which window answered. The palette is one object shared by every strip, so
-                        // a line saying only "sampled from Word's ribbon" cannot distinguish the
-                        // healthy case from this subsystem's one real bug - a window that should not
-                        // have been asked speaking for all of them.
-                        wchar_t from[96];
-                        _snwprintf(from, 96, L"sampled from Word's ribbon in 0x%p", (void*)state->frame);
-                        from[95] = 0;
-                        ApplyPalette(chrome, from);
+                        // Which window answered is carried into the log line by AdoptSampledChrome:
+                        // the palette is one object shared by every strip, so a line saying only
+                        // "sampled from Word's ribbon" cannot distinguish the healthy case from this
+                        // subsystem's one real bug - a window that should not have been asked
+                        // speaking for all of them.
+                        //
+                        // `applied` means a window ANSWERED, not that the palette changed, which is
+                        // why it is still set when the gate declines to adopt. It decides whose
+                        // reason reaches the log, and the reason here is "ok" either way: the sample
+                        // succeeded, and what was then done with it is a separate line in its own
+                        // words.
+                        AdoptSampledChrome(chrome, state->frame);
                         why     = mine;
                         applied = TRUE;
                         break;

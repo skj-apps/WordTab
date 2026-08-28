@@ -169,7 +169,7 @@ static void LogRow(void)
             continue;
 
         wchar_t name[128];
-        WordTabFrameTitle(g_members[i].frame, name, 128);
+        StripTabName(g_members[i].frame, name, 128);
 
         int wrote = _snwprintf(line + at, (size_t)(1024 - at), L"%s0x%p |%s|",
                                at ? L"  " : L"", (void*)g_members[i].frame, name);
@@ -664,6 +664,21 @@ void StackRememberRowSize(HWND frame)
     if (!member || !member->joined || frame != g_active)
         return;
     RememberRowRect();
+}
+
+// Is this frame inside the grace window - the stack has noticed it has no document and is waiting
+// to see whether that is a moment or a fact?
+//
+// Exported for the strip, which has the same question to answer about the same half second and no
+// way of its own to answer it. A frame that loses its document reverts to a bare "Word" title
+// immediately, and the strip's title poll runs ABOVE StackJanitor in the same tick - so without
+// this the row renames a tab to "Word" while the stack is still deciding whether the tab should be
+// there at all. Two things saying different things about the same window in the same tick is the
+// shape that put a tab called "Word" in the row for a second and a half in the field.
+BOOL StackIsWaitingFor(HWND frame)
+{
+    Member* member = Find(frame);
+    return (member && member->joined && member->missedAt != 0) ? TRUE : FALSE;
 }
 
 static BOOL Join(Member* member)
@@ -2320,7 +2335,7 @@ typedef HRESULT (WINAPI *TaskDialogIndirectFn)(const TASKDIALOGCONFIG*, int*, in
 static int AskWhatToClose(HWND frame, int tabs)
 {
     wchar_t name[128];
-    WordTabFrameTitle(frame, name, 128);
+    StripTabName(frame, name, 128);
 
     wchar_t heading[160];
     _snwprintf(heading, 160, L"Close all %d tabs in this window?", tabs);

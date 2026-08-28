@@ -222,8 +222,9 @@ The build is byte-for-byte reproducible: the same sources give the same DLL hash
 
 ## Checking it
 
-Twelve suites drive a real Word with real mouse and keyboard input and assert what happens — about
-580 checks, roughly twenty minutes.
+Fourteen suites drive a real Word with real mouse and keyboard input and assert what happens, and two
+more (`governor`, `palette`) start no Word at all and replay a decision against measurements taken
+from the machine WordTab runs on daily — 837 checks in all, roughly twenty minutes.
 
 ```
 pwsh -File tools\check-all.ps1 *>&1 | Tee-Object -FilePath "$env:TEMP\battery.txt"
@@ -253,6 +254,9 @@ that was built, measured and deliberately scrapped.
   the target has to be a window already in one.
 - A Word that has only ever held Protected View documents keeps the fallback palette until an
   ordinary document is in front, because a Protected View window has no ribbon body to sample.
+- Changing the Office theme takes about four seconds to reach the tab row rather than two. A sampled
+  colour is adopted only once a second reading agrees with it, because a single reading has twice
+  been something other than the ribbon - see `src\native\RESULT-believe.md`.
 - Moving the row between screens of different scaling is unproven. Per-window DPI changes are
   handled, and the machine WordTab runs on daily has two screens at 125% and 150% - but every
   report from it so far has Word on the 150% one for the whole session, so a row that crosses

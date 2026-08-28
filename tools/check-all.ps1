@@ -28,11 +28,13 @@ $ErrorActionPreference = 'Continue'
 # Ordered cheapest-first so a broken build fails fast, with soak last: it opens the most documents
 # and is the one whose leftovers used to poison whatever ran next.
 #
-# `governor` is first and is not like the others: it starts no Word at all, runs in about a second,
-# and is pure arithmetic, so it cannot be flaky. It is also the only suite that can see the branch
-# the dot poll's governor exists for, because this machine cannot produce a slow Document.Saved -
-# see tools\check-governor.ps1. Cheapest-first therefore puts it at the front by its own rule.
-$suites = @('governor', 'stack', 'row', 'rowsize', 'onepage', 'strip', 'tabs', 'menu', 'reorder', 'startscreen', 'look', 'scroll', 'title', 'dot', 'soak-stack')
+# `governor` and `palette` are first and are not like the others: they start no Word at all, run in
+# about a second each, and are pure arithmetic, so they cannot be flaky. They are also the only
+# suites that can see the branches they cover, because this machine cannot produce the input - a slow
+# Document.Saved for one, a ribbon that changes colour under the sampler for the other. See
+# tools\check-governor.ps1 and tools\check-palette.ps1. Cheapest-first therefore puts them at the
+# front by its own rule.
+$suites = @('governor', 'palette', 'stack', 'row', 'rowsize', 'onepage', 'strip', 'tabs', 'menu', 'reorder', 'startscreen', 'look', 'scroll', 'title', 'dot', 'soak-stack')
 if ($Only) {
     # `pwsh -File script.ps1 -Only reorder,look` passes ONE literal string, not two: with -File every
     # argument arrives as text and PowerShell does no array parsing, so a [string[]] parameter gets a
