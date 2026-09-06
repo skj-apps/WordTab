@@ -490,7 +490,7 @@ $controlThird.Bottom = $control.Bottom
 
 $hoverX = $target.Left + [int](($target.Right - $target.Left) / 3)
 $hoverY = [int](($target.Top + $target.Bottom) / 2)
-Assert (Set-Pointer $hoverX $hoverY 'hovering tab 0') 'the pointer could be put on tab 0'
+Assert (Set-Pointer $hoverX $hoverY 'hovering tab 0' -Onto 'WordTabStrip') 'the pointer could be put on tab 0'
 Start-Sleep -Milliseconds 900
 
 # Say where the pointer actually ended up and what is under it. "0 pixels changed" has two very
@@ -558,7 +558,7 @@ $width = $pick.Right - $pick.Left
 $x = $pick.Left + [int]($width / 3)
 $y = [int](($pick.Top + $pick.Bottom) / 2)
 
-Assert (Set-Pointer $x $y 'hovering the tab to be carried') 'the pointer could be put on the tab about to be carried'
+Assert (Set-Pointer $x $y 'hovering the tab to be carried' -Onto 'WordTabStrip') 'the pointer could be put on the tab about to be carried'
 Start-Sleep -Milliseconds 900
 $rest = Get-StripShot $strip
 

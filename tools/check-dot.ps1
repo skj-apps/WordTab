@@ -597,7 +597,7 @@ $spot = $row.Layout.Tabs[1]
 $hx = [int](($spot.Left + $spot.Right) / 2)
 $hy = [int](($spot.Top + $spot.Bottom) / 2)
 
-Assert (Set-Pointer $hx $hy 'hovering Beta') 'the pointer arrived on Beta'
+Assert (Set-Pointer $hx $hy 'hovering Beta' -Onto 'WordTabStrip') 'the pointer arrived on Beta'
 Start-Sleep -Milliseconds 700
 
 $row = Get-Row

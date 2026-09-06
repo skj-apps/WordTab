@@ -40,11 +40,70 @@ param(
     [int]$Documents = 3,
     [switch]$KeepOpen,
     [switch]$Screenshot,
-    [string]$ShotDir = $env:TEMP
+    [string]$ShotDir = $env:TEMP,
+
+    # The pin for the trap below. It throws where the 2026-09-04 crash threw, so that "the cleanup
+    # still runs when the suite dies" can be SEEN to be true rather than argued for:
+    #
+    #     pwsh -File tools\check-stack.ps1 -PinThrow
+    #
+    # should name the error and its line, close Word anyway, and leave with a non-zero exit code.
+    # check-all passes no such switch, so it is inert in a battery. Every fix should leave behind the
+    # thing that fails without it.
+    [switch]$PinThrow
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# ------------------------------------------------------------------------------------------------
+# Closing Word is a FINALLY, not a last line.
+#
+# This suite runs first in check-all, and its cleanup is the one with the most to poison. It was
+# written as the last statement of the script, which means any unhandled error skipped it entirely -
+# and on 2026-09-04 one did:
+#
+#     ==> Minimising the stack
+#     check-stack.ps1: Index was outside the bounds of the array.
+#
+# Three Word windows were left up, check-row started against them, and reported `the row has four
+# tabs (has 7)` eight ways. One stolen foreground cost a whole battery, and the diagnosis cost most
+# of a session, because the suite that failed was not the suite that broke.
+#
+# The throw itself is guarded where it happened, below. This is the general answer: whatever else
+# goes wrong in here, the windows this suite opened are closed before it leaves, so the NEXT suite
+# measures its own fixtures. Word is closed the polite way - Close-AllWord posts WM_CLOSE per frame
+# and stops if Word asks a question, because a test script may not answer a save prompt it did not
+# raise. See the note further down about CloseMainWindow-then-Kill, which is how Word came to offer
+# document recovery to the next suite.
+function Invoke-StackCleanup {
+    if ($KeepOpen -or -not $startedWord) { return }
+    Write-Step 'Closing Word'
+    $end = Close-AllWord
+    if (-not $end.Closed) {
+        Write-Note ("Word is still up ({0}): {1}" -f $end.Reason, (Format-WordWindow $end.Dialog))
+        Write-Note 'Answer it by hand before running the next suite - a leftover Word poisons whatever runs next.'
+    }
+}
+
+# A trap rather than a try/finally wrapped round eight hundred lines: it reaches every statement in
+# the script without re-indenting any of them, which matters because the diff is what the next reader
+# checks. It names the error and WHERE it was, then cleans up and leaves with a failure exit code, so
+# check-all records this suite as red instead of recording the next one as red.
+trap {
+    Write-Host ''
+    Write-Host ("check-stack stopped on an unhandled error: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    if ($_.InvocationInfo) {
+        Write-Host ("  at line {0}: {1}" -f $_.InvocationInfo.ScriptLineNumber,
+                                            $_.InvocationInfo.Line.Trim()) -ForegroundColor Red
+    }
+    try { Invoke-StackCleanup } catch {
+        Write-Host ("  and the cleanup itself failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    }
+    Write-Host ("FAIL  stopped after {0} checks, {1} failure(s), plus the error above" -f
+                $script:Checks, $script:Failures) -ForegroundColor Red
+    exit ([Math]::Max(1, $script:Failures))
+}
 
 $source = Get-Content -Raw -Path (Join-Path $PSScriptRoot 'WordLayout.cs')
 Add-Type -AssemblyName System.Drawing
@@ -549,52 +608,69 @@ if ((Get-FrameCount) -ge 2) {
 # has a taskbar button, so if the others did not come back with it they would be stranded: minimised,
 # no button, no Alt+Tab entry.
 
+if ($PinThrow) { throw '-PinThrow: pretending the foreground was stolen here' }
+
 Write-Step 'Minimising the stack'
 $before = @(Get-Frames)
-[WordLayout]::Focus($before[0]) | Out-Null
-$activeNow = [WordLayout]::GetForeground()
-if (-not ($before -contains $activeNow)) { $activeNow = $before[0] }
 
-[WordLayout]::Show($activeNow, 6)          # SW_MINIMIZE
-Start-Sleep -Milliseconds 1500
-$down = @($before | Where-Object { [WordLayout]::Minimized($_) })
-Assert ($down.Count -eq $before.Count) "every window went down with it ($($down.Count) of $($before.Count))"
-
-# ...and went down OUT OF SIGHT, which is a separate question and the one this suite used to skip.
+# NAMED, and the whole step skipped rather than indexed and hoped for. This is the line that threw on
+# 2026-09-04: the step before it lost the foreground to another application, the windows went with
+# it, Get-Frames came back empty, and `$before[0]` under Set-StrictMode is a hard error rather than
+# $null. The count is what a reader needs and what the crash never printed.
 #
-# Windows parks a minimised window near -32000. It does that for windows the shell manages, and the
-# followers in a stack are not: PresentWindow puts WS_EX_TOOLWINDOW on every window except the active
-# one, to keep them out of the taskbar and Alt+Tab. A minimised tool window is left in the old
-# minimised-window area at a real desktop coordinate and drawn there.
-#
-# The work rig's log of 2026-09-04 is the report of this, with its own control in the same three
-# lines: the active window - the one window still shell-managed - landed at (-32000,-32000), while the
-# two followers landed at (0,1101) and (237,1101), one SM_CXMINSPACING apart. The user confirmed
-# seeing the leftover stubs on their desktop and had not thought them worth reporting.
-#
-# Asserted as "does not touch the screen" rather than "is at -32000", because the harm is that the
-# user can see it; -32000 is only how Windows happens to say the same thing.
-$screen = [WordLayout]::ScreenRect()
-$stranded = @()
-foreach ($f in $before)
-{
-    $r = [WordLayout]::RectOf($f)
-    if ($r.Right -gt $screen.Left -and $r.Left -lt $screen.Right -and
-        $r.Bottom -gt $screen.Top -and $r.Top -lt $screen.Bottom)
-    {
-        $stranded += ('0x{0:X} tool={1} at ({2},{3} {4}x{5})' -f
-                      [int64]$f, [WordLayout]::IsToolWindow($f), $r.Left, $r.Top,
-                      ($r.Right - $r.Left), ($r.Bottom - $r.Top))
-    }
+# The asserts that follow the restore are inside the else for the same reason. Left outside, they
+# compare 0 against 0 and PASS - a step that measured nothing reporting that everything came back.
+if ($before.Count -eq 0) {
+    Assert $false ("there are windows to minimise (Get-Frames found none - something closed them, " +
+                   "or took the foreground away from Word)")
 }
-if ($stranded.Count) { $stranded | ForEach-Object { Write-Note "  still on screen: $_" } }
-Assert ($stranded.Count -eq 0) "every minimised window is parked off-screen, not left drawn on the desktop ($($stranded.Count) still visible)"
+else {
+    [WordLayout]::Focus($before[0]) | Out-Null
+    $activeNow = [WordLayout]::GetForeground()
+    if (-not ($before -contains $activeNow)) { $activeNow = $before[0] }
 
-[WordLayout]::Show($activeNow, 9)          # SW_RESTORE
-Start-Sleep -Seconds 2
-$up = @($before | Where-Object { -not [WordLayout]::Minimized($_) })
-Assert ($up.Count -eq $before.Count) "every window came back with it ($($up.Count) of $($before.Count))"
-Test-Stacked 'After minimise and restore' | Out-Null
+    [WordLayout]::Show($activeNow, 6)          # SW_MINIMIZE
+    Start-Sleep -Milliseconds 1500
+    $down = @($before | Where-Object { [WordLayout]::Minimized($_) })
+    Assert ($down.Count -eq $before.Count) "every window went down with it ($($down.Count) of $($before.Count))"
+
+    # ...and went down OUT OF SIGHT, which is a separate question and the one this suite used to skip.
+    #
+    # Windows parks a minimised window near -32000. It does that for windows the shell manages, and the
+    # followers in a stack are not: PresentWindow puts WS_EX_TOOLWINDOW on every window except the active
+    # one, to keep them out of the taskbar and Alt+Tab. A minimised tool window is left in the old
+    # minimised-window area at a real desktop coordinate and drawn there.
+    #
+    # The work rig's log of 2026-09-04 is the report of this, with its own control in the same three
+    # lines: the active window - the one window still shell-managed - landed at (-32000,-32000), while the
+    # two followers landed at (0,1101) and (237,1101), one SM_CXMINSPACING apart. The user confirmed
+    # seeing the leftover stubs on their desktop and had not thought them worth reporting.
+    #
+    # Asserted as "does not touch the screen" rather than "is at -32000", because the harm is that the
+    # user can see it; -32000 is only how Windows happens to say the same thing.
+    $screen = [WordLayout]::ScreenRect()
+    $stranded = @()
+    foreach ($f in $before)
+    {
+        $r = [WordLayout]::RectOf($f)
+        if ($r.Right -gt $screen.Left -and $r.Left -lt $screen.Right -and
+            $r.Bottom -gt $screen.Top -and $r.Top -lt $screen.Bottom)
+        {
+            $stranded += ('0x{0:X} tool={1} at ({2},{3} {4}x{5})' -f
+                          [int64]$f, [WordLayout]::IsToolWindow($f), $r.Left, $r.Top,
+                          ($r.Right - $r.Left), ($r.Bottom - $r.Top))
+        }
+    }
+    if ($stranded.Count) { $stranded | ForEach-Object { Write-Note "  still on screen: $_" } }
+    Assert ($stranded.Count -eq 0) "every minimised window is parked off-screen, not left drawn on the desktop ($($stranded.Count) still visible)"
+
+    [WordLayout]::Show($activeNow, 9)          # SW_RESTORE
+    Start-Sleep -Seconds 2
+
+    $up = @($before | Where-Object { -not [WordLayout]::Minimized($_) })
+    Assert ($up.Count -eq $before.Count) "every window came back with it ($($up.Count) of $($before.Count))"
+    Test-Stacked 'After minimise and restore' | Out-Null
+}
 
 # ---- closing a document ------------------------------------------------------------------------
 
@@ -786,14 +862,7 @@ if (-not $KeepOpen) {
 #
 # Close-AllWord posts WM_CLOSE per frame and stops if Word asks a question, because a test script may
 # not answer a save prompt it did not raise.
-if (-not $KeepOpen -and $startedWord) {
-    Write-Step 'Closing Word'
-    $end = Close-AllWord
-    if (-not $end.Closed) {
-        Write-Note ("Word is still up ({0}): {1}" -f $end.Reason, (Format-WordWindow $end.Dialog))
-        Write-Note 'Answer it by hand before running the next suite - a leftover Word poisons whatever runs next.'
-    }
-}
+Invoke-StackCleanup
 
 Write-Host ''
 if ($script:Failures -eq 0) {

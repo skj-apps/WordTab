@@ -254,7 +254,7 @@ function Use-Wheel($notches) {
     # The wheel goes to whatever is under the POINTER, not to the foreground window - so if this move
     # silently does not take, every notch below is delivered to some other window and the row simply
     # does not move, which reads exactly like a strip that ignores the wheel.
-    if (-not (Set-Pointer $p.X $p.Y 'putting the pointer over the tab row')) {
+    if (-not (Set-Pointer $p.X $p.Y 'putting the pointer over the tab row' -Onto 'WordTabStrip')) {
         Write-Note 'the pointer would not go over the row - the wheel notches below will not reach the strip'
     }
     $overWhat = Get-ClassAt $p.X $p.Y

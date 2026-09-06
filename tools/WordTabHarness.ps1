@@ -972,15 +972,94 @@ function Test-WordHasFocus {
 # hovered tab sampling the well colour - against hover code that was working perfectly.
 
 # Move the pointer, and prove it arrived.
-function Set-Pointer($x, $y, $what) {
+<#
+  Put the pointer somewhere, and confirm it was DELIVERED rather than merely that it arrived.
+
+  The old version asked GetCursorPos whether the pointer was where it had been sent. That is a true
+  statement about the POINTER and says nothing about whether the window under it was told, and the
+  strip's hover state is driven by WM_MOUSEMOVE, not by where the cursor happens to be. The 2026-09-05
+  battery has the failure in its own words: `hovering a modified tab brings the x back` failed with
+  `PASS  the pointer arrived on Beta` on the line above it, and the add-in logged eight seconds of
+  tooltip silence across the whole step where the passing run logged four show/hide pairs.
+
+  MEASURED, in tools\move-delivery.cpp - one window of its own, counting WM_MOUSEMOVE in its own
+  window procedure, no Word and no add-in:
+
+      2. a REAL move, B -> A                         ->  1 WM_MOUSEMOVE   GetCursorPos says (400,380)
+      3. the SAME point again, A -> A                ->  0 WM_MOUSEMOVE   GetCursorPos says (400,380)
+      4. and once more, A -> A                       ->  0 WM_MOUSEMOVE   GetCursorPos says (400,380)
+      5. nudge away, A -> A+1                        ->  1 WM_MOUSEMOVE   GetCursorPos says (401,380)
+      6. and back, A+1 -> A                          ->  1 WM_MOUSEMOVE   GetCursorPos says (400,380)
+
+  Windows posts no move message when the position does not change, and GetCursorPos answers happily
+  in exactly that case. So the old confirmation did not merely fail to prove delivery - it reported
+  SUCCESS for a move nothing received.
+
+  **And it made the retry loop decorative.** After attempt 1 the pointer is already at the target, so
+  every retry re-sent the same absolute move: zero messages, five times, and then a return of $true.
+  A loop that could not have worked is worse than no loop, because the caller reads it as five tries.
+
+  Two things are now confirmed, and neither of them is the cursor position on its own:
+
+    * that a move was actually generated - by nudging off the target first whenever the pointer is
+      already on it, so there is always a real transition for Windows to report;
+    * that the thing under the point is the thing being aimed at, when the caller says what it is.
+      -Onto takes a window class and is checked with Get-ClassAt, the same authority
+      Invoke-ConfirmedClick uses for clicks - because a move delivered to a window that is COVERING
+      the strip and a move the strip ignored are otherwise the same evidence.
+
+  What this still does NOT prove is that the strip acted on the move; nothing outside the process can
+  see that, and the caller's own assertion is what tests it. What it does mean is that a failure after
+  a $true from here is about the add-in, which is the whole point.
+#>
+function Set-Pointer {
+    param(
+        [Parameter(Mandatory, Position = 0)][int]$X,
+        [Parameter(Mandatory, Position = 1)][int]$Y,
+        [Parameter(Mandatory, Position = 2)][string]$What,
+        [string]$Onto = ''
+    )
+
+    # Kept at 2px. The absolute injection converts through a 65535-wide normalised space and lands a
+    # pixel out on some virtual-desktop geometries; tightening this to 0 would invent failures that
+    # have nothing to do with what is being tested.
+    $slack = 2
+
     for ($try = 1; $try -le 5; $try++) {
-        [WordLayout]::MouseTo($x, $y)
-        Start-Sleep -Milliseconds 250
         $at = [WordLayout]::Cursor()
-        if (([Math]::Abs($at.X - $x) -le 2) -and ([Math]::Abs($at.Y - $y) -le 2)) { return $true }
-        Write-HarnessNote ("{0}: asked for ({1},{2}), the pointer is at ({3},{4}) - trying again" -f
-                           $what, $x, $y, $at.X, $at.Y)
-        Start-Sleep -Milliseconds 500
+        if (([Math]::Abs($at.X - $X) -le $slack) -and ([Math]::Abs($at.Y - $Y) -le $slack)) {
+            # Already there, so a move to it is nothing at all. Step off and come back, which is what
+            # a hand does and what the measurement above says is required.
+            $screen = [WordLayout]::ScreenRect()
+            $nudge  = if (($X + 3) -lt $screen.Right) { $X + 3 } else { $X - 3 }
+            [WordLayout]::MouseTo($nudge, $Y)
+        }
+
+        [WordLayout]::MouseTo($X, $Y)
+        Start-Sleep -Milliseconds 250
+
+        $at = [WordLayout]::Cursor()
+        if (([Math]::Abs($at.X - $X) -gt $slack) -or ([Math]::Abs($at.Y - $Y) -gt $slack)) {
+            Write-HarnessNote ("{0}: asked for ({1},{2}), the pointer is at ({3},{4}) - trying again" -f
+                               $What, $X, $Y, $at.X, $at.Y)
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+
+        if ($Onto) {
+            # Named, not just rejected. "not on the strip" is the answer that narrows nothing down;
+            # the class that IS there says whether something is covering Word, whether the row has
+            # moved, or whether the point was computed from a stale layout.
+            $cls = Get-ClassAt $X $Y
+            if ($cls -ne $Onto) {
+                Write-HarnessNote ("{0}: the pointer is at ({1},{2}) but that point is over |{3}|, not |{4}| - trying again" -f
+                                   $What, $X, $Y, $cls, $Onto)
+                Start-Sleep -Milliseconds 500
+                continue
+            }
+        }
+
+        return $true
     }
     return $false
 }

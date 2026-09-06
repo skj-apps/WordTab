@@ -397,7 +397,7 @@ $spot = Get-TabSpot 0
 Invoke-ConfirmedClick -What 'selecting the tab to be carried' -Point { Get-TabSpot 0 } | Out-Null
 Start-Sleep -Milliseconds 800
 $spot = Get-TabSpot 0
-Assert (Set-Pointer $spot.X $spot.Y 'hovering the tab to be carried') 'the pointer could be put on the tab about to be carried'
+Assert (Set-Pointer $spot.X $spot.Y 'hovering the tab to be carried' -Onto 'WordTabStrip') 'the pointer could be put on the tab about to be carried'
 Start-Sleep -Milliseconds 900
 
 $top = Get-TopStrip

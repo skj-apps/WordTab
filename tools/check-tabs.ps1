@@ -315,7 +315,7 @@ $spot = Get-Spot 'close' $target
 $control = (Get-Spot 'label' $other).Rect
 $control.Right = $control.Left + [int](($control.Right - $control.Left) / 3)
 
-Assert (Set-Pointer $spot.X $spot.Y "hovering tab $target's close button") 'the pointer could be put on the close button'
+Assert (Set-Pointer $spot.X $spot.Y "hovering tab $target's close button" -Onto 'WordTabStrip') 'the pointer could be put on the close button'
 Write-Note ("the pointer is at ({0},{1}), over `"{2}`"" -f
             [WordLayout]::Cursor().X, [WordLayout]::Cursor().Y, (Get-ClassAt $spot.X $spot.Y))
 Start-Sleep -Milliseconds 900
