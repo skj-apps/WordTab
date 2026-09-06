@@ -1336,6 +1336,17 @@ if (-not $KeepOpen) {
                 # section below is asserting the absence of a card in a drag that did nothing.
                 Assert (@(Get-LogSince 'drag left the row').Count -ge 1) `
                     'the tab still comes out of the row with the card switched off'
+                # Named, not just asserted. This check passed at ef49c79 and failed three runs in a
+                # row on the working tree, and all it ever said was that the cursor was not SIZEALL -
+                # which is the one thing that does not narrow anything down. The section 120 lines
+                # above already prints its cursor against the ones it could be; this is the same line
+                # for the same reason. The I-beam is in the list because `wayBelow` is over the
+                # document, so "Word put its own cursor back" and "the add-in never set ours" land on
+                # different values and stop being the same evidence.
+                Write-Note ("cursor during the TabGhost=0 tear-off 0x{0:X}  (SIZEALL 0x{1:X}, arrow 0x{2:X}, I-beam 0x{3:X}, NO 0x{4:X})" -f `
+                            [int64]$cursorOut, [int64][WordLayout]::SystemCursor(32646),
+                            [int64][WordLayout]::SystemCursor(32512), [int64][WordLayout]::SystemCursor(32513),
+                            [int64][WordLayout]::SystemCursor(32648))
                 Assert ($cursorOut -eq [WordLayout]::SystemCursor(32646)) `
                     'and the pointer still says so - IDC_SIZEALL, unchanged'
 

@@ -560,6 +560,36 @@ Start-Sleep -Milliseconds 1500
 $down = @($before | Where-Object { [WordLayout]::Minimized($_) })
 Assert ($down.Count -eq $before.Count) "every window went down with it ($($down.Count) of $($before.Count))"
 
+# ...and went down OUT OF SIGHT, which is a separate question and the one this suite used to skip.
+#
+# Windows parks a minimised window near -32000. It does that for windows the shell manages, and the
+# followers in a stack are not: PresentWindow puts WS_EX_TOOLWINDOW on every window except the active
+# one, to keep them out of the taskbar and Alt+Tab. A minimised tool window is left in the old
+# minimised-window area at a real desktop coordinate and drawn there.
+#
+# The work rig's log of 2026-09-04 is the report of this, with its own control in the same three
+# lines: the active window - the one window still shell-managed - landed at (-32000,-32000), while the
+# two followers landed at (0,1101) and (237,1101), one SM_CXMINSPACING apart. The user confirmed
+# seeing the leftover stubs on their desktop and had not thought them worth reporting.
+#
+# Asserted as "does not touch the screen" rather than "is at -32000", because the harm is that the
+# user can see it; -32000 is only how Windows happens to say the same thing.
+$screen = [WordLayout]::ScreenRect()
+$stranded = @()
+foreach ($f in $before)
+{
+    $r = [WordLayout]::RectOf($f)
+    if ($r.Right -gt $screen.Left -and $r.Left -lt $screen.Right -and
+        $r.Bottom -gt $screen.Top -and $r.Top -lt $screen.Bottom)
+    {
+        $stranded += ('0x{0:X} tool={1} at ({2},{3} {4}x{5})' -f
+                      [int64]$f, [WordLayout]::IsToolWindow($f), $r.Left, $r.Top,
+                      ($r.Right - $r.Left), ($r.Bottom - $r.Top))
+    }
+}
+if ($stranded.Count) { $stranded | ForEach-Object { Write-Note "  still on screen: $_" } }
+Assert ($stranded.Count -eq 0) "every minimised window is parked off-screen, not left drawn on the desktop ($($stranded.Count) still visible)"
+
 [WordLayout]::Show($activeNow, 9)          # SW_RESTORE
 Start-Sleep -Seconds 2
 $up = @($before | Where-Object { -not [WordLayout]::Minimized($_) })

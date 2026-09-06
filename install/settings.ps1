@@ -406,6 +406,71 @@ public static class WordTabWin {
         } catch { Say "(could not be read: $($_.Exception.Message))" }
     }
 
+    # HOW MANY PAGES ACROSS EACH DOCUMENT IS ACTUALLY SHOWING, AND AT WHAT ZOOM.
+    #
+    # The complaint this add-in was built to answer is documents opening several pages side by side
+    # at 10% zoom, and the add-in corrects it on every join - but everything above this line is Win32,
+    # so no report has ever carried the two numbers the correction is about. Six OnePage runs in the
+    # 2026-09-04 report said nothing, and this section is the half of that answer that needs no new
+    # build to reach the machine: it reads what Word is showing RIGHT NOW.
+    #
+    # 99 columns is not ninety-nine pages. It is Word's "as many as fit", and it is the HEALTHY value
+    # - the thing to look for is a small number greater than one, with a crushed zoom beside it.
+    #
+    # Read through Word's object model, which is a different instrument from the window enumeration
+    # above and fails in a different way: a Protected View document is in none of this Application's
+    # collections at all. So the two counts are printed together deliberately - OpusApp windows seen
+    # by Win32 against windows Word admits to - because a gap between them IS the Protected View
+    # signature and has cost this project a diagnosis before.
+    #
+    # Nothing here can start Word, change a document or throw: GetActiveObject attaches only to an
+    # instance that is already running, every property read is individually guarded, and the whole
+    # block is wrapped. It is also the only part of this report that talks to Word rather than about
+    # it, so it is last among the live sections.
+    if ($running.Count -gt 0) {
+        Head 'What each document is showing (pages across, and zoom)'
+        try {
+            # GetActiveObject is .NET Framework only - it is not implemented in .NET Core, so this
+            # says so rather than throwing when the report is run under pwsh 7 instead of the
+            # Windows PowerShell the .cmd uses.
+            $word = [Runtime.InteropServices.Marshal]::GetActiveObject('Word.Application')
+
+            $omCount = 0
+            try { $omCount = $word.Windows.Count } catch { }
+            Say ("Word's object model admits to {0} window(s)." -f $omCount)
+            Say ''
+
+            for ($i = 1; $i -le $omCount; $i++) {
+                $caption = '(unreadable)'; $hwnd = '?'; $cols = '?'; $pct = '?'
+                try { $w = $word.Windows.Item($i) } catch { $w = $null }
+                if ($null -eq $w) { Say ("  window {0}: could not be read" -f $i); continue }
+
+                try { $caption = $w.Caption } catch { }
+                try { $hwnd = '0x{0:X}' -f [int]$w.Hwnd } catch { }
+                # Each read separately: a window can give up its Zoom object and then refuse the
+                # properties on it, which is a different fault from having no View at all.
+                try { $cols = $w.View.Zoom.PageColumns } catch { }
+                try { $pct  = $w.View.Zoom.Percentage } catch { }
+
+                Say ("  {0,-12} {1} pages across at {2}%   {3}" -f $hwnd, $cols, $pct, $caption)
+                if ($cols -is [int] -and $cols -gt 1 -and $cols -lt 99) {
+                    Say '     ^ THIS IS THE FAULT: more than one page across, and not Word''s "as many as fit".'
+                }
+            }
+
+            if ($omCount -lt $running.Count) {
+                Say ''
+                Say ("Note: {0} Word process(es) are running but the object model lists {1} window(s)." -f $running.Count, $omCount)
+                Say 'A document Word will not list is usually one in Protected View, which is in none'
+                Say 'of these collections and which the add-in cannot read or correct either.'
+            }
+        } catch {
+            Say "(Word's object model could not be reached: $($_.Exception.Message))"
+            Say 'That is not necessarily a fault - it is also what a busy Word, a modal dialog, or'
+            Say 'running this report under PowerShell 7 rather than Windows PowerShell looks like.'
+        }
+    }
+
     Head 'Everything in Word''s Disabled Items'
     $disabled = @(Get-DisabledAddinPaths)
     if ($disabled.Count -eq 0) { Say '(empty)' } else { foreach ($d in $disabled) { Say "  $d" } }
@@ -477,6 +542,30 @@ public static class WordTabWin {
         $log = @(Get-Content $logFile -ErrorAction SilentlyContinue)
         Say ("{0} ({1:N0} lines, {2:N0} bytes)" -f $logFile, $log.Count, (Get-Item $logFile).Length)
         Say ''
+
+        # WHERE THIS FILE STARTS, SAID OUT LOUD, BECAUSE IT IS NOT ALWAYS THE BEGINNING.
+        #
+        # The add-in deletes its log whole once it passes 512KB and starts a new one with the very
+        # next line it writes - src\native\log.cpp, RollIfLarge. Nothing marks the seam: the new file
+        # opens on an ordinary mid-session line with an ordinary timestamp, so a rolled log and a
+        # fresh install with a short history read exactly alike from here. Several diagnoses this
+        # project has made turned on "the log says nothing about X", which is a different statement
+        # when the lines that would have said it were deleted.
+        #
+        # A file that has never rolled opens with the '---- DllGetClassObject ----' line the add-in
+        # writes the instant Word loads it: 40 of the 40 logs kept on the development rig begin with
+        # it. Printed verbatim rather than reduced to a verdict, because this is read about a machine
+        # nobody here can reach and the first line may be one this script has never seen.
+        if ($log.Count -gt 0) {
+            Say 'First line in the file - this is how you tell a rolled log from a whole one:'
+            Say ("  {0}" -f $log[0])
+            if ($log[0] -notlike '*DllGetClassObject*') {
+                Say '  ^ that is not a Word-startup line, so this log HAS rolled: it passed 512KB and'
+                Say '    everything written before it was deleted. It is not the whole history.'
+            }
+            Say ''
+        }
+
         foreach ($line in $log) { Say $line }
     } else {
         Say "$logFile does not exist."

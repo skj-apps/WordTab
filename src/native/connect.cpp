@@ -382,10 +382,26 @@ static IDispatch* WindowForFrame(HWND frame)
 //
 // It acts ONLY when the view is showing more than one page across. A window already on one page is
 // left alone entirely, zoom included, because a zoom somebody chose for a document is theirs.
-BOOL WordTabOnePageView(HWND frame, LONG* wasColumns, LONG* wasZoom)
+const wchar_t* WordTabOnePageWhyName(enum WordTabOnePageWhy why)
+{
+    switch (why)
+    {
+    case OnePage_Corrected:    return L"it was put back to one page at 100%";
+    case OnePage_AlreadyFine:  return L"already on one page at a readable zoom - nothing to do";
+    case OnePage_WordRefused:  return L"IT WAS WRONG AND WORD REFUSED THE WRITE";
+    case OnePage_CouldNotRead: return L"Word gave up its Zoom object but not its PageColumns/Percentage";
+    case OnePage_NoZoom:       return L"View.Zoom could not be obtained";
+    case OnePage_NoView:       return L"Window.View could not be obtained";
+    case OnePage_NoWindow:     return L"no Word window claims this frame (Protected View reads like this)";
+    }
+    return L"unknown";
+}
+
+BOOL WordTabOnePageView(HWND frame, LONG* wasColumns, LONG* wasZoom, enum WordTabOnePageWhy* why)
 {
     if (wasColumns) *wasColumns = 0;
     if (wasZoom)    *wasZoom    = 0;
+    if (why)        *why        = OnePage_NoWindow;
 
     IDispatch* window = WindowForFrame(frame);
     if (!window)
@@ -394,17 +410,28 @@ BOOL WordTabOnePageView(HWND frame, LONG* wasColumns, LONG* wasZoom)
     IDispatch* view = GetObjectProperty(window, L"View");
     window->Release();
     if (!view)
+    {
+        if (why) *why = OnePage_NoView;
         return FALSE;
+    }
 
     IDispatch* zoom = GetObjectProperty(view, L"Zoom");
     view->Release();
     if (!zoom)
+    {
+        if (why) *why = OnePage_NoZoom;
         return FALSE;
+    }
 
+    // **Both reads are kept, and that is the point of the fourth reason.** The out-params below are
+    // written unconditionally, so `columns == 0 && percent == 0` is NOT "nobody asked": it is also
+    // what a Zoom object that answered and then refused both property reads leaves behind. Those two
+    // are a healthy-looking log line and a total failure to see the document, and until now they
+    // were the same three numbers.
     LONG columns = 0;
     LONG percent = 0;
-    BOOL read = GetLongProperty(zoom, L"PageColumns", &columns);
-    GetLongProperty(zoom, L"Percentage", &percent);
+    BOOL read     = GetLongProperty(zoom, L"PageColumns", &columns);
+    BOOL readZoom = GetLongProperty(zoom, L"Percentage", &percent);
 
     if (wasColumns) *wasColumns = columns;
     if (wasZoom)    *wasZoom    = percent;
@@ -427,6 +454,11 @@ BOOL WordTabOnePageView(HWND frame, LONG* wasColumns, LONG* wasZoom)
 
     if (!manyPages && !tooSmall)
     {
+        // Two different silences, told apart. Nothing is done in either case and the control flow is
+        // exactly what it was - but "I looked and it was fine" and "I could not read the view at all"
+        // are not the same report, and one of them means the next line in the log is about a document
+        // nobody actually measured.
+        if (why) *why = (read && readZoom) ? OnePage_AlreadyFine : OnePage_CouldNotRead;
         zoom->Release();
         return FALSE;
     }
@@ -436,6 +468,8 @@ BOOL WordTabOnePageView(HWND frame, LONG* wasColumns, LONG* wasZoom)
         ok = SetLongProperty(zoom, L"PageColumns", 1);
     if (ok)
         ok = SetLongProperty(zoom, L"Percentage", 100);
+
+    if (why) *why = ok ? OnePage_Corrected : OnePage_WordRefused;
 
     zoom->Release();
     return ok;

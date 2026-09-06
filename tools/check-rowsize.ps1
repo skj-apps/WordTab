@@ -162,6 +162,20 @@ function Wait-Joined($seconds = 25) {
     Wait-Until { (Get-LogCount 'joined as the first window') -ge 1 } $seconds 200 | Out-Null
 }
 
+# Wait for the line this step is ABOUT, not for the join that precedes it.
+#
+# **Wait-Joined is not a barrier for anything written after the join.** The default-width line is
+# written about 20ms after "joined as the first window" - measured at 19ms, 21ms and 23ms in three
+# batteries - so a step that waits for the join and then reads the log is racing, and step 6 lost
+# that race in two runs out of three on 2026-09-04 while every behavioural assertion beside it passed.
+# The window really was narrowed; the suite just asked before the add-in had said so.
+#
+# Returns whether it arrived, so the assertion that follows is still what fails when it genuinely
+# never comes - this waits for evidence, it does not manufacture it.
+function Wait-Logged($pattern, $seconds = 10) {
+    return (Wait-Until { (Get-LogCount $pattern) -ge 1 } $seconds 100)
+}
+
 # Close-AllWord asks; it does not wait for the process to be gone. Opening the next document
 # while the last WINWORD is still dying gets the new one handed off and exited ~250ms after it
 # starts, which showed up as three steps whose window never joined anything.
@@ -251,6 +265,7 @@ if (-not (Wait-WordReady 1 45)) { Write-Note 'document 1 did not arrive with a s
 Wait-Joined
 
 Assert ((Get-LogCount 'joined as the first window') -ge 1) 'a window joined and defined the row'
+Wait-Logged 'row size=remembered' | Out-Null
 Assert ((Get-LogCount 'row size=remembered') -ge 1) 'the row-size switch is on by default'
 Assert ((Get-LogCount 'the row takes the size it was left at') -eq 0) `
        'nothing was remembered, so the add-in did not move the window'
@@ -301,6 +316,7 @@ Open-Document 2 | Out-Null
 if (-not (Wait-WordReady 1 45)) { Write-Note 'document 2 did not arrive with a strip within 45s' }
 Wait-Joined
 
+Wait-Logged 'the row takes the size it was left at' | Out-Null
 Assert ((Get-LogCount 'the row takes the size it was left at') -ge 1) `
        'the add-in applied the remembered rectangle'
 
@@ -321,6 +337,7 @@ Open-Document 3 | Out-Null
 if (-not (Wait-WordReady 1 45)) { Write-Note 'document 3 did not arrive with a strip within 45s' }
 Wait-Joined
 
+Wait-Logged 'is on no monitor that exists now' | Out-Null
 Assert ((Get-LogCount 'is on no monitor that exists now') -ge 1) 'the add-in refused the rectangle'
 Assert ((Get-LogCount 'the row takes the size it was left at') -eq 0) 'and did not apply it'
 
@@ -339,6 +356,7 @@ Open-Document 4 | Out-Null
 if (-not (Wait-WordReady 1 45)) { Write-Note 'document 4 did not arrive with a strip within 45s' }
 Wait-Joined
 
+Wait-Logged 'row size=off' | Out-Null
 Assert ((Get-LogCount 'row size=off') -ge 1) 'the add-in said the switch is off'
 Assert ((Get-LogCount 'the row takes the size it was left at') -eq 0) 'and left the window to Word'
 Assert ((Get-LogCount 'the row remembers its size') -eq 0) 'and recorded nothing either'
@@ -364,6 +382,7 @@ if (-not $CanForceWidth) {
     if (-not (Wait-WordReady 1 45)) { Write-Note 'document 5 did not arrive with a strip within 45s' }
     Wait-Joined
 
+    Wait-Logged 'no row size remembered and Word opened' | Out-Null
     $narrowed = Get-LogLast 'no row size remembered and Word opened'
     Assert ($primed -ge $ForcedTrigger) `
            "Word was primed $($primed)px wide, which is over the ${ForcedTrigger}px that is three pages here"
@@ -391,6 +410,7 @@ if (-not $CanForceWidth) {
     if (-not (Wait-WordReady 1 45)) { Write-Note 'document 6 did not arrive with a strip within 45s' }
     Wait-Joined
 
+    Wait-Logged 'the row takes the size it was left at' | Out-Null
     Assert ((Get-LogCount 'the row takes the size it was left at') -ge 1) 'the remembered rectangle was applied'
     Assert ((Get-LogCount 'no row size remembered and Word opened') -eq 0) 'and the default never ran'
     $kept = [RowProbe]::Placement((Get-FirstFrame)).rcNormalPosition

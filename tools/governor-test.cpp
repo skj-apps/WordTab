@@ -60,8 +60,8 @@ static int NewStep(New* g, LONGLONG us)
         g->prev = us;
         LONGLONG basis = (us > lastTime) ? us : lastTime;
         int want = RungFor(basis);
-        if (want > g->rung)      g->rung = want;
-        else if (want < g->rung) g->rung--;
+        if (want > g->rung)                   g->rung = want;
+        else if (RungFor(basis * 2) < g->rung) g->rung--;
     }
     if (g->rung < 0)           g->rung = 0;
     if (g->rung >= kRungCount) g->rung = kRungCount - 1;
@@ -70,11 +70,17 @@ static int NewStep(New* g, LONGLONG us)
 
 // ...and for the active-window pass, which carries nothing between passes because the subject
 // changes underneath it: switching tabs changes which document is being asked about.
+// ...and capped at rung 1, because rungs 2-4 exist to protect the UI thread from the ROW's
+// 90,000-518,000us passes and the active pass's worst ever measured is 52ms.
 struct Act { int rung; bool seen; Act() : rung(0), seen(false) {} };
 static int ActStep(Act* g, LONGLONG us)
 {
     if (!g->seen) g->seen = true;
-    else          g->rung = RungFor(us);
+    else
+    {
+        int want = RungFor(us);
+        g->rung = (want > 1) ? 1 : want;
+    }
     return kRungTicks[g->rung] * 500;
 }
 
@@ -161,9 +167,9 @@ int main(void)
     {
         Act a;
         ActStep(&a, 300);                                 // discarded
-        Check(ActStep(&a, 300)    == 500,   "a warm foreground document is asked twice a second");
-        Check(ActStep(&a, 518726) == 60000, "a slow one backs the ACTIVE pass off too - cost still wins");
-        Check(ActStep(&a, 300)    == 500,   "and the next cheap pass restores it, with no walk down");
+        Check(ActStep(&a, 300)    == 500,  "a warm foreground document is asked twice a second");
+        Check(ActStep(&a, 518726) == 2000, "a slow one backs off, but only as far as the cap");
+        Check(ActStep(&a, 300)    == 500,  "and the next cheap pass restores it, with no walk down");
 
         // The failure this rule exists to prevent: moving to a tab whose document is warm must not
         // inherit a cadence that a different, slow document set.
@@ -176,6 +182,97 @@ int main(void)
                aMs, nMs);
         Check(aMs == 500,   "the warm tab is asked twice a second");
         Check(nMs == 60000, "the sticky rule would have pinned it at 60s - why the row's rule is not used here");
+    }
+
+    // ---- 5. the tab with the keyboard in it is never left for long -------------------------------
+    //
+    // Asserted as the PROPERTY, over every cost the ladder can be handed, rather than by replaying
+    // the formula that implements it. A test written to match its own arithmetic proves nothing: it
+    // passes whatever that arithmetic says, including a version that has gone wrong the same way.
+    // The design's claim is "the foreground document is asked at least every two seconds, whatever
+    // it costs", so that is the sentence the sweep checks.
+    //
+    // Why it needed saying: the 2026-09-04 report has the active pass at rung 3 seven times across
+    // two sessions - 52056us bought 20000ms nominal and 35.35s observed - on the tab being typed
+    // into, showing a stale dot for a document Word had already saved.
+    printf("==> However expensive the foreground document is, it is never left longer than 2s\n");
+    {
+        const LONGLONG costs[] = { 0, 300, 4000, 4001, 15000, 15001, 50000, 50001,
+                                   52056, 200000, 200001, 518726, 5000000 };
+        const int      n       = (int)(sizeof(costs) / sizeof(costs[0]));
+
+        int worst = 0;
+        for (int i = 0; i < n; i++)
+        {
+            Act a;
+            ActStep(&a, 300);                             // discarded
+            int ms = ActStep(&a, costs[i]);
+            if (ms > worst) worst = ms;
+        }
+        printf("    the slowest cadence any single cost can buy the active pass is %dms\n", worst);
+        Check(worst <= 2000, "no cost anywhere on the ladder puts the active pass past 2s");
+
+        // And it is still memoryless: what it asks next depends on the pass just taken and on
+        // nothing before it. This is the half that must NOT change - the subject changes underneath
+        // this sampler when the user switches tab, so carrying state across passes would let one
+        // slow document set the cadence for a different one.
+        Act viaSlow, viaCheap;
+        ActStep(&viaSlow, 300);  ActStep(&viaSlow, 518726);
+        ActStep(&viaCheap, 300); ActStep(&viaCheap, 300);
+        Check(ActStep(&viaSlow, 900) == ActStep(&viaCheap, 900),
+              "two histories, one cost: the active pass answers the same either way");
+    }
+
+    // ---- 6. the row's cadence comes down harder than it goes up ----------------------------------
+    //
+    // Again the property, not the arithmetic. The claim is that descending is strictly harder than
+    // ascending - which is what stops a cost sitting on a threshold from crossing it in both
+    // directions on nearly every pass.
+    printf("==> Descending a rung is strictly harder than climbing one\n");
+    {
+        // A cost that is genuinely below a rung boundary must still walk down; a cost that is merely
+        // ON the boundary must not. Neither is a restatement of `basis * 2` - both would be true of
+        // any rule with real hysteresis, and both are false of the bare `want < *rung` that shipped.
+        New settled;
+        NewStep(&settled, 400);
+        NewStep(&settled, 518726);                        // pinned at 60s
+        int walked = 0, ms = 60000;
+        while (ms != 500 && walked < 30) { ms = NewStep(&settled, 300); walked++; }
+        Check(ms == 500, "a genuinely quick Word still walks all the way back to 500ms");
+
+        // The ping-pong the report caught: a 7-window row idling at 2400-3900us with spikes just
+        // over the 4000us line. Under the old rule every one of those crossings wrote a cadence
+        // line; the whole 3m50s episode stayed under 15000us, which is how it was told apart from
+        // f333349's bistability.
+        const LONGLONG jitter[] = { 2400, 3900, 4200, 2600, 4100, 3100, 4300, 2900,
+                                    3800, 4400, 2500, 3950, 4050, 2700, 3600, 4600 };
+        const int      jn       = (int)(sizeof(jitter) / sizeof(jitter[0]));
+
+        New now; int nowChanges = 0, nowLast = -1;
+        New bare; int bareChanges = 0, bareLast = -1;     // the same input through the old descent
+        for (int i = 0; i < jn; i++)
+        {
+            int a = NewStep(&now, jitter[i]);
+            if (a != nowLast) { if (nowLast != -1) nowChanges++; nowLast = a; }
+
+            // The old rule, inline, so the two are driven by identical input.
+            LONGLONG lastTime = bare.prev;
+            if (!bare.seen) bare.seen = true;
+            else
+            {
+                bare.prev = jitter[i];
+                LONGLONG basis = (jitter[i] > lastTime) ? jitter[i] : lastTime;
+                int want = RungFor(basis);
+                if (want > bare.rung)      bare.rung = want;
+                else if (want < bare.rung) bare.rung--;
+            }
+            int b = kRungTicks[bare.rung] * 500;
+            if (b != bareLast) { if (bareLast != -1) bareChanges++; bareLast = b; }
+        }
+        printf("    across %d jittering passes: the shipped rule changed cadence %d times, this one %d\n",
+               jn, bareChanges, nowChanges);
+        Check(bareChanges >= 4, "the bare threshold ping-pongs across it - this is the bug");
+        Check(nowChanges < bareChanges, "requiring twice the cost to descend stops the ping-pong");
     }
 
     printf("\n%s\n", failures ? "FAILED" : "All good.");

@@ -368,6 +368,54 @@ static void PresentWindow(HWND frame, BOOL show)
         SetWindowLongPtrW(frame, GWL_EXSTYLE, wanted);
 }
 
+// Put a minimised follower where the shell would have put it, because for these windows the shell
+// will not.
+//
+// The price of the line above. A window with WS_EX_TOOLWINDOW is not shell-managed, so when it is
+// minimised the window manager does not park it at -32000; it tiles it in the old minimised-window
+// area at a real desktop coordinate, and it is drawn there. The user's report of 2026-09-04 contains
+// its own control experiment: the row went down and the ACTIVE window - the one window PresentWindow
+// leaves shell-managed - landed at (-32000,-32000), while the two followers landed at (0,1101) and
+// (237,1101), 237px apart, which is SM_CXMINSPACING on that rig. They confirmed seeing the stubs and
+// had not thought to report them, which is what a small ugly thing gets.
+//
+// ptMinPosition + WPF_SETMINPOSITION rather than SetWindowPos, because that is the documented way to
+// say where a minimised window sits, and showCmd is forced back to SW_SHOWMINNOACTIVE first: it is
+// already what it is, but SetWindowPlacement would otherwise re-apply SW_SHOWMINIMIZED, which
+// *activates*, and handing focus to a window on its way down is the exact thing the caller's
+// SW_SHOWMINNOACTIVE was chosen to avoid.
+//
+// Nothing here touches rcNormalPosition, so the size the row comes back at is untouched - and the
+// restore path does not depend on this either way: it calls MatchTo on every follower after bringing
+// them up, which overwrites the rectangle regardless of where they were parked.
+static void ParkMinimised(HWND frame)
+{
+    if (!IsWindow(frame) || !IsIconic(frame))
+        return;
+
+    WINDOWPLACEMENT placement;
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(frame, &placement))
+        return;
+
+    if (placement.ptMinPosition.x == -32000 && placement.ptMinPosition.y == -32000)
+        return;
+
+    placement.showCmd            = SW_SHOWMINNOACTIVE;
+    placement.ptMinPosition.x    = -32000;
+    placement.ptMinPosition.y    = -32000;
+    placement.flags             |= WPF_SETMINPOSITION;
+    SetWindowPlacement(frame, &placement);
+
+    // Said with the rectangle it actually ended at, not the one asked for. This rig cannot be the
+    // one that matters - the report came from theirs - and "the park took" is not a thing to assume
+    // about a window the shell has opinions about.
+    RECT after;
+    if (GetWindowRect(frame, &after))
+        LogWrite(L"stack  hwnd=0x%p  parked while minimised: (%ld,%ld %ldx%ld)", (void*)frame,
+                 after.left, after.top, after.right - after.left, after.bottom - after.top);
+}
+
 static void Present(void)
 {
     if (!g_enabled)
@@ -755,7 +803,8 @@ static BOOL Join(Member* member)
     {
         LONG columns = 0;
         LONG percent = 0;
-        if (WordTabOnePageView(member->frame, &columns, &percent))
+        enum WordTabOnePageWhy why = OnePage_AlreadyFine;
+        if (WordTabOnePageView(member->frame, &columns, &percent, &why))
         {
             // Two illnesses, one cure, and the log says which one it found. They were one line for
             // an hour and that line would have reported "1 pages across", which is not a thing that
@@ -768,6 +817,20 @@ static BOOL Join(Member* member)
                 LogWrite(L"view  hwnd=0x%p  this document opened at %ld%%, which is what fitting "
                          L"several pages across leaves behind - put back to 100%% (OnePage=0 leaves "
                          L"it alone)", (void*)member->frame, percent);
+        }
+        else
+        {
+            // **The six silent runs.** This branch is why OnePage could run six times in a report
+            // and leave nothing to read: every one of these outcomes returned the same FALSE, and
+            // one of them is the user's original complaint happening again - the correction was
+            // attempted and Word would not take it, leaving the document three pages across.
+            //
+            // The reason is whatever WordTabOnePageView decided at its own exit. Deriving it here
+            // from `columns` would mean writing the illness test a second time, and the two drafts
+            // that tried both dropped the `columns < 99` and would have shouted about every healthy
+            // document in the row.
+            LogWrite(L"view  hwnd=0x%p  left alone at %ld page(s) across, %ld%% - %s",
+                     (void*)member->frame, columns, percent, WordTabOnePageWhyName(why));
         }
     }
 
@@ -1117,6 +1180,10 @@ void StackOnFrameSize(HWND frame, WPARAM sizeType)
                 // z-order on its way down, which here means handing focus to another document in
                 // the same stack while the user is trying to put the whole thing away.
                 ShowWindow(g_members[i].frame, SW_SHOWMINNOACTIVE);
+
+                // ...and then off-screen, because this one is not shell-managed and will otherwise
+                // be left drawn on the desktop for as long as the row is down. See ParkMinimised.
+                ParkMinimised(g_members[i].frame);
                 count++;
             }
         }

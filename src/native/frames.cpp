@@ -109,6 +109,11 @@ static HWND       g_modalWindow = NULL;
 static LONGLONG   g_modalStart  = 0;
 static LONGLONG   g_qpcFreq     = 0;
 
+// The last drag to END, and when. Read only by the growth probe below - see it for why the interval
+// since a drag ended is the field that matters.
+static HWND       g_modalEndedFor = NULL;
+static LONGLONG   g_modalEndedAt  = 0;
+
 static LONGLONG Now(void)
 {
     LARGE_INTEGER value;
@@ -164,6 +169,12 @@ static void TraceFlush(void)
     if (!g_inModalLoop)
         return;
     g_inModalLoop = FALSE;
+
+    // When the drag ended, and on which window. The growth this file is trying to explain arrives
+    // 48-50ms AFTER this point, outside the modal loop, so "how long since the user let go" is the
+    // one field that separates it from every other resize a window gets.
+    g_modalEndedAt  = Now();
+    g_modalEndedFor = g_modalWindow;
 
     LONGLONG endStamp   = Now();
     LONGLONG totalMicros = ToMicros(endStamp - g_modalStart);
@@ -268,6 +279,156 @@ static void TraceFlush(void)
         LogWrite(L"drag    ... %d more", g_traceCount - show);
 }
 
+// Declared in wordtab.h; the header says who asks and why.
+//
+// `g_inModalLoop` is set in exactly one place - TraceReset, off WM_ENTERSIZEMOVE - and cleared in
+// exactly one other, TraceFlush, off WM_EXITSIZEMOVE. That pairing is the whole of its correctness
+// and there is one known way for it to come apart: a frame destroyed part-way through a drag never
+// sends the second message. WM_NCDESTROY detaches the subclass and nothing on that path touches the
+// flag, so it would be left TRUE against a dead window for the rest of the process - and a caller
+// standing down on it would stand down for good, without writing a word about it.
+//
+// So the flag is not handed out on its own. A modal move/size loop belongs to a window, and when the
+// window is gone the loop is over. Saying so here also unsticks the two things inside this file that
+// ride on the same flag: the WM_SIZE line, which is written only outside the loop and is the evidence
+// the row-growth diagnosis lives on, and TraceRecord, which would otherwise go on filling a dead
+// window's trace with every other frame's position changes until it reported itself full.
+BOOL FramesInModalMoveLoop(void)
+{
+    if (!g_inModalLoop)
+        return FALSE;
+
+    if (!IsWindow(g_modalWindow))
+    {
+        LogWrite(L"drag  hwnd=0x%p  the window being moved is gone and WM_EXITSIZEMOVE never came "
+                 L"- the modal move/size loop is treated as over", (void*)g_modalWindow);
+        g_inModalLoop = FALSE;
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+// The resize nobody in this process asked for, recorded once.
+//
+// **A PROBE. It changes nothing, and it must not be turned into a guard where it stands.** The row
+// grows 21-27px on every drag - 1240x1397 -> 1261x1410 -> 1288x1437 across two drags that both
+// traced ZERO resizes - and the message that carries the growth is currently recorded nowhere at
+// all: TraceRecord returns immediately outside the modal loop, and the WM_SIZE line added in
+// ef49c79 for exactly this can only say `nobody here asked for it` after the fact. So the proposal
+// itself has never been seen. This is that message.
+//
+// What is already settled and is NOT what this is looking for: the proposal is taken const and the
+// followers get `pos->cx/cy` verbatim (stack.cpp), which is the row working as designed; and a
+// coordinate-convention mix in the remembered size is REFUTED - an apply of (21,717 1240x1397)
+// produced a WM_SIZE of exactly (21,717 1240x1397), so that round trip is lossless.
+//
+// The fields are chosen to separate the only two stories that fit the numbers, and to be able to
+// reject BOTH:
+//
+//   * **Something re-asserting a stored rectangle.** Both sessions' first drag landed on exactly
+//     (7,671 1261x1410) from two DIFFERENT drag-end positions, and that is also the rect every
+//     `attach (existing)` line reports as Word's own for a fresh frame. A landing rect independent
+//     of where the drag ended is not a delta. `rcNormalPosition` is printed beside `GetWindowRect`
+//     because it IS the stored restore rectangle: if the proposal matches it, that is the story,
+//     said in one line.
+//   * **An outer rect being read as a client rect.** Drag 1's growth of +21x+13 is within a pixel
+//     of this frame's non-client margin, and its post-drag CLIENT size was within a pixel of its
+//     pre-drag OUTER size. So AdjustWindowRectEx is asked what that margin actually is and the
+//     growth is printed next to it, rather than left to be reverse-engineered. **Drag 2's +27x+27
+//     does not fit this story**, which is why it is a lead and not a finding - and why the probe
+//     has to be able to come back negative.
+//
+// `sinceDragMs` is the discriminator between the two, because 48ms and 50ms after WM_EXITSIZEMOVE
+// is when the growth arrived in all three observed drags. A proposal at +3000ms is a different
+// animal wearing the same shape.
+static void ProbeUnaskedResize(HWND hwnd, const WINDOWPOS* pos)
+{
+    if (!pos || g_inModalLoop || (pos->flags & SWP_NOSIZE))
+        return;
+
+    RECT current;
+    if (!GetWindowRect(hwnd, &current))
+        return;
+
+    LONG haveW = current.right - current.left;
+    LONG haveH = current.bottom - current.top;
+    if (pos->cx == haveW && pos->cy == haveH)
+        return;                             // a move, or a no-op: not what this is for
+
+    // Rate limited per process, not per window, and it says what it swallowed.
+    //
+    // One line per 250ms is chosen from the thing being measured: the growth lands at +48ms and the
+    // interesting burst is three messages inside one tick, so a shorter window would print the same
+    // event three times and a longer one would hide the second and third windows in the row getting
+    // it too. A count of the suppressed lines rides on the next one that prints, because a cap that
+    // says nothing about what it dropped reads exactly like "this happened once".
+    static LONGLONG lastAt      = 0;
+    static int      suppressed  = 0;
+
+    LONGLONG now  = Now();
+    LONGLONG gap  = ToMicros(now - lastAt);
+    if (lastAt != 0 && gap < 250000)
+    {
+        suppressed++;
+        return;
+    }
+    lastAt = now;
+
+    WINDOWPLACEMENT placement;
+    placement.length = sizeof(placement);
+    RECT normal;
+    if (GetWindowPlacement(hwnd, &placement))
+        normal = placement.rcNormalPosition;
+    else
+        normal.left = normal.top = normal.right = normal.bottom = 0;
+
+    // What Windows itself says this frame's non-client margin is, asked with the window's own
+    // styles rather than a remembered constant.
+    RECT margin;
+    margin.left = margin.top = 0;
+    margin.right = margin.bottom = 100;
+    LONG marginW = 0, marginH = 0;
+    if (AdjustWindowRectEx(&margin,
+                           (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE),
+                           GetMenu(hwnd) != NULL,
+                           (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE)))
+    {
+        marginW = (margin.right - margin.left) - 100;
+        marginH = (margin.bottom - margin.top) - 100;
+    }
+
+    LONGLONG sinceDrag = (g_modalEndedAt != 0 && hwnd == g_modalEndedFor)
+                         ? ToMicros(now - g_modalEndedAt) / 1000
+                         : -1;
+
+    wchar_t dpiCtx[160];
+    StripDescribeDpiContext(hwnd, L"frame", dpiCtx, 160);
+
+    LogWrite(L"resize  hwnd=0x%p  NOBODY HERE ASKED: now (%ld,%ld %ldx%ld) -> proposed "
+             L"(%ld,%ld %ldx%ld)  grew %+ldx%+ld  non-client margin %ldx%ld  "
+             L"rcNormalPosition (%ld,%ld %ldx%ld)  flags=0x%08X insertAfter=0x%p zoomed=%d  "
+             L"%s  %lldms since this frame's drag ended%s",
+             (void*)hwnd,
+             current.left, current.top, haveW, haveH,
+             (pos->flags & SWP_NOMOVE) ? current.left : pos->x,
+             (pos->flags & SWP_NOMOVE) ? current.top  : pos->y,
+             pos->cx, pos->cy,
+             pos->cx - haveW, pos->cy - haveH,
+             marginW, marginH,
+             normal.left, normal.top, normal.right - normal.left, normal.bottom - normal.top,
+             pos->flags, (void*)pos->hwndInsertAfter, IsZoomed(hwnd) ? 1 : 0,
+             dpiCtx, sinceDrag,
+             suppressed ? L"  (and more, suppressed - see the count on the next line)" : L"");
+
+    if (suppressed)
+    {
+        LogWrite(L"resize  hwnd=0x%p  %d further unasked resize(s) went unprinted in the 250ms "
+                 L"before this one", (void*)hwnd, suppressed);
+        suppressed = 0;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Declared in wordtab.h and shared with strip.cpp: every switch WordTab has is a DWORD under the
 // same key, and one reader for all of them is one place for the "absent means default" rule.
@@ -358,6 +519,7 @@ static LRESULT CALLBACK FrameSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         {
             const WINDOWPOS* pos = (const WINDOWPOS*)lParam;
             TraceRecord(msg, pos);
+            ProbeUnaskedResize(hwnd, pos);
 
             int moved = StackOnFramePosChanging(hwnd, pos);
             if (moved > 0)

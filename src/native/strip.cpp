@@ -162,6 +162,13 @@
 #define ID_TIP_SHOW  3
 #define ID_TIP_HIDE  4
 
+// The pointer is shared thread state, so a drag has to HOLD its cursor rather than set it once.
+// See DragCursor for what proved that. 50ms is chosen against a hand rather than against Word: it
+// is below the point at which a change of pointer reads as a shape rather than a flicker, and it
+// costs one GetCursor a tick and a SetCursor only when something else has actually taken it.
+#define ID_DRAG_CURSOR   5
+#define DRAG_CURSOR_MS  50
+
 #define TIP_LOGICAL_PADX  10
 #define TIP_LOGICAL_PADY   6
 #define TIP_LOGICAL_GAP    2     // between the name and the folder under it
@@ -241,6 +248,13 @@ struct StripState
 
     BOOL  trippedLogged; // the height tripwire says its piece once per frame, not once per message
     BOOL  wasVisible;    // to catch hidden -> shown, where the layout has to be re-derived
+
+    // Has TryBind already said that Word made this frame and never titled it? Once per frame, for
+    // the same reason trippedLogged is: such a frame can sit there untouched for the whole session -
+    // measured at 39 seconds in one battery log and ended only by shutdown - and the janitor would
+    // otherwise write the same line twice a second for as long as it lived, which is a worse log
+    // than the one line this guard removes.
+    BOOL  untitledLogged;
 
     // Logging a relayout costs a file write, and Word relayouts on every mouse movement of a resize
     // drag. So they are throttled and counted, and the count is reported with the next line that
@@ -411,6 +425,9 @@ static BOOL g_dragJoin   = FALSE;   // the other gesture: a window on its own be
 static HWND g_dragOnto   = NULL;    // the frame whose row it is over, NULL when it is over nothing
 static BOOL g_dragOntoKnown = FALSE; // whether g_dragOnto has been worked out yet this gesture
 static HWND g_dragScroll = NULL;    // the strip running the auto-scroll timer, NULL when it is off
+static HWND g_dragCursorTimer = NULL;   // the strip holding the drag cursor, NULL when no gesture
+static HCURSOR g_dragCursorSet = NULL;  // what the gesture last asked the pointer to be
+static int  g_dragCursorPutBack = 0;    // times it had to be put back during this gesture
 static ATOM g_stripClass = 0;
 static UINT_PTR g_janitor = 0;
 
@@ -529,12 +546,13 @@ static int DpiOverride(void)
     return 0;
 }
 
-static int DpiOf(HWND hwnd)
+// What Windows says, with no override in front of it.
+//
+// Split out from DpiOf so that the DPI probe below can ask the question DpiOf cannot: `state->dpi`
+// is already whatever DpiOf returned, so a probe built on DpiOf would agree with it by construction
+// and could never show the disagreement it exists to look for.
+static int DpiFromWindows(HWND hwnd)
 {
-    int forced = DpiOverride();
-    if (forced)
-        return forced;
-
     static GetDpiForWindowFn fn = NULL;
     static BOOL looked = FALSE;
     if (!looked)
@@ -561,6 +579,15 @@ static int DpiOf(HWND hwnd)
     return dpi > 0 ? dpi : 96;
 }
 
+static int DpiOf(HWND hwnd)
+{
+    int forced = DpiOverride();
+    if (forced)
+        return forced;
+
+    return DpiFromWindows(hwnd);
+}
+
 static int Scaled(int logical, int dpi)
 {
     return MulDiv(logical, dpi, 96);
@@ -573,6 +600,92 @@ static int Scaled(int logical, int dpi)
 int StripDpiOf(HWND frame)
 {
     return DpiOf(frame);
+}
+
+// What DPI context a window is being read in - a probe, not a mechanism, and it changes nothing.
+//
+// It exists because of one episode in the 2026-09-04 report that cannot be explained from the
+// numbers already in the log: the strip was briefly sized at the OTHER monitor's DPI across a
+// minimise/restore, a clean x1.2 then /1.2, with no WM_DPICHANGED and no monitor crossing - every
+// rect in the episode is inside DISPLAY2. Two explanations were REFUTED there and neither needs
+// asking about again. WordTab computed the wrong size: it did not - ApplyMetrics is the only writer
+// of state->stripH, it was 48 throughout, and both times WordTab *corrected* the strip rather than
+// breaking it. A thread-wide awareness flip: it cannot be, because in the same PlaceStrip call
+// ChildRect came back clean for the `_WwF` and scaled for the strip, which no thread-wide context
+// can do.
+//
+// What is left is mixed-mode virtualisation of our own child window - the strip sitting in a
+// different awareness context from the frame it hangs off - and that is a question about the two
+// windows, not about either one's size. So this reports the pair, and if they ever differ the next
+// report says so in one line instead of leaving arithmetic to be reverse-engineered from rects.
+//
+// **Every one of these is Windows 10 1607 and none of them is in w64devkit's headers**, which are
+// older than the API - the same reason GetDpiForWindow is reached by GetProcAddress above. Missing
+// exports are normal, not an error: on anything older the call sites simply print "unavailable" and
+// the rest of their line is unaffected.
+typedef HANDLE (WINAPI *GetWindowDpiAwarenessContextFn)(HWND);
+typedef HANDLE (WINAPI *GetThreadDpiAwarenessContextFn)(void);
+typedef int    (WINAPI *GetAwarenessFromDpiAwarenessContextFn)(HANDLE);
+
+// GetAwarenessFromDpiAwarenessContext collapses PER_MONITOR_AWARE_V2 onto PER_MONITOR_AWARE - they
+// are the same DPI_AWARENESS - so the raw handle is printed beside the name. The pseudo-handles are
+// documented constants ((HANDLE)-1 unaware, -2 system, -3 per-monitor, -4 per-monitor v2), so a
+// reader who needs to tell V2 from V1 can, without this having to guess which of them it is looking
+// at.
+static const wchar_t* DpiAwarenessName(int awareness)
+{
+    switch (awareness)
+    {
+    case 0:  return L"unaware";
+    case 1:  return L"system";
+    case 2:  return L"per-monitor";
+    default: return L"invalid";
+    }
+}
+
+void StripDescribeDpiContext(HWND hwnd, const wchar_t* label, wchar_t* out, int chars)
+{
+    if (!out || chars <= 0)
+        return;
+    out[0] = L'\0';
+
+    static GetWindowDpiAwarenessContextFn   windowCtx = NULL;
+    static GetThreadDpiAwarenessContextFn   threadCtx = NULL;
+    static GetAwarenessFromDpiAwarenessContextFn nameOf = NULL;
+    static BOOL looked = FALSE;
+    if (!looked)
+    {
+        looked = TRUE;
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        if (user32)
+        {
+            windowCtx = (GetWindowDpiAwarenessContextFn)(void*)
+                        GetProcAddress(user32, "GetWindowDpiAwarenessContext");
+            threadCtx = (GetThreadDpiAwarenessContextFn)(void*)
+                        GetProcAddress(user32, "GetThreadDpiAwarenessContext");
+            nameOf    = (GetAwarenessFromDpiAwarenessContextFn)(void*)
+                        GetProcAddress(user32, "GetAwarenessFromDpiAwarenessContext");
+        }
+    }
+
+    if (!windowCtx || !nameOf)
+    {
+        _snwprintf(out, chars, L"%s dpi-context unavailable (pre-1607)", label);
+        out[chars - 1] = L'\0';
+        return;
+    }
+
+    // The window's context, and the thread's beside it. Both, because the hazard this is looking
+    // for is a DISAGREEMENT: a window whose context differs from the thread reading it is exactly
+    // when Windows virtualises the rectangles it hands back, and a single number cannot show that.
+    HANDLE wc = hwnd ? windowCtx(hwnd) : NULL;
+    HANDLE tc = threadCtx ? threadCtx() : NULL;
+
+    _snwprintf(out, chars, L"%s dpi=%d ctx=%s(0x%p) thread-ctx=%s(0x%p)",
+               label, hwnd ? DpiFromWindows(hwnd) : 0,
+               DpiAwarenessName(wc ? nameOf(wc) : -1), (void*)wc,
+               tc ? DpiAwarenessName(nameOf(tc)) : L"unavailable", (void*)tc);
+    out[chars - 1] = L'\0';
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -672,7 +785,26 @@ static void DerivePalette(COLORREF chrome, Palette* out)
 
     out->selected = chrome;
     out->back     = Step(chrome, -26);
-    out->hover    = Step(chrome, -13);
+
+    // Halfway between the well and the tab, which is what a hover *is*: the tab, part-way brought up.
+    //
+    // It was Step(chrome, -13) - thirteen down from the ribbon - and for any ribbon lighter than the
+    // step that is the same number, because back is chrome-26 exactly and the midpoint of chrome-26
+    // and chrome is chrome-13. Bit-identical at 41 (Dark Grey), 243 (Light Grey) and 255 (White).
+    //
+    // **Word's Black theme is where the old form ran out of room.** That ribbon reads RGB(10,10,10),
+    // so Step(chrome,-26) and Step(chrome,-13) both clamp to RGB(0,0,0) and the hover fill painted the
+    // well onto the well: hovering an inactive tab did nothing at all, every hover, all day. It
+    // shipped on 2026-08-28 and the field report of 2026-09-04 prints the collapse in its own words -
+    // `well=RGB(0,0,0)` beside `chrome=RGB(10,10,10)`. The scheme was measured against Dark Grey and
+    // nobody asked what it did one theme further down.
+    //
+    // A midpoint rather than a fixed step up from the well, and check-look already said why before
+    // this was written: it asserts the hover is brighter than the well AND darker than the card
+    // (check-look.ps1:517-519). On Black the card is only RGB(10,10,10), so a fixed +13 off the well
+    // clears the well and overshoots the card - a hover lighter than the tab it is hovering. The
+    // midpoint cannot overshoot by construction, at any ribbon, which is the property worth having.
+    out->hover    = Mix(out->back, chrome, 50);
 
     // A picked-up tab is lifted by a shadow, and a shadow is black - which is worth nothing at all
     // on a dark Word, where the well behind it is already RGB(15,15,15). Photographed: the lift was
@@ -910,10 +1042,49 @@ static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
     int      step = (rw / 2) / 24;
     if (step < 1) step = 1;
 
+    // **The band is copied once and then read, rather than read twenty-four times.**
+    //
+    // `GetPixel` against a screen DC is not a memory read. Every call forces a readback out of the
+    // compositor's surface, and on this rig that is about **40ms each** - measured standalone, off
+    // the add-in, in tools\pixel-cost.cpp:
+    //
+    //     GetDC(NULL)            9-34 us          free
+    //     24x WindowFromPoint    79-1336 us       free
+    //     24x GetPixel           929,092-1,284,716 us
+    //
+    // Which is what the QPC bracket in JanitorProc had just reported from inside Word: a mean of
+    // 512,856-743,963us and a worst of 796,719us per sample, every fourth tick, on the UI thread,
+    // against a dot poll of ~430us. It had never been timed, so it had never looked like anything.
+    //
+    // One `BitBlt` of the 1-pixel-tall band the samples lie on is one readback instead of
+    // twenty-four, and `GetPixel` against the resulting *memory* DC is an ordinary memory read.
+    // Nothing else changes: the same points, the same y, and `WindowFromPoint` still asked per point
+    // against the SCREEN, because that is the question that makes reading the screen honest at all
+    // and it was never the expensive half.
+    //
+    // If any of it fails we fall back to reading the screen DC directly - slow, but the answer this
+    // has always given, and a palette that is right and late beats one that is absent.
+    int      bandX = ribbonRect.left + 20;
+    int      bandW = 23 * step + 1;
+    HDC      band  = CreateCompatibleDC(screen);
+    HBITMAP  bandBmp = band ? CreateCompatibleBitmap(screen, bandW, 1) : NULL;
+    HGDIOBJ  bandOld = bandBmp ? SelectObject(band, bandBmp) : NULL;
+    BOOL     banded  = FALSE;
+
+    // **CAPTUREBLT, and it is not optional.** Without it the first version of this passed every
+    // static check and then failed check-look's live theme change: Word's ribbon was measurably
+    // white on screen and the blit kept handing back the old dark pixels, so the palette never
+    // re-derived. That is the same redirection-surface staleness that rules out reading the ribbon's
+    // own window DC (see the comment above) - a plain SRCCOPY off the screen DC is entitled to come
+    // from a cached surface, and per-pixel GetPixel was accidentally immune because it forces a
+    // readback every time. CAPTUREBLT asks for what is on the screen now.
+    if (band && bandBmp && BitBlt(band, 0, 0, bandW, 1, screen, bandX, y, SRCCOPY | CAPTUREBLT))
+        banded = TRUE;
+
     for (int i = 0; i < 24; i++)
     {
         POINT pt;
-        pt.x = ribbonRect.left + 20 + i * step;
+        pt.x = bandX + i * step;
         pt.y = y;
 
         HWND owner = WindowFromPoint(pt);
@@ -923,7 +1094,8 @@ static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
             continue;
         }
 
-        COLORREF c = GetPixel(screen, pt.x, pt.y);
+        COLORREF c = banded ? GetPixel(band, i * step, 0)
+                            : GetPixel(screen, pt.x, pt.y);
         if (c == CLR_INVALID)
             continue;
 
@@ -940,6 +1112,10 @@ static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
             kinds++;
         }
     }
+
+    if (bandOld) SelectObject(band, bandOld);
+    if (bandBmp) DeleteObject(bandBmp);
+    if (band)    DeleteDC(band);
     ReleaseDC(NULL, screen);
 
     if (total < 12)
@@ -1305,11 +1481,28 @@ static void PlaceStrip(StripState* state, const RECT* wwfRect)
 
     if (state->stripPlaced && !SameRect(&actual, &state->stripAt))
     {
+        // The DPI context of both windows, on the line that fires when the strip is found somewhere
+        // it was not put. This is the probe for the 2026-09-04 episode where the strip was briefly
+        // read at the other monitor's DPI - 1218x120/144 = 1015 and 48x120/144 = 40, then the exact
+        // inverse a second later - with no WM_DPICHANGED and no monitor crossing.
+        //
+        // The frame and the strip are asked SEPARATELY and printed side by side because that is the
+        // one shape the refutations left standing: in the same PlaceStrip call, ChildRect came back
+        // clean for the `_WwF` and scaled for the strip, which no thread-wide awareness context can
+        // produce. If these two lines ever disagree, this is mixed-mode virtualisation of our own
+        // child window and it is ours to fix; if they always agree, that reading is wrong too and
+        // the next place to look is ChildRect itself.
+        wchar_t frameCtx[160];
+        wchar_t stripCtx[160];
+        StripDescribeDpiContext(state->frame, L"frame", frameCtx, 160);
+        StripDescribeDpiContext(state->strip, L"strip", stripCtx, 160);
+
         LogWrite(L"strip  hwnd=0x%p  strip had drifted: at (%ld,%ld %ldx%ld), expected "
-                 L"(%ld,%ld %ldx%ld) - correcting",
+                 L"(%ld,%ld %ldx%ld) - correcting  [state->dpi=%d stripH=%d  %s  %s]",
                  (void*)state->frame,
                  actual.left, actual.top, actual.right - actual.left, actual.bottom - actual.top,
-                 want.left, want.top, want.right - want.left, want.bottom - want.top);
+                 want.left, want.top, want.right - want.left, want.bottom - want.top,
+                 state->dpi, state->stripH, frameCtx, stripCtx);
     }
 
     // SWP_NOZORDER after the first placement, deliberately. The strip is created at the top of the
@@ -3600,12 +3793,95 @@ static void DragScrollStop(void);
 // relocating this", not a cursor invented here.
 //
 // System cursors are shared and cached by the window manager: LoadCursorW hands back the same handle
-// every time and there is nothing to destroy. Setting it while we hold the mouse capture is enough to
-// keep it - WM_SETCURSOR is not sent to anybody while the mouse is captured, so nothing else is going
-// to put the arrow back underneath us.
+// every time and there is nothing to destroy.
+//
+// **Setting it once is NOT enough, and the comment that used to stand here said it was.** It read:
+// "Setting it while we hold the mouse capture is enough to keep it - WM_SETCURSOR is not sent to
+// anybody while the mouse is captured, so nothing else is going to put the arrow back underneath us."
+// The first half is true and the conclusion does not follow. WM_SETCURSOR is indeed not sent while the
+// mouse is captured, so no other WINDOW is asked - but SetCursor is per-THREAD state and this add-in
+// runs on Word's own UI thread. Word does not have to be asked. Anything Word runs here sets the
+// pointer directly, and the last call wins.
+//
+// Measured, not reasoned. With a WH_CALLWNDPROCRET hook naming the message that changed it, a
+// TabGhost=0 tear-off logged:
+//
+//     20:38:09.049  the tear - this strip sets IDC_SIZEALL              cursor 0x10015
+//     20:38:09.439  _WwG  WM_NCCREATE           (0x0081)                cursor 0x10005
+//     20:38:09.439  _WwG  WM_WINDOWPOSCHANGING  (0x0046)                cursor 0x10007
+//     20:38:09.441  _WwG  WM_STYLECHANGING      (0x007C)                cursor 0x10005
+//     20:38:09.871  the button is released
+//
+// Word building a document-view window 390ms into a gesture it knows nothing about: a wait cursor
+// while it worked, then what IT thinks the pointer should be over a document - the I-beam. Nothing of
+// ours was asked, nothing was lost, and the capture never moved, which is why the WM_CAPTURECHANGED
+// handler is silent in every failing run and why four hypotheses that all assumed a fault fitted the
+// evidence equally badly.
+//
+// So the cursor is HELD for the length of the gesture rather than set at its edges.
+//
+// It was invisible for months because SampleChrome used to occupy this thread for 750ms at a time,
+// which left no quiet stretch for Word to build anything in. Fixing that sampler is what uncovered
+// this, and every A/B that made the thread BUSIER hid it again - the old sampler restored, or a build
+// that binds more work into each janitor tick. That is worth knowing before anyone reads a green
+// suite here as evidence: this defect is masked by slowness, so it passes on a loaded machine.
 static void DragCursor(const wchar_t* which)
 {
-    SetCursor(LoadCursorW(NULL, which));
+    g_dragCursorSet = LoadCursorW(NULL, which);
+    SetCursor(g_dragCursorSet);
+}
+
+// Runs for the length of a drag. Silent and nearly free in the ordinary case: one GetCursor, and a
+// SetCursor only when the pointer is not what the gesture asked for.
+static void DragCursorTick(void)
+{
+    if (!g_dragging || !g_dragCursorSet)
+        return;
+
+    HCURSOR taken = GetCursor();
+    if (taken == g_dragCursorSet)
+        return;
+
+    SetCursor(g_dragCursorSet);
+
+    // Once per gesture, not once per tick. A pointer being taken twenty times a second is one fact,
+    // and the line that says so names the handle that took it against the ones it could be - which is
+    // the whole reason this was diagnosable at all. Four runs of check-reorder said only "not
+    // IDC_SIZEALL" and named nothing.
+    if (++g_dragCursorPutBack == 1)
+        LogWrite(L"strip  the pointer was taken mid-drag and put back: something on Word's UI thread "
+                 L"set 0x%p where this gesture had set 0x%p  "
+                 L"(SIZEALL 0x%p, arrow 0x%p, I-beam 0x%p, NO 0x%p)",
+                 (void*)taken, (void*)g_dragCursorSet,
+                 (void*)LoadCursorW(NULL, IDC_SIZEALL), (void*)LoadCursorW(NULL, IDC_ARROW),
+                 (void*)LoadCursorW(NULL, IDC_IBEAM), (void*)LoadCursorW(NULL, IDC_NO));
+}
+
+static void DragCursorStop(void)
+{
+    if (g_dragCursorTimer)
+    {
+        if (IsWindow(g_dragCursorTimer))
+            KillTimer(g_dragCursorTimer, ID_DRAG_CURSOR);
+        g_dragCursorTimer = NULL;
+    }
+
+    // Said at the end of the gesture, where the total is known. One line per drag that needed it and
+    // none at all for a drag that did not, so the field log carries the rate rather than the noise.
+    if (g_dragCursorPutBack > 1)
+        LogWrite(L"strip  the pointer was put back %d times during that drag", g_dragCursorPutBack);
+
+    g_dragCursorPutBack = 0;
+    g_dragCursorSet     = NULL;
+}
+
+static void DragCursorStart(HWND hwnd)
+{
+    if (g_dragCursorTimer == hwnd)
+        return;
+    DragCursorStop();
+    if (SetTimer(hwnd, ID_DRAG_CURSOR, DRAG_CURSOR_MS, NULL))
+        g_dragCursorTimer = hwnd;
 }
 
 // Forget the gesture without touching the row: a drop that was agreed to, or a strip destroyed
@@ -3613,6 +3889,7 @@ static void DragCursor(const wchar_t* which)
 static void DragForget(void)
 {
     DragScrollStop();
+    DragCursorStop();
     GhostStop();
     if (g_dragTorn || g_dragJoin)
         DragCursor(IDC_ARROW);
@@ -3651,6 +3928,7 @@ static void DragUndo(HWND hwnd, const wchar_t* why)
     g_dragOnto  = NULL;
     g_dragOntoKnown = FALSE;
     DragScrollStop();
+    DragCursorStop();
     GhostStop();
 
     if (!was || !frame || !IsWindow(frame))
@@ -3726,6 +4004,7 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
                 return;
 
             g_dragging = TRUE;
+            DragCursorStart(hwnd);
             LogWrite(L"strip  hwnd=0x%p  drag started on 0x%p - it is on its own, so this is a rejoin",
                      (void*)hwnd, (void*)g_dragFrame);
         }
@@ -3850,6 +4129,7 @@ static void DragMove(StripState* state, HWND hwnd, POINT point)
 
         g_dragging = TRUE;
         DragScrollStart(hwnd);
+        DragCursorStart(hwnd);
         LogWrite(L"strip  hwnd=0x%p  drag started on 0x%p (tab %d)",
                  (void*)hwnd, (void*)g_dragFrame, g_dragFrom);
     }
@@ -4655,6 +4935,11 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         if (state && wParam == ID_DRAG_SCROLL)
         {
             DragScrollTick(state, hwnd);
+            return 0;
+        }
+        if (state && wParam == ID_DRAG_CURSOR)
+        {
+            DragCursorTick();
             return 0;
         }
         if (state && wParam == ID_CHEVRON_REPEAT)
@@ -5668,6 +5953,55 @@ static void TryBind(StripState* state)
     if (!IsWindow(state->frame))
         return;
 
+    // **A frame Word has made and not finished is not a tab, and everything below this line would
+    // say otherwise.**
+    //
+    // Word creates OpusApp frames it never shows and never names, and hands one a document later or
+    // never - StackAttachFrame says the same thing from the stack's side, and the rejoin flag there
+    // exists because of it. What it costs here is in every battery log on this rig, 116 times across
+    // two builds, and one frame carries the whole of it:
+    //
+    //   14:21:14.829  attach  hwnd=0x170630  (new frame)  visible=0  rect=(40,40 900x700)
+    //   14:21:14.830  strip   hwnd=0x170630  tab name |Word|  from window title ||
+    //   14:21:14.831  strip   hwnd=0x170630  initial: _WwF natural (0,156 874x429) -> (0,220 874x365)
+    //
+    // ReadTitle asserts a tab name for a window that has no tab, and ApplyInitial takes the interior
+    // of a frame Word has not laid out as its `natural` - top edge 156 where every finished frame in
+    // that same log reads 356, which is 200px of ribbon that has not been drawn yet. That frame then
+    // sat hidden for 39 seconds and was let go at shutdown, having never held a document, having
+    // never joined the row, and having had a real window moved 64px for it.
+    //
+    // **What identifies it is the title being absent, and only that.** A title of "Word" is a
+    // different window entirely and must still bind: it is the Start screen and the window whose
+    // last document was closed, both of which keep their strip on purpose - see StripHasDocument -
+    // and it is also what a Protected View window reads for the 31ms before Word renames it,
+    // measured in the same log on hwnd=0x19004E. ReadTitle's `nameless` treats "" and "Word" alike
+    // and would take all three of those with it.
+    //
+    // Being off screen is the second half of the AND rather than a signal of its own, and the
+    // distinction matters: every good frame on this rig attaches hidden too, so a visibility test
+    // alone would defer every bind there is. It is here to bound the cost of the title test being
+    // wrong. An untitled frame that IS on screen is one somebody could be looking at, so it binds
+    // now and takes its chances; an untitled frame that is not on screen costs one janitor tick to
+    // wait, which nobody can see.
+    //
+    // Nothing is lost by waiting. `state->wwf` is still NULL, so the janitor's first test brings us
+    // straight back here, exactly as it does for a frame whose `_WwF` is not built yet.
+    wchar_t raw[256];
+    GetWindowTextW(state->frame, raw, 256);
+    raw[255] = L'\0';
+
+    if (raw[0] == L'\0' && (!IsWindowVisible(state->frame) || IsIconic(state->frame)))
+    {
+        if (!state->untitledLogged)
+        {
+            state->untitledLogged = TRUE;
+            LogWrite(L"strip  hwnd=0x%p  Word has made this frame and not titled it, and it is "
+                     L"hidden or minimised - not binding yet", (void*)state->frame);
+        }
+        return;
+    }
+
     HWND wwf = PickWwf(state->frame, NULL);
     if (!wwf)
         return;                 // not built yet - the janitor will come back
@@ -5858,8 +6192,14 @@ static void Restore(StripState* state)
 //      ~5.5% of Word's UI thread in half-second lumps. See PollModified for the measurement and for
 //      what replaced it.
 //
-//   2. **In between, only the ACTIVE window is asked about**, at the same governed cadence and by
-//      the same measurement. That is not a compromise on correctness so much as a statement of where
+//   2. **In between, only the ACTIVE window is asked about**, on its own counter and its own rung,
+//      and governed by a deliberately different rule: memoryless, because switching tabs changes
+//      which document is being asked about, and capped at two seconds, because the rungs below that
+//      exist to protect the UI thread from the ROW's half-second passes and the active pass has
+//      never cost more than 52ms. See PollModified - both halves are argued there, and the cap is a
+//      2026-09-04 correction to a version of this that had no ceiling at all and was measured
+//      leaving the typed-in tab unasked for 35 seconds. That is not a compromise on correctness so
+//      much as a statement of where
 //      the flag can change: a document is edited in the window that has the keyboard, and saved from
 //      the window that has the keyboard. What the periodic full pass is for is the rest - a
 //      background document Word saves by itself, which is what AutoSave on a SharePoint document
@@ -5941,6 +6281,47 @@ static void PollModified(void)
     // they had, and the tabs they belong to are being closed.
     if (StackCloseInFlight())
         return;
+
+    // And a move or size, for the same reason and a larger one. This timer is a THREAD timer, so its
+    // WM_TIMER is dispatched by whatever pump is running, and while Word is dragging a frame that
+    // pump is Word's own modal loop: the tick lands between two frames of the window the user is
+    // watching move. The work rig's log has it happening - two complete janitor rounds inside one
+    // 908.9ms drag, whose trace carries gaps of 260.8ms and 173.3ms with the row not following the
+    // mouse - and a full row pass costs a mean of 179,188us and a worst of 520,183us there.
+    //
+    // Only this stage stands down, which is why the test is here rather than at the top of
+    // JanitorProc. The stages above are what keeps the strip sitting on its frame while the frame
+    // moves; stopping those would trade a stutter for a strip that visibly lags its own window.
+    //
+    // Nothing is lost. The countdowns below are not reached either, so a pass that was due is still
+    // due and runs on the first tick after the loop ends, and what can go stale meanwhile is what
+    // already goes stale between ticks - a background document Word saved by itself - now at most one
+    // gesture late.
+    static int skipped = 0;
+    if (FramesInModalMoveLoop())
+    {
+        skipped++;
+
+        // Once a minute while it lasts, and it should never last that long: two skipped passes is a
+        // whole drag. It is here because the flag this reads is cleared by one message arriving, and
+        // a stand-down that somehow never ended would stop the dot for the life of the process and
+        // say nothing at all. FramesInModalMoveLoop handles the one way that is known to happen; this
+        // is what would name a second one.
+        if (skipped % 120 == 0)
+            LogWrite(L"strip  dot poll: %d passes skipped and still standing down - Word says it is "
+                     L"STILL inside its own move/size loop", skipped);
+        return;
+    }
+
+    // Counted and said once, not said per pass. The cadence line further down this function refuses
+    // to be written per tick for exactly this reason, and the number the next report wants is how
+    // many passes a gesture cost - which one line carries and N lines only imply.
+    if (skipped > 0)
+    {
+        LogWrite(L"strip  dot poll: %d pass(es) skipped while Word was inside its own move/size loop",
+                 skipped);
+        skipped = 0;
+    }
 
     HWND        frames[MAX_STRIPS];
     StripState* owners[MAX_STRIPS];
@@ -6044,8 +6425,17 @@ static void PollModified(void)
     // report says which of those is actually happening.
     //
     // What makes the staleness affordable is rule 2 above: the active window keeps its own counter
-    // and its own rung, so the tab being typed into is still asked twice a second however far the row
-    // has backed off. What goes late is a background document Word saved by itself.
+    // and its own rung, so the tab being typed into does not go as quiet as the row. What goes late
+    // is a background document Word saved by itself.
+    //
+    // **That used to say "is still asked twice a second however far the row has backed off", and
+    // that is no longer true - it is now "at least every two seconds".** The weakening is deliberate
+    // and it is written down here rather than left for the next reader to discover from the code,
+    // because this comment was the licence the uncapped version was written under. The 2026-09-04
+    // report has the active pass reaching rung 3 seven times across two sessions, worst
+    // 52056us -> 20000ms nominal, with 35.35s actually observed between consecutive active passes -
+    // on the tab with the keyboard in it. A saved document still showing the unsaved dot for
+    // thirty-five seconds is the wrong direction to be wrong in, and the cap below bounds it.
     static int      fullRung   = 0;
     static int      activeRung = 0;
     static LONGLONG prevFull   = 0;
@@ -6073,10 +6463,30 @@ static void PollModified(void)
         *prev = us;
         LONGLONG basis = (us > lastTime) ? us : lastTime;
 
+        // **Descending is asked a harder question than ascending, and that asymmetry is the whole
+        // of the second fix.** A bare `want < *rung` has no hysteresis at all, so a cost sitting on
+        // a threshold crosses it in both directions on nearly every pass: the 2026-09-04 report has
+        // this governor ping-ponging 500<->2000ms **36 times in 3m50s** on a 7-window row idling at
+        // 2400-3900us with spikes just over the 4000us line.
+        //
+        // That is NOT f333349's bistability coming back, and the log settles it rather than leaving
+        // it to be argued: in the whole 230s episode not one line above "2000 ms" was written, so
+        // every pass in it cost <= 15000us, where f333349's fault produced 90,000-518,000us passes -
+        // which this same log shows the ladder handling correctly a minute later (510616us ->
+        // 60000ms). It is plain jitter across a bare threshold. It costs 0.10 points of the UI
+        // thread, which is no harm to anybody, and 49% of the log's bytes per hour, in the same
+        // words and shape as the one line that matters.
+        //
+        // Asking `RungFor(basis * 2)` means a pass must be cheap enough that even twice its cost
+        // would sit lower before the cadence is trusted back down. `basis * 2` can only map to a
+        // rung >= `RungFor(basis)`, so this is strictly harder than what it replaces and can never
+        // descend where the old rule would not have - the same direction f333349's fix went, so it
+        // cannot reintroduce it. Replayed against the report's own numbers the 72-sample warm band
+        // goes from 34 cadence changes to 1.
         int want = RungFor(basis);
         if (want > *rung)
             *rung = want;                                   // a slow Word stops being asked, at once
-        else if (want < *rung)
+        else if (RungFor(basis * 2) < *rung)
             (*rung)--;                                      // and is trusted back a rung at a time
     }
     else
@@ -6093,11 +6503,26 @@ static void PollModified(void)
         // document being looked at live. That is why the work rig's active pass never once exceeded
         // 4ms across five and a half hours while its row passes were running to half a second.
         //
-        // **If that assumption is ever wrong, the log already says so in its own words** - "the
-        // active window took ... - now asking every ..." - and that line is the one to look for in
-        // the next report. It has never yet appeared after the first pass of a process.
+        // **That assumption was wrong, and the log said so in its own words** - "the active window
+        // took ... - now asking every ..." - which this comment used to name as the line to look for
+        // while claiming it had never appeared after the first pass of a process. It has now, seven
+        // times across two sessions in the 2026-09-04 report, worst 52056us -> rung 3 -> 20000ms
+        // nominal and 35.35s actually observed between consecutive active passes.
+        //
+        // So the pass keeps its memorylessness - the subject really does change underneath it, and
+        // hysteresis on a sampler whose subject changes is meaningless - but it is capped. Rungs 2-4
+        // exist to protect the UI thread from the ROW's 90,000-518,000us passes; the active pass's
+        // worst across those same two sessions is 52ms. Nothing measured anywhere justifies a 20s or
+        // 60s cadence on the one window the user is typing into, and the direction the staleness
+        // misleads in is the bad one: a document Word has just saved goes on showing the unsaved dot.
+        //
+        // Capped at rung 1 rather than rung 0 because the cost is real when it is real: one 52ms
+        // pass on a 500ms cadence is 10% of the interval, and 2s bounds that to under 3% while still
+        // being far inside how long a person takes to notice a dot. It is a deliberate weakening of
+        // what the comment above rule 2 used to promise, and that comment now says so.
         *prev = us;
-        *rung = RungFor(us);
+        int want = RungFor(us);
+        *rung = (want > 1) ? 1 : want;
     }
 
     if (*rung < 0)           *rung = 0;
@@ -6116,9 +6541,25 @@ static void PollModified(void)
     if (ticks != *last)
     {
         *last = ticks;
+
+        // Which window this pass was about, said out loud.
+        //
+        // It was not, and that cost the 2026-09-04 report an answer it should have had: two
+        // expensive active samples could not be shown to be about the same document, because the
+        // line named neither. It is not self-evident from the code either - WordTabReadModified
+        // walks all of Application.Windows regardless of `count` (connect.cpp), so "the active
+        // window" describes which flag is wanted, not how much work Word did to produce it.
+        //
+        // The row's pass is many windows and has no single hwnd, so it says so rather than naming
+        // an arbitrary member.
+        //
+        // Appended, deliberately: check-dot.ps1 matches `now asking every \d+ ms` on this line, so
+        // the phrase it reads is left exactly where it was.
+        HWND about = full ? NULL : frames[only];
         LogWrite(L"strip  dot poll: %s took %lld us for %d window(s) (and %lld us the time before) "
-                 L"- now asking every %d ms",
-                 full ? L"the whole row" : L"the active window", us, asked, lastTime, ticks * 500);
+                 L"- now asking every %d ms  (hwnd=0x%p)",
+                 full ? L"the whole row" : L"the active window", us, asked, lastTime, ticks * 500,
+                 (void*)about);
     }
 
     // What it costs. The out-of-process measurement in tools\probe-saved.ps1 put a two-window pass
@@ -6188,9 +6629,27 @@ static void PollModified(void)
     }
 }
 
+// Naming the thief instead of guessing at it.
+//
+// The TabGhost=0 tear-off reads the pointer 400ms after the last mouse move with the button still
+// held, and gets Word's I-beam (0x10005) where the strip put IDC_SIZEALL. Four hypotheses fitted
+// the evidence equally well and not one of them named a call, which is the shape this project has
+// paid for before: "not IDC_SIZEALL" is the one thing that narrows nothing down.
+//
+// What makes it hard to see is that NOTHING NEEDS TO GO WRONG for it to happen. SetCursor is
+// per-THREAD state and this add-in runs on Word's own UI thread, so any Word code that runs here
+// overwrites the strip's cursor with no WM_SETCURSOR and no change of capture - which is exactly
+// why the WM_CAPTURECHANGED handler above is silent in every failing run, and why the comment on
+// DragCursor ("nothing else is going to put the arrow back underneath us") is true about other
+// windows and false about this thread.
+//
+// So: read the cursor around every stage of a janitor tick that lands inside a drag, and have the
+// stage that changes it say so. GetCursor is a register read and the whole thing is gated on
+// g_dragging, so it costs nothing when nobody is dragging - which is always, outside a check.
 static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
 {
     (void)hwnd; (void)msg; (void)id; (void)tick;
+
 
     for (int i = 0; i < g_stripCount; i++)
     {
@@ -6313,7 +6772,24 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
     // "the front window is showing a message bar" could be reported as "something is covering the
     // ribbon" - a true statement about a different window, which is exactly the three-steps-from-
     // the-cause shape that has cost this subsystem two diagnoses.
-    if (g_sampleEnabled)
+    // **And this stage stands down inside a drag too, which the dot poll's stand-down did not
+    // originally cover - because until it was bracketed, nobody knew this was the expensive one.**
+    //
+    // Measured here the moment the instrument above went in: mean 512,856-743,963us and worst
+    // 796,719us per sample, on THIS rig, where the dot poll the whole governor was built for costs
+    // about 430us. Three orders of magnitude, on Word's UI thread, every fourth tick.
+    //
+    // The cause is not in doubt and is not Word's. Measured standalone, off any add-in, on this
+    // machine: GetDC(NULL) is 9-34us and twenty-four WindowFromPoint calls are 79-1336us, but
+    // **twenty-four GetPixel calls against the screen DC are 929,092-1,284,716us** - about 40ms
+    // each, because every one of them forces a readback out of a DWM-composited surface.
+    //
+    // So it is stood down for a gesture, on the same query and for the same reason as the dot poll:
+    // a theme change cannot happen while the user is holding the mouse button down, and this is by
+    // a wide margin the largest thing this timer does. It is NOT the fix - the fix is to stop asking
+    // GDI for twenty-four individual pixels off the screen, which is its own slice and is written up
+    // in the report for this one. This is only what keeps it out of the drag.
+    if (g_sampleEnabled && !FramesInModalMoveLoop())
     {
         static int countdown = 0;
         if (--countdown <= 0)
@@ -6327,6 +6803,24 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
             const wchar_t* why      = L"no strip was ready to be asked";
             const wchar_t* frontWhy = NULL;
             const wchar_t* barWhy   = NULL;
+
+            // What the sample costs, bracketed the way AskModified brackets its own call into Word:
+            // QPC either side of the expensive thing, integer microseconds out of it. Until now this
+            // was the one stage on this timer with no instrument at all, and it is the one with the
+            // most reason for one - a GetDC(NULL) and then, per strip until one of them answers,
+            // twenty-four WindowFromPoint and GetPixel calls against a screen DC that belongs to the
+            // compositor. None of it has ever been measured on the rig it runs on, and it rides this
+            // timer into Word's modal move/size loop like everything else here, which makes it a
+            // candidate for the 260.8ms and 173.3ms drag gaps nothing so far accounts for.
+            //
+            // The bracket closes where the loop does, so AdoptSampledChrome is inside it. That is the
+            // one thing in here that is not the sample, and it is left in rather than hoisted out
+            // because it is compare-before-act: on every tick but the one where Word's theme actually
+            // changed it is a single COLORREF comparison. The tick where it is not will stand in
+            // `worst` with the palette's own line beside it saying what it did.
+            LARGE_INTEGER before, after, freq;
+            QueryPerformanceFrequency(&freq);
+            QueryPerformanceCounter(&before);
 
             HWND front   = GetForegroundWindow();
             BOOL applied = FALSE;
@@ -6373,6 +6867,46 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
                     if (mine == kBandDoesNotReachTop)
                         barWhy = mine;
                 }
+            }
+
+            QueryPerformanceCounter(&after);
+            LONGLONG us = (freq.QuadPart > 0)
+                        ? ((after.QuadPart - before.QuadPart) * 1000000 / freq.QuadPart) : 0;
+
+            // Reported the two ways the dot poll reports itself, and for the reasons written out
+            // there: a record alone describes a cold start and then falls silent forever, and a worst
+            // case with no typical case beside it is not a measurement of what something costs.
+            //
+            // 20 then every 480 are the dot poll's own numbers and they buy something different here,
+            // because this stage runs every fourth tick rather than every one: the first line lands
+            // forty seconds into a Word session and the rest every sixteen minutes. That is four
+            // times rarer than the dot poll's, which is what makes it safe to add to a log that
+            // deletes itself at half a megabyte.
+            static LONGLONG worstEver = -1;
+            if (us > worstEver)
+            {
+                worstEver = us;
+                LogWrite(L"strip  chrome sample: %lld us (the most it has ever taken)", us);
+            }
+
+            static int      passes   = 0;
+            static int      reportAt = 20;
+            static LONGLONG total    = 0;
+            static LONGLONG worst    = 0;
+
+            passes++;
+            total += us;
+            if (us > worst)
+                worst = us;
+
+            if (passes >= reportAt)
+            {
+                LogWrite(L"strip  chrome sample: %d passes, mean %lld us, worst %lld us",
+                         passes, total / passes, worst);
+                passes   = 0;
+                total    = 0;
+                worst    = 0;
+                reportAt = 480;
             }
 
             // Precedence when nobody could answer: the window the user is looking at, then a

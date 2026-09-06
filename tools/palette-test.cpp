@@ -24,6 +24,23 @@ typedef unsigned long COLORREF;
 
 static const int kSameWithin = 4;                 // CHROME_SAME_WITHIN
 
+// The other half of what this file asserts: not whether a sampled ribbon is believed, but what the
+// row is painted with once it is. Kept in step with strip.cpp's Clamp255 and Step by hand, for the
+// reason given at the top of the file - the copy is what is being asserted.
+static int Clamp255(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
+static COLORREF Step(COLORREF c, int delta)
+{
+    return RGBV(Clamp255(RV(c) + delta), Clamp255(GV(c) + delta), Clamp255(BV(c) + delta));
+}
+
+static COLORREF Mix(COLORREF a, COLORREF b, int percentB)
+{
+    return RGBV((RV(a) * (100 - percentB) + RV(b) * percentB) / 100,
+                (GV(a) * (100 - percentB) + GV(b) * percentB) / 100,
+                (BV(a) * (100 - percentB) + BV(b) * percentB) / 100);
+}
+
 static bool ChromeNear(COLORREF a, COLORREF b)
 {
     int dr = RV(a) - RV(b); if (dr < 0) dr = -dr;
@@ -194,6 +211,89 @@ int main(void)
         // unit off the candidate - ChromeNear, not equality, is what the second reading is judged by.
         Check(AdoptStep(&g, RGBV(253, 253, 253)), "a confirming sample one unit off still confirms it");
         Check(g.applied == RGBV(253, 253, 253),   "and what is applied is the sample that confirmed, not the candidate");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // And then what the adopted colour is USED for, which is where the same rig found the next one.
+    //
+    // The gate above decides whether to believe a sampled ribbon. DerivePalette decides what the row
+    // looks like once it is believed, and it had never been asserted at all - so the strip shipped a
+    // hover state that does not exist on Word's Black theme. Nothing here needs Word either: it is
+    // subtraction, and subtraction is exactly what went wrong.
+    // -----------------------------------------------------------------------------------------
+    printf("==> Every ribbon Word can give us leaves the hover state visible\n");
+    {
+        // Below the whole range 0..255 rather than at the four named themes, because the fault was
+        // never at a named theme - it was at a value the arithmetic could not represent, and the
+        // only honest way to say "no ribbon does this" is to try every ribbon.
+        int collapsedNew = 0;
+        int collapsedOld = 0;
+        int differ       = 0;
+        int outOfOrder   = 0;
+        int overshootAlt = 0;
+        bool strictWhereverThereIsRoom = true;
+
+        for (int v = 0; v <= 255; v++)
+        {
+            COLORREF chrome = RGBV(v, v, v);
+            COLORREF back   = Step(chrome, -26);      // the well
+            COLORREF card   = chrome;                 // the active tab is the ribbon, brought down
+            COLORREF hotNew = Mix(back, chrome, 50);  // strip.cpp DerivePalette, now
+            COLORREF hotOld = Step(chrome, -13);      // ...and as it shipped in ef49c79
+            COLORREF hotAlt = Step(back,   +13);      // ...and the first attempt at the fix
+
+            if (hotNew == back) collapsedNew++;
+            if (hotOld == back) collapsedOld++;
+            if (hotNew != hotOld) differ++;
+            if (!(RV(back) <= RV(hotNew) && RV(hotNew) <= RV(card))) outOfOrder++;
+            if (RV(hotAlt) > RV(card)) overshootAlt++;
+            if (RV(card) - RV(back) >= 2 && !(RV(back) < RV(hotNew) && RV(hotNew) < RV(card)))
+                strictWhereverThereIsRoom = false;
+        }
+
+        // The invariant, and it is check-look.ps1:517-519's, not one invented here: the hover sits
+        // BETWEEN the well and the card. Asserted as an ordering rather than as a value, because a
+        // test written to match the arithmetic it is checking proves nothing - the first attempt at
+        // this fix passed a value-shaped version of it and still put the hover above the card.
+        Check(outOfOrder == 0, "the hover is never outside the well..card range, at any ribbon");
+        Check(strictWhereverThereIsRoom,
+              "and strictly between the two wherever there is a unit of room for it");
+
+        // Which is exactly what the first attempt got wrong: a fixed +13 up from the well clears the
+        // well and then overshoots a card that is only 10 units up, giving a hover lighter than the
+        // tab being hovered. Kept as a check so that shape cannot come back.
+        Check(overshootAlt == 13, "a fixed step up from the well would overshoot the card 13 times");
+
+        Check(collapsedOld == 14, "the shipped rule collapsed hover onto the well below chrome 14");
+        Check(collapsedNew == 2,  "the midpoint collapses only at chrome 0 and 1, where the card has "
+                                  "collapsed onto the well too and there is nothing to be between");
+
+        // The blast radius, stated as a number so it cannot quietly grow: the two rules differ below
+        // chrome 26 and nowhere else. Every theme Word ships except Black sits above that, which is
+        // why this fix cannot be seen anywhere the palette was originally measured.
+        Check(differ == 23, "and they part company only below chrome 26 - 23 values of 256");
+    }
+
+    printf("==> The themes the user actually runs\n");
+    {
+        // The one the report came from. chrome RGB(10,10,10) is Word's Black theme with the window
+        // inactive, and it is in the 2026-09-04 log beside the collapse it caused: well=RGB(0,0,0).
+        COLORREF back = Step(kBlackIdle, -26);
+        Check(back == RGBV(0, 0, 0),                        "Black theme: the well is black, as the field log says");
+        Check(Step(kBlackIdle, -13) == back,                "...and the shipped hover was the same black - the defect");
+        Check(Mix(back, kBlackIdle, 50) == RGBV(5, 5, 5),   "...where it is now 5, between the well at 0 and the tab at 10");
+
+        // Active black - the other half of the ribbon's flap - has to work too, or the hover would
+        // appear and disappear as the window took and lost focus.
+        COLORREF backActive = Step(kBlack, -26);
+        Check(Mix(backActive, kBlack, 50) == RGBV(4, 4, 4), "Black theme, window active: 4, and still between");
+
+        // The three themes the scheme was originally measured against must not move by one unit.
+        // This is the whole claim of the fix: for any ribbon lighter than the step, back is
+        // chrome-26 exactly, so the midpoint of back and chrome IS chrome-13.
+        Check(Mix(Step(kDarkGrey,  -26), kDarkGrey,  50) == Step(kDarkGrey,  -13), "Dark Grey is unchanged");
+        Check(Mix(Step(kLightGrey, -26), kLightGrey, 50) == Step(kLightGrey, -13), "Light Grey is unchanged");
+        Check(Mix(Step(kWhite,     -26), kWhite,     50) == Step(kWhite,     -13), "White is unchanged");
     }
 
     printf("\n%s\n", failures ? "FAILED" : "All good.");

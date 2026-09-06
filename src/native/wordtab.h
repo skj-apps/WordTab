@@ -146,7 +146,32 @@ BOOL WordTabReadDocumentPath(HWND frame, wchar_t* out, int chars);
 // that appear to fix it only fix the window in front of you - which is why the person this was
 // built for was setting the view by hand on every Word start. Reports what it found, so the log
 // can say what was wrong rather than only that something was.
-BOOL WordTabOnePageView(HWND frame, LONG* wasColumns, LONG* wasZoom);
+// Why it decided what it decided. **FALSE had five meanings and the caller logged on none of them**,
+// so "healthy, nothing to do" and "the correction was attempted and Word refused the write" were
+// byte-identical in the log - and the second of those leaves the document three pages across at 10%
+// zoom, which is the complaint this whole path exists to answer. OnePage ran six times in the
+// 2026-09-04 report and said nothing about any of them.
+//
+// The reason is decided HERE, at the five exits, and never re-derived by the caller. That is not a
+// style preference: the illness test is `columns > 1 && columns < 99`, because 99 is Word's "as many
+// as fit" and IS the healthy value, and two separate attempts at rebuilding that test in stack.cpp
+// dropped the `< 99` and would have printed "Word refused the write" on every healthy join.
+enum WordTabOnePageWhy
+{
+    OnePage_Corrected = 0,   // it was wrong, it was set, Word accepted it
+    OnePage_AlreadyFine,     // nothing to do - one page across already, at a readable zoom
+    OnePage_WordRefused,     // it WAS wrong, the write was attempted, and Word said no
+    OnePage_CouldNotRead,    // the Zoom object answered, but its properties did not
+    OnePage_NoZoom,          // View.Zoom could not be obtained
+    OnePage_NoView,          // Window.View could not be obtained
+    OnePage_NoWindow         // no Word window claims this frame - Protected View looks like this
+};
+
+// The word for one of the above, for a log line. Never NULL.
+const wchar_t* WordTabOnePageWhyName(enum WordTabOnePageWhy why);
+
+// `why` may be NULL, and receives the reason whatever the return value is.
+BOOL WordTabOnePageView(HWND frame, LONG* wasColumns, LONG* wasZoom, enum WordTabOnePageWhy* why);
 
 BOOL WordTabSaveDocument(HWND frame);
 
@@ -159,6 +184,19 @@ BOOL WordTabSaveDocument(HWND frame);
 
 void FramesStart(void);
 void FramesStop(void);
+
+// Is Word inside its own modal move/size loop right now - a frame being dragged by its caption, or
+// moved or sized from the window menu?
+//
+// Exported for the janitor, which runs on a THREAD timer and is therefore dispatched by whatever
+// pump happens to be running. Inside this loop that pump is Word's own, so a half-second tick lands
+// between two frames of a window the user is watching move, and whatever it does is paid for out of
+// them. Anything on that timer that is expensive and can wait a gesture should ask this first.
+//
+// It says nothing about Win+Left and Win+Right. Those snap a window without entering the loop and
+// without a system command, which frames.cpp already names as the case it cannot see - so FALSE here
+// is not "nobody is moving this window".
+BOOL FramesInModalMoveLoop(void);
 
 // ---------------------------------------------------------------------------------------------
 // The strip - our band of Word's layout, carved out of the top of the `_WwF` document frame.
@@ -212,6 +250,15 @@ void StripDescribeDocumentFrames(HWND frame, wchar_t* out, int chars);
 // The DPI this window is being drawn at, as the strip computes it - honouring TabDpi. The stack
 // uses it to work out how wide a printed page is on this screen; see ApplyDefaultRowRect.
 int StripDpiOf(HWND frame);
+
+// One line describing what DPI context a window is being read in: its own awareness context, the
+// calling thread's, and the DPI Windows reports for it with no TabDpi override in front of it.
+//
+// A PROBE. Nothing branches on it and nothing should - it exists so the next report can answer two
+// questions that the 2026-09-04 one could not. `label` is prefixed verbatim so one log line can
+// carry two windows and say which is which. It always writes something, including on Windows older
+// than the APIs it needs.
+void StripDescribeDpiContext(HWND hwnd, const wchar_t* label, wchar_t* out, int chars);
 
 BOOL StripGetNatural(HWND frame, RECT* natural);
 // `why` names the path that asked, because this is the one writer of a window's natural rect that

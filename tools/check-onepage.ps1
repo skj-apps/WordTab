@@ -153,7 +153,19 @@ Assert ($null -ne $said -and $said -match 'pages across') 'and the line names ho
 # ---- 3. a window already on one page is not touched ---------------------------------------------
 #
 # The claim is "acts only when there is something wrong", and the way to fail it is to act always.
-# A second document opened into the same, now-healthy Word must produce no line at all.
+#
+# **The line above this one used to say a second document "must produce no line at all", and that
+# was never true** - the assertion it described was never written, so nothing ever checked it, and
+# the log has always had a line here. The paragraph below in this same section says why in its own
+# words: correcting the columns does not make Word recompute the zoom it crushed to fit them, so the
+# second document arrives one page across at 10% and is the ZOOM half of the same illness. It is
+# corrected, and it says so.
+#
+# **What is asserted now is the line's CONTENT**, which is the 2026-09-04 change: WordTabOnePageView
+# returned the same FALSE for five different reasons and the caller logged on none of them, so a
+# healthy join and "the correction was attempted and Word refused the write" - which leaves the
+# document three pages across at 10%, the original complaint - were byte-identical in the log.
+# OnePage ran six times in one report saying nothing at all about any of them.
 
 Write-Step 'A document that opens on one page already'
 Set-LogMark
@@ -169,6 +181,12 @@ if ($saidAgain) { Write-Note "  log: $saidAgain" }
 # - one page, and unreadable. Asserting the columns alone passed it.
 Assert ($fine.Columns -eq 1) 'the second document is one page across'
 Assert ($fine.Percent -ge 50) "and readable rather than the leftover fit-many-pages zoom (got $($fine.Percent)%)"
+
+# The hole this closes: $saidAgain was read and printed and never asserted, so the section's own
+# claim above was never actually checked by anything - and the claim itself was wrong.
+Assert ($null -ne $saidAgain) 'the add-in said what it decided about the second document'
+Assert ($saidAgain -match 'put back to 100') 'and what it decided was to correct the zoom Word left crushed'
+Assert ($saidAgain -notmatch 'REFUSED') 'Word accepted the write rather than refusing it'
 try { $second.Close(0) } catch { }
 Close-Word $fixed
 
@@ -183,6 +201,26 @@ $saidLater = Get-LogLast 'view  hwnd='
 if ($saidLater) { Write-Note "  log: $saidLater" }
 Assert ($now.Columns -le 1) 'Word opens on one page by itself now - the column count it kept is the corrected one'
 Assert ($now.Percent -ge 50) "and the document is readable (got $($now.Percent)%)"
+
+# Same hole, same close: $saidLater was printed and never asserted. This is the run that matters
+# most - a fresh Word, which is the one the user actually complains about.
+Assert ($null -ne $saidLater) 'the add-in said what it decided in the new Word too'
+Assert ($saidLater -match 'put back to 100') 'and it corrected the zoom in the new Word as well'
+
+# **The reason is now a fixed vocabulary, and two of its words are alarms.** Neither may appear here,
+# where the document was reachable and Word took the write - so this is the assertion that would fail
+# if the correction silently stopped working, which is the failure mode that produced six unreadable
+# OnePage runs in the 2026-09-04 report.
+#
+# Scoped to this section, like every other log assertion in this file: Get-LogCount reads from the
+# mark set at the top of it, not from the start of the run.
+$refused = Get-LogCount 'WORD REFUSED THE WRITE'
+Assert ($refused -eq 0) "Word refused no write while correcting the new Word (got $refused)"
+
+# Get-LogSince matches with -like, not regex, so this is a wildcard and the leading and trailing
+# stars are added for it. 'unknown' is what WordTabOnePageWhyName returns for a value it has no word
+# for, which can only happen if an exit was added without a name beside it.
+Assert ((Get-LogCount 'view  hwnd=*unknown') -eq 0) 'and every outcome the add-in logged was one it has a word for'
 Close-Word $later
 
 } finally {
