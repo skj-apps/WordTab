@@ -688,6 +688,48 @@ void StripDescribeDpiContext(HWND hwnd, const wchar_t* label, wchar_t* out, int 
     out[chars - 1] = L'\0';
 }
 
+// The hosting behaviour, which is what permits a child to sit in a different context from its parent
+// at all - and so the half of the question that says what a fix would have to touch. Windows 10 1803,
+// reached the same way as the rest, and "unavailable" on anything older.
+typedef int (WINAPI *GetThreadDpiHostingBehaviorFn)(void);
+typedef int (WINAPI *GetWindowDpiHostingBehaviorFn)(HWND);
+
+static const wchar_t* DpiHostingName(int behavior)
+{
+    switch (behavior)
+    {
+    case 0:  return L"default";
+    case 1:  return L"mixed";
+    default: return L"invalid";
+    }
+}
+
+static void DescribeDpiHosting(HWND frame, wchar_t* out, int chars)
+{
+    static GetThreadDpiHostingBehaviorFn threadHosting = NULL;
+    static GetWindowDpiHostingBehaviorFn windowHosting = NULL;
+    static BOOL looked = FALSE;
+    if (!looked)
+    {
+        looked = TRUE;
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        if (user32)
+        {
+            threadHosting = (GetThreadDpiHostingBehaviorFn)(void*)
+                            GetProcAddress(user32, "GetThreadDpiHostingBehavior");
+            windowHosting = (GetWindowDpiHostingBehaviorFn)(void*)
+                            GetProcAddress(user32, "GetWindowDpiHostingBehavior");
+        }
+    }
+
+    if (!threadHosting || !windowHosting)
+        _snwprintf(out, chars, L"dpi-hosting unavailable (pre-1803)");
+    else
+        _snwprintf(out, chars, L"hosting thread=%s frame=%s",
+                   DpiHostingName(threadHosting()), DpiHostingName(windowHosting(frame)));
+    out[chars - 1] = L'\0';
+}
+
 // ---------------------------------------------------------------------------------------------
 // Theme.
 //
@@ -1028,12 +1070,7 @@ static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
     // *who owns this pixel* before it is read, and points that belong to anything but the ribbon are
     // not read at all. That is not a heuristic about how likely occlusion is; it is the question the
     // hazard actually poses, answered per pixel.
-    HDC screen = GetDC(NULL);
-    if (!screen)
-    {
-        *why = L"no screen DC";
-        return FALSE;
-    }
+    const wchar_t* covered = L"something is covering Word's ribbon";
 
     COLORREF seen[32];
     int      count[32];
@@ -1041,6 +1078,55 @@ static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
     int      y = ribbonRect.bottom - 3;
     int      step = (rw / 2) / 24;
     if (step < 1) step = 1;
+    int      bandX = ribbonRect.left + 20;
+
+    // **Who owns each point is asked BEFORE anything is read, not after.**
+    //
+    // It used to be asked inside the read loop, which meant the screen DC, the memory DC and the
+    // CAPTUREBLT readback were all paid for first, and only then did `total < 12` discover that every
+    // point belonged to something else and none of it was usable. That is the ordinary case, not an
+    // edge: the stack holds every window at one rectangle, so every strip but the front one reads as
+    // covered - and the janitor tries them one after another until one answers. The 2026-09-11
+    // report measured the bill at 4.1% of Word's UI thread, and it tracked which TAB was in front,
+    // because that decided how many covered windows were read in full before the answering one.
+    //
+    // Asking first costs nothing that was not already spent - twenty-four WindowFromPoint calls are
+    // 79-1336us, measured below - and a covered window now stops here.
+    //
+    // **The price, accepted knowingly.** Ownership and colour used to be asked with the blit first and
+    // the ownership after; now it is the other way round, and a window that arrives over the ribbon
+    // in between is read and believed. The gap is the ownership loop plus two DCs and a bitmap - about
+    // a millisecond at worst on this rig - and a single wrong reading is what AdoptSampledChrome's second-reading
+    // rule exists to absorb - except for a process's very first sample, which it exempts.
+    BOOL owned[24];
+    for (int i = 0; i < 24; i++)
+    {
+        POINT pt;
+        pt.x = bandX + i * step;
+        pt.y = y;
+
+        HWND owner = WindowFromPoint(pt);
+        owned[i] = (owner == ribbon || IsChild(ribbon, owner)) ? TRUE : FALSE;
+        if (!owned[i])
+            foreign++;
+    }
+
+    // The same message, for the same condition, that the read loop's own test below gives: fewer than
+    // twelve usable points, and some of them foreign. The same words on purpose - the janitor logs the
+    // reason only when it CHANGES, so a covered window that started saying something new just because
+    // it was found out sooner would put a line in every field report that means nothing.
+    if (24 - foreign < 12)
+    {
+        *why = covered;
+        return FALSE;
+    }
+
+    HDC screen = GetDC(NULL);
+    if (!screen)
+    {
+        *why = L"no screen DC";
+        return FALSE;
+    }
 
     // **The band is copied once and then read, rather than read twenty-four times.**
     //
@@ -1059,12 +1145,11 @@ static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
     // One `BitBlt` of the 1-pixel-tall band the samples lie on is one readback instead of
     // twenty-four, and `GetPixel` against the resulting *memory* DC is an ordinary memory read.
     // Nothing else changes: the same points, the same y, and `WindowFromPoint` still asked per point
-    // against the SCREEN, because that is the question that makes reading the screen honest at all
-    // and it was never the expensive half.
+    // against the SCREEN - above, before any of this - because that is the question that makes
+    // reading the screen honest at all and it was never the expensive half.
     //
     // If any of it fails we fall back to reading the screen DC directly - slow, but the answer this
     // has always given, and a palette that is right and late beats one that is absent.
-    int      bandX = ribbonRect.left + 20;
     int      bandW = 23 * step + 1;
     HDC      band  = CreateCompatibleDC(screen);
     HBITMAP  bandBmp = band ? CreateCompatibleBitmap(screen, bandW, 1) : NULL;
@@ -1081,21 +1166,29 @@ static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
     if (band && bandBmp && BitBlt(band, 0, 0, bandW, 1, screen, bandX, y, SRCCOPY | CAPTUREBLT))
         banded = TRUE;
 
+    // The fallback used to be silent, and it is the one failure here with a price nobody would see:
+    // twenty-four screen GetPixels are about a second of Word's UI thread per window tried, which is
+    // the exact cost the blit exists to remove. So it is said when it starts and when it stops - on
+    // the change, never per sample.
+    static int lastBanded = -1;
+    if ((int)banded != lastBanded)
+    {
+        if (!banded)
+            LogWrite(L"strip  chrome sample: the band could not be copied (dc=%d bitmap=%d "
+                     L"lastError=%lu) - reading the screen one pixel at a time, ~40ms a pixel",
+                     (int)(band != NULL), (int)(bandBmp != NULL), GetLastError());
+        else if (lastBanded == 0)
+            LogWrite(L"strip  chrome sample: the band can be copied again");
+        lastBanded = (int)banded;
+    }
+
     for (int i = 0; i < 24; i++)
     {
-        POINT pt;
-        pt.x = bandX + i * step;
-        pt.y = y;
-
-        HWND owner = WindowFromPoint(pt);
-        if (owner != ribbon && !IsChild(ribbon, owner))
-        {
-            foreign++;
-            continue;
-        }
+        if (!owned[i])
+            continue;                   // counted as foreign above, before anything was read
 
         COLORREF c = banded ? GetPixel(band, i * step, 0)
-                            : GetPixel(screen, pt.x, pt.y);
+                            : GetPixel(screen, bandX + i * step, y);
         if (c == CLR_INVALID)
             continue;
 
@@ -1118,10 +1211,11 @@ static BOOL SampleChrome(StripState* state, COLORREF* out, const wchar_t** why)
     if (band)    DeleteDC(band);
     ReleaseDC(NULL, screen);
 
+    // Kept, although the test above catches most of what reaches it: owned points can still read back
+    // CLR_INVALID, and "too few readable pixels" is the only way that is ever said.
     if (total < 12)
     {
-        *why = (foreign > 0) ? L"something is covering Word's ribbon"
-                             : L"too few readable pixels";
+        *why = (foreign > 0) ? covered : L"too few readable pixels";
         return FALSE;
     }
 
@@ -5343,10 +5437,38 @@ static LRESULT CALLBACK StripWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// How deep inside JanitorProc this thread is, and which stage of it. Declared up here rather than
+// beside JanitorProc because the strip's creation line just below says whether it was reached from
+// inside a tick. See JanitorEntry.
+static int            g_janitorDepth = 0;
+static const wchar_t* g_janitorStage = L"no stage";
+
 static BOOL CreateStripWindow(StripState* state)
 {
     if (state->strip && IsWindow(state->strip))
         return TRUE;
+
+    // A probe, and it changes nothing: which DPI context this child is made in.
+    //
+    // The 2026-09-11 report printed a PER-MONITOR frame holding a SYSTEM-aware strip on every drift
+    // line. The obvious fix is to bracket this CreateWindowExW with the frame's own context, and it is
+    // not written, because nothing in the log can say whether it would work: every thread-ctx the
+    // field has ever printed was sampled INSIDE a Word window procedure, where Windows has already
+    // swapped the thread to that window's context. What decides the child's context is the thread's
+    // context at the moment it is made, which is here, and which has never once been sampled.
+    //
+    // The two possible answers need two different fixes, which is why the hosting behaviour is beside
+    // it:
+    //
+    //   thread SYSTEM as it is made       -> the bracket is the fix
+    //   thread PER-MONITOR as it is made  -> Windows made the child system-aware anyway, the bracket
+    //                                        does nothing, and it is a hosting question instead
+    //
+    // Every strip, unconditionally - one line per window Word opens.
+    wchar_t frameCtx[160];
+    wchar_t hosting[96];
+    StripDescribeDpiContext(state->frame, L"frame", frameCtx, 160);
+    DescribeDpiHosting(state->frame, hosting, 96);
 
     state->strip = CreateWindowExW(WS_EX_NOACTIVATE, kStripClass, L"WordTab",
                                    WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
@@ -5354,10 +5476,18 @@ static BOOL CreateStripWindow(StripState* state)
                                    state->frame, NULL, g_module, NULL);
     if (!state->strip)
     {
-        LogWrite(L"strip  hwnd=0x%p  CreateWindowEx FAILED (lastError=%lu)",
-                 (void*)state->frame, GetLastError());
+        LogWrite(L"strip  hwnd=0x%p  CreateWindowEx FAILED (lastError=%lu)  as it was made: %s  %s",
+                 (void*)state->frame, GetLastError(), frameCtx, hosting);
         return FALSE;
     }
+
+    wchar_t stripCtx[160];
+    StripDescribeDpiContext(state->strip, L"strip", stripCtx, 160);
+    LogWrite(L"strip  hwnd=0x%p  strip=0x%p made from %s.  as it was made: %s  %s  |  "
+             L"after: %s",
+             (void*)state->frame, (void*)state->strip,
+             g_janitorDepth > 0 ? L"a janitor tick" : L"attach",
+             frameCtx, hosting, stripCtx);
 
     SetWindowLongPtrW(state->strip, GWLP_USERDATA, (LONG_PTR)state);
     state->stripPlaced = FALSE;
@@ -6646,11 +6776,61 @@ static void PollModified(void)
 // So: read the cursor around every stage of a janitor tick that lands inside a drag, and have the
 // stage that changes it say so. GetCursor is a register read and the whole thing is gated on
 // g_dragging, so it costs nothing when nobody is dragging - which is always, outside a check.
+//
+// And a probe for the ~520ms dot-poll ceiling, which changes nothing: does this timer ever run INSIDE
+// itself?
+//
+// The worst dot poll in the field is FLAT across row size - 518,726us at 3-5 windows, 520,183us at
+// 7-8 - and its top end is truncated, not tailed: 17 of 58 values above 400ms sit inside one 1.5ms
+// band. Independent network round trips do not pile up like that. One story that fits is this timer's
+// own period leaking into the bracket: SetTimer(NULL, ...) is a THREAD timer, anything Word does inside
+// PollModified that pumps messages can dispatch the next tick, and 500ms plus one 15.625ms system tick
+// is 515.625ms. The other is a fixed ~500ms wait inside Word. This says which, by naming the stage the
+// outer tick was in and how long it had been running when the inner one arrived.
+//
+// **A guard object, not a decrement at the bottom.** PollModified alone has seven returns, and a depth
+// that failed to come back down would report nesting forever and say nothing about why. It restores
+// the stage too, so a second nested tick is still labelled with the outer tick's stage.
+//
+// **Probe only. It does not stand anything down** - the whole-janitor stand-down was rejected on
+// purpose (see PollModified), and nothing here is evidence against that yet.
+struct JanitorEntry
+{
+    const wchar_t* stage;
+    JanitorEntry()  : stage(g_janitorStage) { g_janitorDepth++; }
+    ~JanitorEntry() { g_janitorDepth--; g_janitorStage = stage; }
+};
+
 static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
 {
     (void)hwnd; (void)msg; (void)id; (void)tick;
 
+    static LARGE_INTEGER outerStarted = {};
+    LARGE_INTEGER entered;
+    QueryPerformanceCounter(&entered);
+    if (g_janitorDepth > 0)
+    {
+        // The first twenty-five, then every hundredth with the running count, so a machine where this
+        // happens once a minute does not double the rate the log fills at.
+        static int nested = 0;
+        nested++;
+        if (nested <= 25 || nested % 100 == 0)
+        {
+            LARGE_INTEGER freq;
+            QueryPerformanceFrequency(&freq);
+            LONGLONG us = (freq.QuadPart > 0)
+                        ? ((entered.QuadPart - outerStarted.QuadPart) * 1000000 / freq.QuadPart) : 0;
+            LogWrite(L"strip  janitor tick ran INSIDE another one (depth %d, %d time(s) so far): "
+                     L"the outer tick was in %s, %lld us after it started",
+                     g_janitorDepth, nested, g_janitorStage, us);
+        }
+    }
+    else
+        outerStarted = entered;
 
+    JanitorEntry entry;
+
+    g_janitorStage = L"the per-strip loop";
     for (int i = 0; i < g_stripCount; i++)
     {
         StripState* state = &g_strips[i];
@@ -6741,11 +6921,15 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
     // Membership is decided from what is true right now - visible, has a document frame - so it is
     // re-decided on the same cadence rather than tracked through events that Word does not always
     // send.
+    g_janitorStage = L"StackJanitor";
     StackJanitor();
 
     // After StackJanitor, so that a window which has just left the stack is not asked about, and a
-    // window which has just joined it is. Before the chrome sample, which is the cheaper of the two
-    // and has waited two seconds already.
+    // window which has just joined it is. Before the chrome sample, which has waited two seconds
+    // already. NOT because the sample is the cheaper of the two, which this comment used to say: the
+    // 2026-09-11 field report measured the sample at 4.1% of Word's UI thread against 0.2-0.9% for
+    // the dot poll.
+    g_janitorStage = L"PollModified";
     PollModified();
 
     // Has Word changed colour underneath us?
@@ -6760,9 +6944,11 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
     // Sampling is the honest mechanism here for a second reason too: there is no event to hear. The
     // strip is a WS_CHILD, and WM_SETTINGCHANGE is broadcast to top-level windows only.
     //
-    // Every fourth tick, once, off the first strip that can answer - not once per window. Cost is a
-    // GetDC and twenty-four GetPixels every two seconds, and it stops at the first strip that gives
-    // a usable answer.
+    // Every fourth tick, once, off the first strip that can answer. **That is one sample per window
+    // TRIED, not one per tick**: every window asked before the one that answers pays for a whole
+    // sample, which the 2026-09-11 report measured as 47,387us with the last-attached tab in front
+    // against 15,664us with the first - same session, same three windows. SampleChrome now asks who
+    // owns the band before it reads a pixel, so a window that cannot answer is cheap to try.
     //
     // **The window in front is asked first, and its answer is the one reported.** Two reasons, and
     // neither is a preference. It is the only window whose pixels can be read at all - the stack
@@ -6789,6 +6975,7 @@ static void CALLBACK JanitorProc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick)
     // a wide margin the largest thing this timer does. It is NOT the fix - the fix is to stop asking
     // GDI for twenty-four individual pixels off the screen, which is its own slice and is written up
     // in the report for this one. This is only what keeps it out of the drag.
+    g_janitorStage = L"the chrome sample";
     if (g_sampleEnabled && !FramesInModalMoveLoop())
     {
         static int countdown = 0;
